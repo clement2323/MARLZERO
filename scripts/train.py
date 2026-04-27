@@ -70,7 +70,8 @@ def main(cfg: DictConfig) -> None:
     # would land at the project root, scattering logs/tensorboard. Anchor
     # everything explicitly on Hydra's runtime output_dir.
     run_dir = Path(HydraConfig.get().runtime.output_dir)
-    setup_logging(log_file=str(run_dir / "train.log"))
+    log_file_path = str(run_dir / "train.log")
+    setup_logging(log_file=log_file_path)
     seed_everything(cfg.seed)
 
     device = _resolve_device(cfg.device)

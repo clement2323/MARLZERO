@@ -229,10 +229,12 @@ def _worker_fn(
 
 def _worker_fn_remote(
     worker_id: int,
-    req_queue: mp.Queue,  # type: ignore[type-arg]
-    reply_queue: mp.Queue,  # type: ignore[type-arg]
+    req_send_conn: Any,     # mpc.Connection — worker's send end of req pipe
+    reply_recv_conn: Any,   # mpc.Connection — worker's recv end of reply pipe
     results_queue: mp.Queue,  # type: ignore[type-arg]
     shutdown_event: Any,    # mp.Event — set when manager.stop() is called
+    shm_names: Any,
+    num_workers: int,
     num_simulations: int,
     temperature_threshold: int,
     dirichlet_alpha: float,
@@ -282,8 +284,10 @@ def _worker_fn_remote(
 
     eval_fn = make_remote_eval_fn(
         worker_id=worker_id,
-        req_queue=req_queue,
-        reply_queue=reply_queue,
+        req_send_conn=req_send_conn,
+        reply_recv_conn=reply_recv_conn,
+        shm_names=shm_names,
+        num_workers=num_workers,
         encode_state=encode_state,
         get_legal_actions=get_legal_actions,
     )
@@ -343,6 +347,7 @@ class SelfPlayManager:
         inference_device: str = "cuda",
         max_batch_size: int = 32,
         max_wait_ms: float = 5.0,
+        log_file: str | None = None,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -358,6 +363,7 @@ class SelfPlayManager:
         self._inference_device = inference_device
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
+        self._log_file = log_file
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -416,18 +422,22 @@ class SelfPlayManager:
             device=self._inference_device,
             max_batch=self._max_batch_size,
             max_wait_ms=self._max_wait_ms,
+            log_file=self._log_file,
         )
         self._inference_server.start()
 
         for i in range(self._num_workers):
+            req_send, reply_recv = self._inference_server.worker_pipes(i)
             p = self._ctx.Process(
                 target=_worker_fn_remote,
                 args=(
                     i,
-                    self._inference_server.request_queue,
-                    self._inference_server.reply_queues[i],
+                    req_send,
+                    reply_recv,
                     self._results_queue,
                     self._shutdown_event,
+                    self._inference_server.shm_names,
+                    self._inference_server.num_workers,
                     self._num_simulations,
                     self._temperature_threshold,
                     self._dirichlet_alpha,
@@ -502,14 +512,9 @@ class SelfPlayManager:
         if self._inference_mode == "shared_gpu":
             self._shutdown_event.set()
             if self._inference_server is not None:
-                # Wake up any worker currently blocked on reply_queue.get()
-                # before bringing the server down — otherwise they'd hit the
-                # 60 s request_timeout and emit spurious errors.
-                for q in self._inference_server.reply_queues:
-                    try:
-                        q.put_nowait(None)
-                    except Exception:
-                        pass
+                # InferenceServer.stop() sends None on each worker reply pipe,
+                # waking blocked workers, then signals the server's shutdown
+                # pipe before joining.
                 self._inference_server.stop()
         else:
             for q in self._weights_queues:

@@ -9,8 +9,11 @@ algorithm: alphazero
 
 network:
   type: resnet
-  num_blocks: 12
-  num_channels: 128
+  # 16x192 (~3M params): tuned for shared_gpu mode where the GPU can absorb
+  # larger forwards cheaply. With per_worker_cpu the CPU forwards become the
+  # bottleneck — drop back to 12x128 if you ever want to revert.
+  num_blocks: 16
+  num_channels: 192
   policy_head_hidden: 64
   value_head_hidden: 64
 
@@ -37,9 +40,9 @@ self_play:
   #                  but does not exploit GPU during MCTS leaf evaluation.
   # shared_gpu     : centralized GPU inference server batches leaf evaluations
   #                  across workers. Big throughput win on small networks.
-  inference_mode: per_worker_cpu
+  inference_mode: shared_gpu
   inference_device: cuda      # "cuda" or "cpu" (only used in shared_gpu mode)
-  max_batch_size: 32          # GPU forward batch upper bound
+  max_batch_size: 64          # GPU forward batch upper bound (≥ num_workers)
   max_wait_ms: 5              # batcher max latency budget per request
   inference_batch_size: 32    # legacy/unused, kept for backward compat
   temperature_schedule:
