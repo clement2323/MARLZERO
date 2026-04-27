@@ -173,6 +173,62 @@ def test_manager_start_stop() -> None:
 
 
 @pytest.mark.slow
+def test_manager_shared_gpu_mode_cpu_fallback() -> None:
+    """Run shared_gpu inference mode on CPU (no GPU required in CI).
+
+    Validates that the worker → request queue → server → reply queue round-trip
+    works end-to-end and produces valid GameRecords.
+    """
+    net = _make_small_net()
+    with SelfPlayManager(
+        network=net,
+        network_cfg=_SMALL_NET_CFG,
+        num_workers=2,
+        num_simulations=5,
+        temperature_threshold=2,
+        seed=0,
+        inference_mode="shared_gpu",
+        inference_device="cpu",
+        max_batch_size=4,
+        max_wait_ms=2.0,
+    ) as manager:
+        game1 = manager.collect_game(timeout=120.0)
+        game2 = manager.collect_game(timeout=120.0)
+    assert isinstance(game1, GameRecord) and isinstance(game2, GameRecord)
+    assert len(game1.samples) > 0 and len(game2.samples) > 0
+    for sample in game1.samples:
+        assert sample.encoded_state.shape == (_NUM_PLANES, NUM_POSITIONS)
+        assert abs(sample.policy_target.sum() - 1.0) < 1e-4
+
+
+@pytest.mark.slow
+def test_manager_shared_gpu_weights_update_propagates() -> None:
+    """update_network in shared_gpu mode should not crash and not block."""
+    net = _make_small_net()
+    with SelfPlayManager(
+        network=net,
+        network_cfg=_SMALL_NET_CFG,
+        num_workers=2,
+        num_simulations=3,
+        temperature_threshold=2,
+        seed=0,
+        inference_mode="shared_gpu",
+        inference_device="cpu",
+        max_batch_size=4,
+        max_wait_ms=2.0,
+    ) as manager:
+        # Mutate weights deterministically and broadcast — server must consume
+        # without dropping new requests.
+        for p in net.parameters():
+            with torch.no_grad():
+                p.add_(0.01)
+        manager.update_network(net.state_dict())
+        game = manager.collect_game(timeout=120.0)
+    assert isinstance(game, GameRecord)
+    assert len(game.samples) > 0
+
+
+@pytest.mark.slow
 def test_self_play_throughput() -> None:
     """Verify a baseline throughput with 4 workers and a tiny network.
 

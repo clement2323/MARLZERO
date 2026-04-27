@@ -160,15 +160,27 @@ class MorrisSimEnv:
 # ---------------------------------------------------------------------------
 
 
-def _make_policy_fn(
-    network: nn.Module, device: torch.device
-) -> Callable[[MorrisSimEnv], tuple[dict[int, float], float]]:
-    """Return a policy forward function compatible with LightZero's MCTS."""
+EvalFn = Callable[
+    [GameState],
+    tuple[dict[int, float], float],
+]
+"""Leaf evaluator signature.
 
-    def policy_forward(env: MorrisSimEnv) -> tuple[dict[int, float], float]:
-        state = env._state
+Takes a :class:`GameState`, returns:
+    (action → prior_probability dict over legal actions, value estimate in [-1, 1])
+
+This abstraction lets MCTS run with either a local in-process network call or
+a remote shared GPU server that batches across workers — see
+``training/inference_server.py``. The default factory below builds the local
+flavour from ``(network, device)``.
+"""
+
+
+def _make_local_eval_fn(network: nn.Module, device: torch.device) -> EvalFn:
+    """Build an EvalFn that runs the given network in-process on *device*."""
+
+    def evaluate(state: GameState) -> tuple[dict[int, float], float]:
         legal = get_legal_actions(state)
-
         x = encode_state(state).to(device)
         mask = torch.zeros(1, ACTION_SPACE_SIZE, dtype=torch.bool, device=device)
         for a in legal:
@@ -177,9 +189,19 @@ def _make_policy_fn(
         with torch.no_grad():
             log_policy, value = network(x, mask)
 
-        probs: np.ndarray[tuple[int], np.dtype[np.float32]] = log_policy.exp()[0].cpu().numpy()
-        action_probs_dict = {a: float(probs[a]) for a in legal}
-        return action_probs_dict, float(value[0].item())
+        probs = log_policy.exp()[0].cpu().numpy()
+        return {a: float(probs[a]) for a in legal}, float(value[0].item())
+
+    return evaluate
+
+
+def _adapt_eval_fn_to_lzero(
+    eval_fn: EvalFn,
+) -> Callable[[MorrisSimEnv], tuple[dict[int, float], float]]:
+    """Wrap an EvalFn so it satisfies LightZero's policy_forward(env) signature."""
+
+    def policy_forward(env: MorrisSimEnv) -> tuple[dict[int, float], float]:
+        return eval_fn(env._state)
 
     return policy_forward
 
@@ -200,18 +222,31 @@ class MorrisSearch:
 
     def __init__(
         self,
-        network: nn.Module,
-        device: torch.device,
+        network: nn.Module | None = None,
+        device: torch.device | None = None,
         num_simulations: int = 800,
         c_puct_base: float = 19652.0,
         c_puct_init: float = 1.25,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        eval_fn: EvalFn | None = None,
     ) -> None:
+        """Construct an MCTS search.
+
+        Either provide ``(network, device)`` to run inference locally in-process,
+        or provide ``eval_fn`` to delegate evaluation (e.g. to a centralized GPU
+        inference server). Exactly one of the two must be supplied.
+        """
+        if eval_fn is None:
+            if network is None or device is None:
+                raise ValueError(
+                    "Provide either eval_fn, or both network and device."
+                )
+            eval_fn = _make_local_eval_fn(network, device)
         self._sim_env = MorrisSimEnv()
         self._network = network
         self._device = device
-        self._policy_fn = _make_policy_fn(network, device)
+        self._policy_fn = _adapt_eval_fn_to_lzero(eval_fn)
 
         if _CTREE_AVAILABLE:
             # C++ backend: constructor takes positional args, not a cfg dict.

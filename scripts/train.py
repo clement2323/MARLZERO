@@ -115,6 +115,8 @@ def main(cfg: DictConfig) -> None:
         trainer.load(resume_path, buffer=buffer)
 
     # ---- Self-play workers ----
+    inference_mode = cfg.self_play.get("inference_mode", "per_worker_cpu")
+    inference_device = cfg.self_play.get("inference_device", "cuda" if device.type == "cuda" else "cpu")
     manager = SelfPlayManager(
         network=network,
         network_cfg=_network_cfg_dict(cfg),
@@ -124,6 +126,10 @@ def main(cfg: DictConfig) -> None:
         dirichlet_alpha=cfg.mcts.dirichlet_alpha,
         dirichlet_epsilon=cfg.mcts.dirichlet_epsilon,
         seed=cfg.seed,
+        inference_mode=inference_mode,
+        inference_device=inference_device,
+        max_batch_size=cfg.self_play.get("max_batch_size", 32),
+        max_wait_ms=cfg.self_play.get("max_wait_ms", 5.0),
     )
 
     logger.info(

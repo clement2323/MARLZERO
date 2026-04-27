@@ -33,7 +33,15 @@ mcts:
 
 self_play:
   num_workers: 13
-  inference_batch_size: 32
+  # per_worker_cpu : each worker runs torch on CPU in-process. Simple, no IPC,
+  #                  but does not exploit GPU during MCTS leaf evaluation.
+  # shared_gpu     : centralized GPU inference server batches leaf evaluations
+  #                  across workers. Big throughput win on small networks.
+  inference_mode: shared_gpu
+  inference_device: cuda      # "cuda" or "cpu" (only used in shared_gpu mode)
+  max_batch_size: 32          # GPU forward batch upper bound
+  max_wait_ms: 5              # batcher max latency budget per request
+  inference_batch_size: 32    # legacy/unused, kept for backward compat
   temperature_schedule:
     moves_0_to_10: 1.0
     moves_10_plus: 0.0

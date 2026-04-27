@@ -223,6 +223,87 @@ def _worker_fn(
 
 
 # ---------------------------------------------------------------------------
+# Remote-eval worker (shared GPU inference server)
+# ---------------------------------------------------------------------------
+
+
+def _worker_fn_remote(
+    worker_id: int,
+    req_queue: mp.Queue,  # type: ignore[type-arg]
+    reply_queue: mp.Queue,  # type: ignore[type-arg]
+    results_queue: mp.Queue,  # type: ignore[type-arg]
+    shutdown_event: Any,    # mp.Event — set when manager.stop() is called
+    num_simulations: int,
+    temperature_threshold: int,
+    dirichlet_alpha: float,
+    dirichlet_epsilon: float,
+    seed: int,
+) -> None:
+    """Worker process: delegates leaf evaluation to the inference server.
+
+    Same self-play loop as :func:`_worker_fn` but evaluation goes through a
+    request/reply queue pair connected to a centralized GPU server instead of
+    running torch in-process.
+    """
+    import random
+    import sys
+    import warnings
+
+    import os
+    warnings.filterwarnings("ignore")
+    _old_stderr = sys.stderr
+    from loguru import logger as _log
+    _log.remove()
+    _log.add(_old_stderr, level="INFO", filter=lambda r: r["name"].startswith("morris_rl"))
+
+    _devnull = open(os.devnull, "w")
+    sys.stderr = _devnull
+    try:
+        from morris_rl.env.rules import get_legal_actions
+        from morris_rl.mcts.search import MorrisSearch, encode_state
+        from morris_rl.training.inference_server import make_remote_eval_fn
+    finally:
+        sys.stderr = _old_stderr
+        _devnull.close()
+
+    # Workers don't run torch in-process here, but other libs may still query
+    # CPU thread defaults (e.g. numpy/BLAS); pin to one to avoid contention
+    # with the inference server's host-side dispatch threads.
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+    worker_seed = seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+    eval_fn = make_remote_eval_fn(
+        worker_id=worker_id,
+        req_queue=req_queue,
+        reply_queue=reply_queue,
+        encode_state=encode_state,
+        get_legal_actions=get_legal_actions,
+    )
+    search = MorrisSearch(
+        eval_fn=eval_fn,
+        num_simulations=num_simulations,
+        dirichlet_alpha=dirichlet_alpha,
+        dirichlet_epsilon=dirichlet_epsilon,
+    )
+
+    while not shutdown_event.is_set():
+        try:
+            game = _play_game(search, temperature_threshold=temperature_threshold)
+            results_queue.put(game)
+        except Exception as exc:
+            results_queue.put(WorkerError(exception=exc, worker_id=worker_id))
+            return
+
+
+# ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
 
@@ -258,7 +339,13 @@ class SelfPlayManager:
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         seed: int = 42,
+        inference_mode: str = "per_worker_cpu",
+        inference_device: str = "cuda",
+        max_batch_size: int = 32,
+        max_wait_ms: float = 5.0,
     ) -> None:
+        if inference_mode not in ("per_worker_cpu", "shared_gpu"):
+            raise ValueError(f"unknown inference_mode {inference_mode!r}")
         self._network = network
         self._network_cfg = network_cfg
         self._num_workers = num_workers
@@ -267,22 +354,35 @@ class SelfPlayManager:
         self._dirichlet_alpha = dirichlet_alpha
         self._dirichlet_epsilon = dirichlet_epsilon
         self._seed = seed
+        self._inference_mode = inference_mode
+        self._inference_device = inference_device
+        self._max_batch_size = max_batch_size
+        self._max_wait_ms = max_wait_ms
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
-        # maxsize=1: only the freshest weights matter. Older snapshots a worker
-        # never picked up are obsolete by the time a newer one arrives, and an
-        # unbounded queue accumulates ~4 MB state_dicts per broadcast → OOM.
+        # Per-worker weights queue is only used in per_worker_cpu mode; in
+        # shared_gpu mode the inference server owns the network and gets a
+        # single dedicated weights channel via InferenceServer.update_weights.
         self._weights_queues: list[mp.Queue] = [  # type: ignore[type-arg]
             self._ctx.Queue(maxsize=1) for _ in range(num_workers)
         ]
+        self._shutdown_event: Any = self._ctx.Event()
+        self._inference_server: Any = None
         self._processes: list[Any] = []
         self._running = False
 
     def start(self) -> None:
-        """Spawn worker processes and send them the initial network weights."""
+        """Spawn worker processes (and inference server if shared_gpu)."""
         if self._running:
             return
+        if self._inference_mode == "shared_gpu":
+            self._start_shared_gpu()
+        else:
+            self._start_per_worker_cpu()
+        self._running = True
+
+    def _start_per_worker_cpu(self) -> None:
         initial_weights = {k: v.cpu() for k, v in self._network.state_dict().items()}
         for i in range(self._num_workers):
             p = self._ctx.Process(
@@ -303,7 +403,41 @@ class SelfPlayManager:
             p.start()
             self._processes.append(p)
             self._weights_queues[i].put(initial_weights)
-        self._running = True
+
+    def _start_shared_gpu(self) -> None:
+        # Lazy import: InferenceServer pulls torch + the network module, no need
+        # to load it when only per_worker_cpu mode is used (e.g. CI smoke tests).
+        from morris_rl.training.inference_server import InferenceServer
+
+        self._inference_server = InferenceServer(
+            network=self._network,
+            network_cfg=self._network_cfg,
+            num_workers=self._num_workers,
+            device=self._inference_device,
+            max_batch=self._max_batch_size,
+            max_wait_ms=self._max_wait_ms,
+        )
+        self._inference_server.start()
+
+        for i in range(self._num_workers):
+            p = self._ctx.Process(
+                target=_worker_fn_remote,
+                args=(
+                    i,
+                    self._inference_server.request_queue,
+                    self._inference_server.reply_queues[i],
+                    self._results_queue,
+                    self._shutdown_event,
+                    self._num_simulations,
+                    self._temperature_threshold,
+                    self._dirichlet_alpha,
+                    self._dirichlet_epsilon,
+                    self._seed,
+                ),
+                daemon=True,
+            )
+            p.start()
+            self._processes.append(p)
 
     def collect_game(self, timeout: float = 300.0) -> GameRecord:
         """Block until one completed game is available and return it.
@@ -323,13 +457,16 @@ class SelfPlayManager:
         return result  # type: ignore[return-value]
 
     def update_network(self, state_dict: dict[str, Any]) -> None:
-        """Broadcast updated weights to all workers.
+        """Broadcast updated weights to whoever needs them.
 
-        Each worker picks up the update at the start of its next game via a
-        non-blocking poll.  Queue is bounded at size 1: if a stale weight
-        snapshot is still waiting, drop it and replace with the fresh one —
-        the worker will get the latest weights next time it polls.
+        - per_worker_cpu : push to each worker's bounded weights queue.
+        - shared_gpu     : push only to the inference server; workers don't
+                           own a network in this mode.
         """
+        if self._inference_mode == "shared_gpu":
+            if self._inference_server is not None:
+                self._inference_server.update_weights(state_dict)
+            return
         cpu_weights = {k: v.cpu() for k, v in state_dict.items()}
         for q in self._weights_queues:
             try:
@@ -362,8 +499,21 @@ class SelfPlayManager:
         """Send shutdown sentinels and join all worker processes."""
         if not self._running:
             return
-        for q in self._weights_queues:
-            q.put(None)
+        if self._inference_mode == "shared_gpu":
+            self._shutdown_event.set()
+            if self._inference_server is not None:
+                # Wake up any worker currently blocked on reply_queue.get()
+                # before bringing the server down — otherwise they'd hit the
+                # 60 s request_timeout and emit spurious errors.
+                for q in self._inference_server.reply_queues:
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
+                self._inference_server.stop()
+        else:
+            for q in self._weights_queues:
+                q.put(None)
         for p in self._processes:
             p.join(timeout=15)
             if p.is_alive():
