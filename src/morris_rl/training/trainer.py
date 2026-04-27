@@ -60,8 +60,11 @@ try:
 except ImportError:
     _PSUTIL_AVAILABLE = False
 
-# Memory/queue health is logged this often to spot leaks early without spamming.
-_MEMORY_LOG_INTERVAL = 50
+# Memory/queue health is logged this often to spot leaks early without
+# spamming the trainer's tqdm bar on stderr. TensorBoard captures the same
+# scalars on every check so high-resolution data is still available.
+_MEMORY_LOG_INTERVAL = 50          # how often to *check* (and write to TB)
+_MEMORY_LOG_STDERR_INTERVAL = 500  # how often to ALSO emit a stderr line
 # How many recent games to keep for histogram aggregation in TensorBoard.
 _GAME_LENGTH_WINDOW = 200
 
@@ -401,7 +404,12 @@ class Trainer:
             )
 
     def _log_memory_health(self, manager: SelfPlayManager) -> None:
-        """Periodic check for memory/queue leaks. Cheap: ~1ms per call."""
+        """Periodic check for memory/queue leaks. Cheap: ~1 ms per call.
+
+        TensorBoard scalars are written every call (high-resolution trace).
+        A stderr line is only emitted every ``_MEMORY_LOG_STDERR_INTERVAL``
+        steps to avoid disturbing the trainer's tqdm bar.
+        """
         results_q = manager.results_qsize()
         weights_q_max = manager.weights_qsize_max()
         rss_gb = -1.0
@@ -410,10 +418,11 @@ class Trainer:
             self._log_scalar("system/rss_gb", rss_gb)
         self._log_scalar("system/results_qsize", results_q)
         self._log_scalar("system/weights_qsize_max", weights_q_max)
-        logger.info(
-            f"step={self._step} rss={rss_gb:.2f}GB "
-            f"results_q={results_q} weights_q_max={weights_q_max}"
-        )
+        if self._step % _MEMORY_LOG_STDERR_INTERVAL == 0:
+            logger.info(
+                f"step={self._step} rss={rss_gb:.2f}GB "
+                f"results_q={results_q} weights_q_max={weights_q_max}"
+            )
 
     def _auto_checkpoint(self) -> None:
         if self._checkpoint_dir is None:
