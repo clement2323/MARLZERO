@@ -134,6 +134,7 @@ def main(cfg: DictConfig) -> None:
         inference_device=inference_device,
         max_batch_size=cfg.self_play.get("max_batch_size", 32),
         max_wait_ms=cfg.self_play.get("max_wait_ms", 5.0),
+        log_file=log_file_path,
     )
 
     logger.info(

@@ -35,7 +35,10 @@ mcts:
   dirichlet_epsilon: 0.25
 
 self_play:
-  num_workers: 14
+  # 16 workers in shared_gpu mode: workers spend ~80% of cycle waiting on the
+  # GPU reply, so CPU usage stays light (~3-4 cores busy out of 16). Going
+  # higher than ~24 hits diminishing returns as forward time scales with batch.
+  num_workers: 16
   # per_worker_cpu : each worker runs torch on CPU in-process. Simple, no IPC,
   #                  but does not exploit GPU during MCTS leaf evaluation.
   # shared_gpu     : centralized GPU inference server batches leaf evaluations
