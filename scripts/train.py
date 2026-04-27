@@ -23,6 +23,7 @@ from pathlib import Path
 
 import hydra
 import torch
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 # Allow running as `python scripts/train.py` from the repo root.
@@ -65,16 +66,18 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
 
 @hydra.main(config_path="../configs", config_name="default", version_base="1.3")
 def main(cfg: DictConfig) -> None:
-    # Hydra changes cwd to outputs/<timestamp>/ before main(); relative path lands there.
-    setup_logging(log_file="train.log")
+    # Hydra v1.3+ does NOT chdir into the run dir by default — relative paths
+    # would land at the project root, scattering logs/tensorboard. Anchor
+    # everything explicitly on Hydra's runtime output_dir.
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    setup_logging(log_file=str(run_dir / "train.log"))
     seed_everything(cfg.seed)
 
     device = _resolve_device(cfg.device)
     logger.info(f"Device: {device}")
+    logger.info(f"Run dir: {run_dir}")
     logger.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
-    # Output directories created by Hydra under outputs/<timestamp>/
-    run_dir = Path(".")
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir = run_dir / "tensorboard"

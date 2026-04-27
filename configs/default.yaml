@@ -24,7 +24,7 @@ input_encoding:
   # Plane 7: must-capture flag (set after forming a mill)
 
 mcts:
-  num_simulations_train: 300
+  num_simulations_train: 200
   num_simulations_eval: 800
   num_simulations_demo: 5000
   c_puct: 1.5
@@ -32,12 +32,12 @@ mcts:
   dirichlet_epsilon: 0.25
 
 self_play:
-  num_workers: 13
+  num_workers: 14
   # per_worker_cpu : each worker runs torch on CPU in-process. Simple, no IPC,
   #                  but does not exploit GPU during MCTS leaf evaluation.
   # shared_gpu     : centralized GPU inference server batches leaf evaluations
   #                  across workers. Big throughput win on small networks.
-  inference_mode: shared_gpu
+  inference_mode: per_worker_cpu
   inference_device: cuda      # "cuda" or "cpu" (only used in shared_gpu mode)
   max_batch_size: 32          # GPU forward batch upper bound
   max_wait_ms: 5              # batcher max latency budget per request

@@ -10,7 +10,7 @@ web:
 	cd web && npm run dev
 
 tensorboard:
-	uv run tensorboard --logdir tensorboard --port 6006 --reload_multifile true
+	uv run tensorboard --logdir outputs --port 6006 --reload_multifile true
 
 # All-in-one: training + inference + web demo + tensorboard, in parallel.
 # Ctrl+C kills the whole group via the INT trap.
