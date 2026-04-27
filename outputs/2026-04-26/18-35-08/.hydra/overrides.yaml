@@ -1,0 +1,5 @@
+- self_play.num_workers=4
+- mcts.num_simulations_train=20
+- training.total_steps=50
+- training.min_buffer_size=50
+- device=cuda

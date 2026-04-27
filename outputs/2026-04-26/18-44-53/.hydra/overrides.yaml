@@ -1,0 +1,7 @@
+- self_play.num_workers=16
+- mcts.num_simulations_train=200
+- training.batch_size=512
+- training.min_buffer_size=5000
+- training.total_steps=300000
+- training.updates_per_collected_game=4
+- device=cuda

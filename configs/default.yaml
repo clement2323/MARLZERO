@@ -1,0 +1,61 @@
+# Base configuration for Nine Men's Morris RL training.
+# All values are overridable via Hydra command-line overrides.
+# e.g.:  python scripts/train.py mcts.num_simulations_train=400
+
+seed: 42
+run_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
+
+algorithm: alphazero
+
+network:
+  type: resnet
+  num_blocks: 10
+  num_channels: 128
+  policy_head_hidden: 64
+  value_head_hidden: 64
+
+input_encoding:
+  num_planes: 8
+  # Plane 0: current player's pieces
+  # Plane 1: opponent's pieces
+  # Plane 2: pieces in current player's hand (scalar broadcast, divided by 9)
+  # Plane 3: pieces in opponent's hand
+  # Planes 4-6: phase one-hot (placing, moving, flying)
+  # Plane 7: must-capture flag (set after forming a mill)
+
+mcts:
+  num_simulations_train: 100
+  num_simulations_eval: 800
+  num_simulations_demo: 5000
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.25
+
+self_play:
+  num_workers: 10
+  inference_batch_size: 32
+  temperature_schedule:
+    moves_0_to_10: 1.0
+    moves_10_plus: 0.0
+  tree_reuse: false  # disabled during training; enabled in eval/demo
+
+training:
+  batch_size: 512
+  learning_rate: 0.001
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  replay_buffer_size: 500000
+  min_buffer_size: 2000          # wait for this many samples before first gradient step
+  total_steps: 500000            # total gradient updates (stop condition)
+  updates_per_collected_game: 4
+  lr_decay_steps: 200000         # cosine annealing period (steps)
+  checkpoint_interval: 1000      # save a .pt file every N gradient steps
+  symmetry_augmentation: true    # 8x augmentation via dihedral group
+  mixed_precision: true          # FP16 via torch.cuda.amp
+
+device: auto  # "auto" = cuda if available, else cpu
+
+promotion:
+  mode: arena  # 'arena' or 'continuous'
+  eval_games: 100
+  win_rate_threshold: 0.55
