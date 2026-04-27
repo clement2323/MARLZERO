@@ -9,7 +9,7 @@ algorithm: alphazero
 
 network:
   type: resnet
-  num_blocks: 10
+  num_blocks: 12
   num_channels: 128
   policy_head_hidden: 64
   value_head_hidden: 64
@@ -24,7 +24,7 @@ input_encoding:
   # Plane 7: must-capture flag (set after forming a mill)
 
 mcts:
-  num_simulations_train: 100
+  num_simulations_train: 300
   num_simulations_eval: 800
   num_simulations_demo: 5000
   c_puct: 1.5
@@ -32,7 +32,7 @@ mcts:
   dirichlet_epsilon: 0.25
 
 self_play:
-  num_workers: 10
+  num_workers: 13
   inference_batch_size: 32
   temperature_schedule:
     moves_0_to_10: 1.0
@@ -40,7 +40,7 @@ self_play:
   tree_reuse: false  # disabled during training; enabled in eval/demo
 
 training:
-  batch_size: 512
+  batch_size: 256
   learning_rate: 0.001
   weight_decay: 1.0e-4
   max_grad_norm: 1.0

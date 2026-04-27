@@ -83,6 +83,7 @@ function initialState(humanPlayer: 1 | 2 = 1): GameState {
     status: "idle",
     errorMsg: "",
     serverReady: false,
+    serverLegalActions: [],
   };
 }
 
@@ -95,6 +96,7 @@ function applyBoardState(gs: GameState, bs: BoardState): GameState {
     mustCapture: bs.must_capture,
     gameOver: bs.game_over,
     winner: bs.winner ?? null,
+    serverLegalActions: bs.legal_actions,
   };
 }
 
@@ -301,11 +303,10 @@ export function useGame() {
 
   const legalActions: number[] = gs.status === "waiting_human"
     ? (() => {
-        const { mustCapture, piecesInHand, currentPlayer, selectedPos, board } = gs;
+        const { mustCapture, piecesInHand, currentPlayer, selectedPos, board, serverLegalActions } = gs;
+        // Capture is rule-heavy (mill protection); always trust the server.
         if (mustCapture) {
-          return board
-            .map((owner, i) => (owner === 3 - currentPlayer ? i : -1))
-            .filter((i) => i >= 0);
+          return serverLegalActions;
         }
         if (piecesInHand[currentPlayer - 1] > 0) {
           return board.map((owner, i) => (owner === 0 ? i : -1)).filter((i) => i >= 0);

@@ -9,6 +9,7 @@ from morris_rl.env.board import NUM_PLACE_CAPTURE_ACTIONS
 from morris_rl.env.rules import apply_action, initial_state, is_terminal
 from morris_rl.inference.play import (
     POSITION_LABELS,
+    IllegalActionError,
     describe_action,
     get_network_value,
     reconstruct_state,
@@ -88,6 +89,39 @@ def test_reconstruct_more_actions_advances_state() -> None:
     state_after_3 = reconstruct_state([0, 5, 2])
     # After 3 actions, one more piece is on the board.
     assert state_after_3.board.sum() > state_after_2.board.sum()
+
+
+def test_reconstruct_rejects_capture_of_protected_mill_piece() -> None:
+    """Defense in depth: capturing a piece in an opponent mill is illegal
+    when other (non-mill) targets exist. This regression guards the bug
+    where the human web client could click on a protected piece because
+    legality was not enforced at the server boundary.
+    """
+    # Build a position where:
+    #   - Player 1 has just formed mill 0-1-2 and owes a capture
+    #   - Player 2 has pieces in mill 8-9-10 AND a non-mill piece at 11
+    # Legal captures: only [11]; capturing any of 8/9/10 must be rejected.
+    history = [
+        0,   # P1 places a7
+        8,   # P2 places b6
+        1,   # P1 places d7
+        9,   # P2 places d6
+        5,   # P1 places d1
+        11,  # P2 places f4 (not in any mill)
+        4,   # P1 places g1
+        10,  # P2 places f6 → mill 8-9-10 → P2 must capture
+        4,   # P2 captures P1 at g1
+        2,   # P1 places g7 → mill 0-1-2 → P1 must capture
+    ]
+    # The legal path captures the unprotected piece at 11.
+    state = reconstruct_state(history + [11])
+    assert state.board[11] == 0  # captured
+    assert not state.must_capture  # capture consumed
+
+    # The illegal path tries to capture a mill-protected piece.
+    for protected in (8, 9, 10):
+        with pytest.raises(IllegalActionError):
+            reconstruct_state(history + [protected])
 
 
 # ---------------------------------------------------------------------------
