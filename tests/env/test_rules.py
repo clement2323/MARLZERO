@@ -396,15 +396,17 @@ def test_apply_action_does_not_mutate_input() -> None:
 def _play_random_game(seed: int) -> None:
     rng = random.Random(seed)
     state = initial_state()
-    for _ in range(500):  # safety cap — draw rules prevent infinite loops
+    # Safety cap must clear MAX_HALFMOVES + room for the threefold-repetition
+    # detector to fire (THREEFOLD_LIMIT × cycle length). At 300/10 a random
+    # game of dozens of replays can stretch past 1000 plies before terminating.
+    for _ in range(3000):
         done, _ = is_terminal(state)
         if done:
             return
         actions = get_legal_actions(state)
         assert actions, "Non-terminal state has no legal actions"
         state = apply_action(state, rng.choice(actions))
-    # If we hit 500 moves without terminal that is a bug; fail loudly.
-    raise AssertionError("Game did not terminate within 500 moves")
+    raise AssertionError("Game did not terminate within 3000 moves")
 
 
 def test_random_games_1000() -> None:

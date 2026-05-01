@@ -262,4 +262,7 @@ def test_self_play_throughput() -> None:
     assert collected >= target_games, (
         f"Only {collected} games in {elapsed:.1f}s — target was {target_games} in {window}s"
     )
-    assert rate >= 20, f"Throughput {rate:.1f} games/min < 20 games/min"
+    # 5 games/min is a safe floor under the 300/10 draw rules — random play
+    # produces much longer games than the old 50/3 regime, so the historical
+    # 20/min target is no longer realistic at 4 workers × 5 sims/move.
+    assert rate >= 5, f"Throughput {rate:.1f} games/min < 5 games/min"
