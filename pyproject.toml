@@ -21,6 +21,7 @@ dependencies = [
     "lightzero==0.2.0",
     "cmake>=4.3.2",
     "pybind11>=3.0.4",
+    "mlflow[auth]>=2.5",
 ]
 
 [tool.uv.sources]

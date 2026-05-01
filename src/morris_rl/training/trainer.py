@@ -60,6 +60,27 @@ try:
 except ImportError:
     _PSUTIL_AVAILABLE = False
 
+try:
+    import mlflow as _mlflow
+
+    _MLFLOW_AVAILABLE = True
+except ImportError:
+    _MLFLOW_AVAILABLE = False
+
+
+def _flatten_config(cfg: dict[str, Any], prefix: str = "") -> dict[str, str]:
+    """Flatten a nested config dict to dotted keys for MLflow params."""
+    flat: dict[str, str] = {}
+    for k, v in cfg.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(_flatten_config(v, key))
+        else:
+            # MLflow caps param values at 500 chars and rejects None silently
+            # — stringify defensively. Nested lists become "[…]".
+            flat[key] = str(v) if v is not None else ""
+    return flat
+
 # Memory/queue health is logged this often to spot leaks early without
 # spamming the trainer's tqdm bar on stderr. TensorBoard captures the same
 # scalars on every check so high-resolution data is still available.
@@ -131,6 +152,9 @@ class Trainer:
         checkpoint_dir: str | Path | None = None,
         checkpoint_interval: int = 1000,
         config: dict[str, Any] | None = None,
+        mlflow_uri: str | None = None,
+        mlflow_experiment: str = "morris-az",
+        mlflow_run_name: str | None = None,
     ) -> None:
         self._network = network.to(device)
         self._device = device
@@ -161,6 +185,28 @@ class Trainer:
             self._writer: _SummaryWriter | None = _SummaryWriter(log_dir=str(log_dir))
         else:
             self._writer = None
+
+        # MLflow is opt-in; enabled only when an explicit tracking URI is given.
+        # Errors during setup (server unreachable, bad creds) surface as warnings
+        # — we never fail the run because the metrics sink can't reach a UI.
+        self._mlflow_active: bool = False
+        if mlflow_uri and _MLFLOW_AVAILABLE:
+            try:
+                _mlflow.set_tracking_uri(mlflow_uri)
+                _mlflow.set_experiment(mlflow_experiment)
+                _mlflow.start_run(run_name=mlflow_run_name)
+                if self._config:
+                    flat = _flatten_config(self._config)
+                    for key, value in flat.items():
+                        try:
+                            _mlflow.log_param(key, value)
+                        except Exception:  # noqa: BLE001 — MLflow has many error subclasses
+                            pass
+                self._mlflow_active = True
+                logger.info(f"MLflow tracking → {mlflow_uri} / {mlflow_experiment}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"MLflow disabled: {type(exc).__name__}: {exc}")
+                self._mlflow_active = False
 
     # ------------------------------------------------------------------
     # Core training step
@@ -354,9 +400,15 @@ class Trainer:
         return self._step
 
     def close(self) -> None:
-        """Flush TensorBoard writer."""
+        """Flush TensorBoard writer and end any active MLflow run."""
         if self._writer is not None:
             self._writer.close()
+        if self._mlflow_active:
+            try:
+                _mlflow.end_run()
+            except Exception:  # noqa: BLE001
+                pass
+            self._mlflow_active = False
 
     def __enter__(self) -> Trainer:
         return self
@@ -369,14 +421,25 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
-        if self._writer is None:
-            return
         for key, value in metrics.items():
-            self._writer.add_scalar(f"train/{key}", value, self._step)
+            tag = f"train/{key}"
+            if self._writer is not None:
+                self._writer.add_scalar(tag, value, self._step)
+            self._mlflow_log(tag, float(value), self._step)
 
     def _log_scalar(self, tag: str, value: float | int) -> None:
         if self._writer is not None:
             self._writer.add_scalar(tag, value, self._step)
+        self._mlflow_log(tag, float(value), self._step)
+
+    def _mlflow_log(self, tag: str, value: float, step: int) -> None:
+        if not self._mlflow_active:
+            return
+        try:
+            _mlflow.log_metric(tag, value, step=step)
+        except Exception:  # noqa: BLE001
+            # A transient MLflow server hiccup must never bring down training.
+            pass
 
     def _log_game_stats(
         self,
@@ -385,18 +448,30 @@ class Trainer:
         games_collected: int,
     ) -> None:
         """Log per-game scalar stats and a periodic histogram of recent lengths."""
-        if self._writer is None or not recent_lengths:
+        if not recent_lengths:
             return
         last = recent_lengths[-1]
-        self._writer.add_scalar("game/length_last", last, games_collected)
         mean_len = sum(recent_lengths) / len(recent_lengths)
-        self._writer.add_scalar("game/length_mean_window", mean_len, games_collected)
         total = sum(outcome_counts.values()) or 1
-        self._writer.add_scalar("game/p1_win_rate", outcome_counts["p1_win"] / total, games_collected)
-        self._writer.add_scalar("game/p2_win_rate", outcome_counts["p2_win"] / total, games_collected)
-        self._writer.add_scalar("game/draw_rate", outcome_counts["draw"] / total, games_collected)
-        # Histograms are heavier; only emit one every full window refresh.
-        if games_collected % _GAME_LENGTH_WINDOW == 0 and len(recent_lengths) == _GAME_LENGTH_WINDOW:
+        stats: dict[str, float] = {
+            "game/length_last": float(last),
+            "game/length_mean_window": mean_len,
+            "game/p1_win_rate": outcome_counts["p1_win"] / total,
+            "game/p2_win_rate": outcome_counts["p2_win"] / total,
+            "game/draw_rate": outcome_counts["draw"] / total,
+        }
+        for tag, value in stats.items():
+            if self._writer is not None:
+                self._writer.add_scalar(tag, value, games_collected)
+            self._mlflow_log(tag, value, games_collected)
+
+        # Histograms are heavier; only emit one every full window refresh, and
+        # only to TensorBoard (MLflow has no histogram metric type).
+        if (
+            self._writer is not None
+            and games_collected % _GAME_LENGTH_WINDOW == 0
+            and len(recent_lengths) == _GAME_LENGTH_WINDOW
+        ):
             self._writer.add_histogram(
                 "game/length_distribution",
                 torch.tensor(list(recent_lengths), dtype=torch.float32),
@@ -429,3 +504,8 @@ class Trainer:
             return
         path = self._checkpoint_dir / f"checkpoint_{self._step:08d}.pt"
         self.save(path)
+        if self._mlflow_active:
+            try:
+                _mlflow.log_artifact(str(path), artifact_path="checkpoints")
+            except Exception:  # noqa: BLE001
+                pass

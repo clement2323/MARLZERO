@@ -92,6 +92,16 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---- Trainer ----
+    mlflow_cfg = cfg.get("mlflow", None)
+    if mlflow_cfg is not None and bool(mlflow_cfg.get("enabled", False)):
+        mlflow_uri: str | None = mlflow_cfg.get("tracking_uri")
+        mlflow_experiment = mlflow_cfg.get("experiment_name", "morris-az")
+        mlflow_run_name = mlflow_cfg.get("run_name") or run_dir.name
+    else:
+        mlflow_uri = None
+        mlflow_experiment = "morris-az"
+        mlflow_run_name = None
+
     trainer = Trainer(
         network=network,
         device=device,
@@ -104,6 +114,9 @@ def main(cfg: DictConfig) -> None:
         checkpoint_dir=checkpoint_dir,
         checkpoint_interval=cfg.training.checkpoint_interval,
         config=OmegaConf.to_container(cfg, resolve=True),  # type: ignore[arg-type]
+        mlflow_uri=mlflow_uri,
+        mlflow_experiment=mlflow_experiment,
+        mlflow_run_name=mlflow_run_name,
     )
 
     # ---- Replay buffer ----
