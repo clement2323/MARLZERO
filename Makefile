@@ -48,21 +48,23 @@ train-tmux-kill:  ## Stop the detached training session
 ##@ Demo (play against the agent in the browser)
 
 # Auto-pick the most recent checkpoint unless the user passes one explicitly:
-#   make play                                # latest checkpoint
+#   make play                                # latest checkpoint, or minimax fallback if none
 #   MODEL_CHECKPOINT=path/to/file.pt make play
+#   MINIMAX_DEPTH=5 make play                # force the minimax fallback at depth 5
 MODEL_CHECKPOINT ?= $(shell ls -1t outputs/*/*/checkpoints/checkpoint_*.pt 2>/dev/null | head -1)
+MINIMAX_DEPTH ?= 3
 
-play:  ## Launch backend + frontend together against the latest checkpoint
+play:  ## Launch backend + frontend (uses latest checkpoint, falls back to minimax depth N)
 	@if [ -z "$(MODEL_CHECKPOINT)" ]; then \
-	  echo "No checkpoint found in outputs/*/*/checkpoints/. Train one or set MODEL_CHECKPOINT explicitly."; \
-	  exit 1; \
+	  echo "No checkpoint found — backend will fall back to MinimaxAgent(depth=$(MINIMAX_DEPTH))"; \
+	else \
+	  echo "Checkpoint: $(MODEL_CHECKPOINT)"; \
 	fi
-	@echo "Checkpoint: $(MODEL_CHECKPOINT)"
 	@echo "Backend:    http://127.0.0.1:8000"
 	@echo "Frontend:   http://127.0.0.1:5173"
 	@echo "Ctrl-C to stop both."
 	@trap 'kill 0' INT; \
-	  MODEL_CHECKPOINT="$(MODEL_CHECKPOINT)" $(MAKE) serve & \
+	  MODEL_CHECKPOINT="$(MODEL_CHECKPOINT)" MINIMAX_DEPTH="$(MINIMAX_DEPTH)" $(MAKE) serve & \
 	  $(MAKE) web & \
 	  wait
 
