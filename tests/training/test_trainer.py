@@ -33,13 +33,21 @@ def _make_buffer(n: int, seed: int = 0) -> ReplayBuffer:
     buf = ReplayBuffer(capacity=10_000, use_symmetry_augmentation=False)
     samples = []
     for i in range(n):
-        policy = rng.random(ACTION_SPACE_SIZE).astype(np.float32)
+        # Mask first, then build a policy that is zero outside the mask — the
+        # invariant the production pipeline maintains (MCTS visits never touch
+        # illegal actions). Without this, masked log_softmax × uniform policy
+        # produces 0 × -inf = NaN in the cross-entropy loss.
+        mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
+        mask[rng.choice(ACTION_SPACE_SIZE, size=20, replace=False)] = True
+        policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+        policy[mask] = rng.random(int(mask.sum())).astype(np.float32)
         policy /= policy.sum()
         samples.append(
             SampleRecord(
                 encoded_state=rng.random((_NUM_PLANES, NUM_POSITIONS)).astype(np.float32),
                 policy_target=policy,
                 value_target=float(rng.choice([-1.0, 0.0, 1.0])),
+                legal_mask=mask,
             )
         )
     buf.add_samples(samples)

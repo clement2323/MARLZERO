@@ -20,13 +20,13 @@ Weight decay (L2 regularisation) is handled by the Adam optimiser.
 
 Action masking during training
 -------------------------------
-During self-play the network is called with the exact legal-action mask so that
-illegal actions get zero probability.  During training we pass a full-True mask
-so that log_softmax is computed over all 600 actions.  This is valid because
-the MCTS visit distribution stored in the replay buffer already has zero mass on
-illegal actions; the cross-entropy loss gradient therefore only trains the
-log-probabilities of legal moves.  Illegal actions get no explicit push-to-zero
-signal, but the masking at inference time guarantees they are never selected.
+The same legal-action mask used at inference is used during training: the
+log_softmax is normalised over the legal support only.  This matches the
+distribution the MCTS visit target was sampled from (priors are masked at the
+root) and avoids wasting gradient on logits for illegal actions that will be
+discarded by the inference-time mask anyway.  The mask is stored alongside
+each sample in the replay buffer (see :class:`SampleRecord.legal_mask`) so it
+survives symmetry augmentation and buffer replay.
 """
 
 from __future__ import annotations
@@ -112,7 +112,13 @@ def compute_loss(
     Returns:
         Tuple of (total_loss, policy_loss, value_loss).
     """
-    policy_loss = -(policy_target * log_policy).sum(dim=1).mean()
+    # When the network forward uses a legal-action mask, illegal positions
+    # have log_policy=-inf. policy_target is 0 there (MCTS never visits an
+    # illegal action), but 0 × -inf = NaN in float math. Replace those terms
+    # with 0 explicitly.
+    contrib = policy_target * log_policy
+    contrib = torch.where(policy_target > 0, contrib, torch.zeros_like(contrib))
+    policy_loss = -contrib.sum(dim=1).mean()
     value_loss = F.mse_loss(value, value_target)
     return policy_loss + value_loss, policy_loss, value_loss
 
@@ -223,15 +229,17 @@ class Trainer:
             Dict with keys ``total_loss``, ``policy_loss``, ``value_loss``,
             ``learning_rate``.
         """
-        states, policy_targets, value_targets = buffer.sample(batch_size, device=self._device)
-
-        # Full-True mask: training does not filter illegal actions (see module docstring).
-        full_mask = torch.ones(states.shape[0], ACTION_SPACE_SIZE, dtype=torch.bool, device=self._device)
+        states, policy_targets, value_targets, legal_masks = buffer.sample(
+            batch_size, device=self._device
+        )
 
         self._optimizer.zero_grad()
 
         with torch.autocast(device_type=self._device.type, enabled=self._amp_enabled):
-            log_policy, value = self._network(states, full_mask)
+            # Masked log_softmax: same operator as inference. The MCTS visit
+            # distribution is implicitly conditional on legal actions, so we
+            # match by normalising over the same support during training.
+            log_policy, value = self._network(states, legal_masks)
             total_loss, policy_loss, value_loss = compute_loss(
                 log_policy, value, policy_targets, value_targets
             )

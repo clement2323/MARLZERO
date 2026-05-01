@@ -32,13 +32,19 @@ _NUM_PLANES = 7
 class SampleRecord:
     """One training sample from a self-play position."""
 
-    encoded_state: npt.NDArray[np.float32]   # (8, 24)
+    encoded_state: npt.NDArray[np.float32]   # (7, 24)
     policy_target: npt.NDArray[np.float32]  # (ACTION_SPACE_SIZE,)
     value_target: float                     # in {-1.0, 0.0, 1.0}, current-player perspective
+    legal_mask: npt.NDArray[np.bool_]       # (ACTION_SPACE_SIZE,) True on legal actions
 
 
 def _augment_sample(sample: SampleRecord) -> list[SampleRecord]:
-    """Return the 7 non-identity symmetric variants of a sample."""
+    """Return the 7 non-identity symmetric variants of a sample.
+
+    The legal_mask transforms exactly like the policy: a legal action under
+    the original orientation maps to the same legal action under the rotated
+    board (transform_policy is dtype-agnostic and works on bool arrays).
+    """
     augmented = []
     for perm in SYMMETRY_PERMUTATIONS[1:]:
         augmented.append(
@@ -46,6 +52,7 @@ def _augment_sample(sample: SampleRecord) -> list[SampleRecord]:
                 encoded_state=transform_encoded_state(sample.encoded_state, perm),
                 policy_target=transform_policy(sample.policy_target, perm),
                 value_target=sample.value_target,
+                legal_mask=transform_policy(sample.legal_mask, perm),
             )
         )
     return augmented
@@ -76,6 +83,10 @@ class ReplayBuffer:
         self._states = np.zeros((capacity, _NUM_PLANES, NUM_POSITIONS), dtype=np.float32)
         self._policies = np.zeros((capacity, ACTION_SPACE_SIZE), dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
+        # Legal-action mask, kept aligned with the trainer's masked log_softmax.
+        # bool dtype = 1 byte/element; ~300 MB at capacity=500k. Could be packed
+        # via np.packbits for ~8× compression if memory ever becomes tight.
+        self._masks = np.zeros((capacity, ACTION_SPACE_SIZE), dtype=np.bool_)
 
         self._write_ptr = 0
         self._size = 0
@@ -110,13 +121,14 @@ class ReplayBuffer:
         self,
         batch_size: int,
         device: torch.device | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return a random minibatch as (states, policies, values) tensors.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return a random minibatch as (states, policies, values, masks) tensors.
 
         Shapes:
-            states:   (batch_size, 8, 24)
+            states:   (batch_size, 7, 24)
             policies: (batch_size, ACTION_SPACE_SIZE)
             values:   (batch_size,)
+            masks:    (batch_size, ACTION_SPACE_SIZE)  bool
 
         Raises:
             ValueError: if the buffer contains fewer than batch_size samples.
@@ -130,17 +142,20 @@ class ReplayBuffer:
             states_np = self._states[indices].copy()
             policies_np = self._policies[indices].copy()
             values_np = self._values[indices].copy()
+            masks_np = self._masks[indices].copy()
 
         states = torch.from_numpy(states_np)
         policies = torch.from_numpy(policies_np)
         values = torch.from_numpy(values_np)
+        masks = torch.from_numpy(masks_np)
 
         if device is not None:
             states = states.to(device)
             policies = policies.to(device)
             values = values.to(device)
+            masks = masks.to(device)
 
-        return states, policies, values
+        return states, policies, values, masks
 
     # ------------------------------------------------------------------
     # Introspection
@@ -167,6 +182,7 @@ class ReplayBuffer:
                 states=self._states[: self._size],
                 policies=self._policies[: self._size],
                 values=self._values[: self._size],
+                masks=self._masks[: self._size],
                 write_ptr=np.array([self._write_ptr], dtype=np.int64),
                 size=np.array([self._size], dtype=np.int64),
                 capacity=np.array([self._capacity], dtype=np.int64),
@@ -178,6 +194,10 @@ class ReplayBuffer:
         Capacity must match. Stored entries are placed at the start of the
         circular buffer; the write pointer is restored so subsequent writes
         continue evicting in FIFO order.
+
+        Backward compat: a buffer saved before legal_mask was introduced
+        won't have a "masks" key — in that case we fall back to all-True
+        masks (equivalent to the old full_mask behaviour for those samples).
         """
         from pathlib import Path
         data = np.load(Path(path))
@@ -192,6 +212,10 @@ class ReplayBuffer:
             self._states[:size] = data["states"]
             self._policies[:size] = data["policies"]
             self._values[:size] = data["values"]
+            if "masks" in data.files:
+                self._masks[:size] = data["masks"]
+            else:
+                self._masks[:size] = True
             self._size = size
             self._write_ptr = int(data["write_ptr"][0])
 
@@ -204,6 +228,7 @@ class ReplayBuffer:
         self._states[self._write_ptr] = sample.encoded_state
         self._policies[self._write_ptr] = sample.policy_target
         self._values[self._write_ptr] = sample.value_target
+        self._masks[self._write_ptr] = sample.legal_mask
         self._write_ptr = (self._write_ptr + 1) % self._capacity
         if self._size < self._capacity:
             self._size += 1

@@ -35,9 +35,11 @@ import torch.nn as nn
 from morris_rl.env.rules import (
     Outcome,
     apply_action,
+    get_legal_actions,
     initial_state,
     is_terminal,
 )
+from morris_rl.env.board import ACTION_SPACE_SIZE
 from morris_rl.network.resnet import MorrisResNet
 from morris_rl.training.replay_buffer import SampleRecord
 
@@ -77,19 +79,33 @@ def _temperature_for_move(move_number: int, threshold: int) -> float:
 
 
 def _assign_value_targets(
-    steps: list[tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], int]],
+    steps: list[
+        tuple[
+            npt.NDArray[np.float32],
+            npt.NDArray[np.float32],
+            int,
+            npt.NDArray[np.bool_],
+        ]
+    ],
     outcome: Outcome | None,
 ) -> list[SampleRecord]:
-    """Convert (encoded, policy, current_player) triples into SampleRecords."""
+    """Convert (encoded, policy, current_player, legal_mask) tuples into SampleRecords."""
     records: list[SampleRecord] = []
-    for encoded, policy, player in steps:
+    for encoded, policy, player, mask in steps:
         if outcome is None or outcome == Outcome.DRAW:
             v = 0.0
         elif int(outcome) == player:
             v = 1.0
         else:
             v = -1.0
-        records.append(SampleRecord(encoded_state=encoded, policy_target=policy, value_target=v))
+        records.append(
+            SampleRecord(
+                encoded_state=encoded,
+                policy_target=policy,
+                value_target=v,
+                legal_mask=mask,
+            )
+        )
     return records
 
 
@@ -98,7 +114,14 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
     from morris_rl.mcts.search import encode_state  # cached after worker import
 
     state = initial_state()
-    steps: list[tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], int]] = []
+    steps: list[
+        tuple[
+            npt.NDArray[np.float32],
+            npt.NDArray[np.float32],
+            int,
+            npt.NDArray[np.bool_],
+        ]
+    ] = []
     move_count = 0
 
     while True:
@@ -108,8 +131,12 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
 
         temp = _temperature_for_move(move_count, temperature_threshold)
         encoded = encode_state(state).squeeze(0).numpy().copy()
+        # Snapshot the legal mask BEFORE applying the chosen action — we want
+        # the mask of the state the policy_target was computed for.
+        legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
+        legal_mask[get_legal_actions(state)] = True
         action, visit_probs = search.run(state, temperature=temp, add_noise=True)
-        steps.append((encoded, visit_probs, state.current_player))
+        steps.append((encoded, visit_probs, state.current_player, legal_mask))
         state = apply_action(state, action)
         move_count += 1
 
