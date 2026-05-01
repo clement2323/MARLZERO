@@ -1,15 +1,28 @@
-.PHONY: train train-tmux train-tmux-kill serve web tensorboard mlflow-ui dev clean
+.PHONY: help train train-tmux train-tmux-kill serve web tensorboard mlflow-ui play dev clean
+.DEFAULT_GOAL := help
 
-train:
+# ---------------------------------------------------------------------------
+# Self-documenting help — each target's `## description` annotation is parsed
+# below and printed by `make help`. Group headings start with `##@`.
+# ---------------------------------------------------------------------------
+
+help:  ## Show this help message
+	@awk 'BEGIN {FS = ":.*?## "} \
+	  /^##@/ {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
+	  /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}' \
+	  $(MAKEFILE_LIST)
+
+##@ Training
+
+train:  ## Run training in foreground (Ctrl-C to stop)
 	uv run python scripts/train.py
 
 # Long-running production training in a detached tmux session — survives
-# closing the terminal. Encodes the canonical flag set so we don't retype
-# them every time. Override TRAIN_SESSION to run multiple in parallel
-# (not recommended on 30 GB RAM).
+# closing the terminal. Override TRAIN_SESSION to pick a different session
+# name (e.g. TRAIN_SESSION=tier3 make train-tmux).
 TRAIN_SESSION ?= train
 
-train-tmux:
+train-tmux:  ## Run training in a detached tmux session (canonical 100k-step config)
 	@if tmux has-session -t $(TRAIN_SESSION) 2>/dev/null; then \
 	  echo "tmux session '$(TRAIN_SESSION)' already active. Attach with: tmux attach -t $(TRAIN_SESSION)"; \
 	  exit 1; \
@@ -28,28 +41,48 @@ train-tmux:
 	@echo "  Detach: Ctrl-b then d"
 	@echo "  Kill:   make train-tmux-kill"
 
-train-tmux-kill:
+train-tmux-kill:  ## Stop the detached training session
 	tmux kill-session -t $(TRAIN_SESSION) 2>/dev/null || true
 	@echo "Session '$(TRAIN_SESSION)' stopped."
 
-serve:
+##@ Demo (play against the agent in the browser)
+
+# Auto-pick the most recent checkpoint unless the user passes one explicitly:
+#   make play                                # latest checkpoint
+#   MODEL_CHECKPOINT=path/to/file.pt make play
+MODEL_CHECKPOINT ?= $(shell ls -1t outputs/*/*/checkpoints/checkpoint_*.pt 2>/dev/null | head -1)
+
+play:  ## Launch backend + frontend together against the latest checkpoint
+	@if [ -z "$(MODEL_CHECKPOINT)" ]; then \
+	  echo "No checkpoint found in outputs/*/*/checkpoints/. Train one or set MODEL_CHECKPOINT explicitly."; \
+	  exit 1; \
+	fi
+	@echo "Checkpoint: $(MODEL_CHECKPOINT)"
+	@echo "Backend:    http://127.0.0.1:8000"
+	@echo "Frontend:   http://127.0.0.1:5173"
+	@echo "Ctrl-C to stop both."
+	@trap 'kill 0' INT; \
+	  MODEL_CHECKPOINT="$(MODEL_CHECKPOINT)" $(MAKE) serve & \
+	  $(MAKE) web & \
+	  wait
+
+serve:  ## Run the FastAPI inference backend alone (uses MODEL_CHECKPOINT env)
 	uv run uvicorn morris_rl.inference.server:app --reload --port 8000
 
-web:
+web:  ## Run the React/Vite frontend alone (expects backend on :8000)
 	cd web && npm run dev
 
-tensorboard:
-	uv run tensorboard --logdir outputs --port 6006 --reload_multifile true
+##@ Monitoring
 
-# Read-only MLflow UI for the file-based store. Costs ~50 MB RAM
-# vs ~1.5 GB for `mlflow server` — that overhead OOM'd a training run
-# previously, so default is `mlflow ui` and we never spawn the full server.
-mlflow-ui:
+mlflow-ui:  ## Read-only MLflow UI on file:./mlruns (~50 MB RAM)
 	uv run mlflow ui --backend-store-uri file:./mlruns --port 5000
 
-# All-in-one: training + inference + web demo + tensorboard, in parallel.
-# Ctrl+C kills the whole group via the INT trap.
-dev:
+tensorboard:  ## TensorBoard UI on outputs/ (port 6006)
+	uv run tensorboard --logdir outputs --port 6006 --reload_multifile true
+
+##@ All-in-one
+
+dev:  ## Train + backend + frontend + tensorboard in parallel (Ctrl-C kills all)
 	@trap 'kill 0' INT; \
 	$(MAKE) train & \
 	$(MAKE) serve & \
@@ -57,5 +90,7 @@ dev:
 	$(MAKE) tensorboard & \
 	wait
 
-clean:
+##@ Maintenance
+
+clean:  ## Remove training outputs and caches
 	rm -rf outputs/ multirun/ wandb/ .pytest_cache/ web/node_modules/.vite
