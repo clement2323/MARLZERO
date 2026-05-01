@@ -356,12 +356,14 @@ def test_draw_halfmove_clock_at_limit() -> None:
 def test_draw_threefold_repetition() -> None:
     # P1 bounces 0↔1, P2 bounces 10↔11.  One full round-trip restores the
     # same (board, player) position.  The starting position is NOT pre-registered
-    # in _make_state, so we need 3 full round-trips to reach count == 3.
+    # in _make_state, so we need THREEFOLD_LIMIT full round-trips to trigger draw.
+    from morris_rl.env.rules import THREEFOLD_LIMIT
+
     board = [0] * NUM_POSITIONS
     board[0] = board[2] = board[4] = PLAYER_1
     board[8] = board[10] = board[12] = PLAYER_2
     s = _make_state(board, current_player=PLAYER_1, p1_hand=0, p2_hand=0)
-    for _ in range(3):
+    for _ in range(THREEFOLD_LIMIT):
         s = apply_action(s, _encode_move(0, 1))   # P1: 0→1
         s = apply_action(s, _encode_move(10, 11))  # P2: 10→11
         s = apply_action(s, _encode_move(1, 0))    # P1: 1→0

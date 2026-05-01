@@ -29,8 +29,8 @@ PLAYER_1: Final[int] = 1
 PLAYER_2: Final[int] = 2
 EMPTY: Final[int] = 0
 
-MAX_HALFMOVES: Final[int] = 50
-THREEFOLD_LIMIT: Final[int] = 3
+MAX_HALFMOVES: Final[int] = 300
+THREEFOLD_LIMIT: Final[int] = 10
 
 
 class Phase(IntEnum):
