@@ -36,7 +36,8 @@ THREEFOLD_LIMIT: Final[int] = 10
 class Phase(IntEnum):
     PLACING = 0
     MOVING = 1
-    FLYING = 2
+    # No FLYING phase: this variant keeps the adjacency constraint even at 3
+    # pieces. A player with no legal move (blocked by adjacency) loses.
 
 
 class Outcome(IntEnum):
@@ -87,7 +88,7 @@ def get_phase(state: GameState, player: int) -> Phase:
     """Return the current phase for *player* (may differ between players)."""
     if state.pieces_in_hand[player - 1] > 0:
         return Phase.PLACING
-    return Phase.FLYING if pieces_on_board(state.board, player) == 3 else Phase.MOVING
+    return Phase.MOVING
 
 
 def forms_mill(board: np.ndarray, position: int, player: int) -> bool:
@@ -126,9 +127,7 @@ def get_legal_actions(state: GameState) -> list[int]:
     phase = get_phase(state, state.current_player)
     if phase == Phase.PLACING:
         return [p for p in range(NUM_POSITIONS) if state.board[p] == EMPTY]
-    if phase == Phase.MOVING:
-        return _legal_move_actions(state)
-    return _legal_fly_actions(state)
+    return _legal_move_actions(state)
 
 
 def apply_action(state: GameState, action: int) -> GameState:
@@ -207,15 +206,6 @@ def _legal_move_actions(state: GameState) -> list[int]:
             if state.board[dst] == EMPTY:
                 actions.append(NUM_PLACE_CAPTURE_ACTIONS + src * NUM_POSITIONS + dst)
     return actions
-
-
-def _legal_fly_actions(state: GameState) -> list[int]:
-    player = state.current_player
-    sources = [p for p in range(NUM_POSITIONS) if state.board[p] == player]
-    targets = [p for p in range(NUM_POSITIONS) if state.board[p] == EMPTY]
-    return [
-        NUM_PLACE_CAPTURE_ACTIONS + src * NUM_POSITIONS + dst for src in sources for dst in targets
-    ]
 
 
 def _apply_placement(state: GameState, position: int) -> None:

@@ -25,7 +25,7 @@ from morris_rl.env.symmetries import (
     transform_policy,
 )
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 
 
 @dataclass

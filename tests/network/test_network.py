@@ -10,7 +10,7 @@ from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_POSITIONS
 from morris_rl.network.factory import build_network
 from morris_rl.network.resnet import MorrisResNet
 
-NUM_PLANES = 8
+NUM_PLANES = 7
 BATCH = 4
 
 

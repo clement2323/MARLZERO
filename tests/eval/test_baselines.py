@@ -15,7 +15,7 @@ _DEVICE = torch.device("cpu")
 
 def _small_net() -> MorrisResNet:
     net = MorrisResNet(
-        num_blocks=1, num_channels=8, num_planes=8,
+        num_blocks=1, num_channels=8, num_planes=7,
         policy_head_hidden=16, value_head_hidden=16,
     )
     net.eval()

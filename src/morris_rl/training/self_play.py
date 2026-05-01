@@ -41,7 +41,7 @@ from morris_rl.env.rules import (
 from morris_rl.network.resnet import MorrisResNet
 from morris_rl.training.replay_buffer import SampleRecord
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 _ARGMAX_TEMPERATURE = 1e-6
 
 

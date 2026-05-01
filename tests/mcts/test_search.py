@@ -16,7 +16,7 @@ from morris_rl.env.rules import (
 from morris_rl.mcts.search import MorrisSearch, MorrisSimEnv, encode_state
 from morris_rl.network.resnet import MorrisResNet
 
-NUM_PLANES = 8
+NUM_PLANES = 7
 DEVICE = torch.device("cpu")
 
 
@@ -83,7 +83,8 @@ def test_encode_state_must_capture_plane() -> None:
     state = apply_action(state, 1)  # P1 → 1, mill! must_capture=True
     assert state.must_capture
     t = encode_state(state)
-    assert (t[0, 7] == 1.0).all()
+    # must_capture is plane 6 in the 7-plane variant (was 7 with FLYING).
+    assert (t[0, 6] == 1.0).all()
 
 
 # ---------------------------------------------------------------------------

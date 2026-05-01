@@ -24,4 +24,4 @@ export interface PlayResponse {
   agent_name: string;
 }
 
-export type GamePhase = "placing" | "moving" | "flying" | "game_over";
+export type GamePhase = "placing" | "moving" | "game_over";

@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 
 from morris_rl.network.resnet import MorrisResNet
 
-_NUM_INPUT_PLANES = 8  # defined by the encoding scheme (see encoding.py)
+_NUM_INPUT_PLANES = 7  # defined by the encoding scheme (see mcts/search.py:encode_state)
 
 
 def build_network(config: DictConfig) -> nn.Module:

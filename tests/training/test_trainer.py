@@ -14,7 +14,7 @@ from morris_rl.network.resnet import MorrisResNet
 from morris_rl.training.replay_buffer import ReplayBuffer, SampleRecord
 from morris_rl.training.trainer import Trainer, compute_loss
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 _DEVICE = torch.device("cpu")
 
 

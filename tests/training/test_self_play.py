@@ -20,7 +20,7 @@ from morris_rl.training.self_play import (
     _temperature_for_move,
 )
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 _DEVICE = torch.device("cpu")
 _SMALL_NET_CFG = {
     "num_blocks": 1,

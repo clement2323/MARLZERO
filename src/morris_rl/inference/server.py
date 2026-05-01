@@ -50,7 +50,7 @@ from morris_rl.network.resnet import MorrisResNet
 from morris_rl.utils.checkpoints import load_checkpoint
 from morris_rl.utils.logging import logger
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 
 # Module-level agent and (optional) network — set during lifespan startup.
 _agent: Agent | None = None

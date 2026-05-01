@@ -9,7 +9,7 @@ import torch
 from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_POSITIONS
 from morris_rl.training.replay_buffer import ReplayBuffer, SampleRecord
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 
 
 def _make_sample(seed: int = 0) -> SampleRecord:

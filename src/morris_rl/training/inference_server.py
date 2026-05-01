@@ -54,7 +54,7 @@ from morris_rl.env.board import ACTION_SPACE_SIZE
 from morris_rl.network.resnet import MorrisResNet
 from morris_rl.utils.logging import logger
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 
 
 @dataclass(frozen=True)

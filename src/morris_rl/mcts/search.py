@@ -44,7 +44,7 @@ from morris_rl.env.rules import (
     opponent,
 )
 
-_NUM_PLANES = 8
+_NUM_PLANES = 7
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ _NUM_PLANES = 8
 
 
 def encode_state(state: GameState) -> torch.Tensor:
-    """Encode a GameState as a float32 tensor of shape (1, 8, 24).
+    """Encode a GameState as a float32 tensor of shape (1, 7, 24).
 
     Planes:
         0 — current player's pieces
@@ -62,8 +62,11 @@ def encode_state(state: GameState) -> torch.Tensor:
         3 — opponent's hand fraction (scalar broadcast)
         4 — phase == PLACING (broadcast)
         5 — phase == MOVING (broadcast)
-        6 — phase == FLYING (broadcast)
-        7 — must_capture flag (broadcast)
+        6 — must_capture flag (broadcast)
+
+    No FLYING plane: this variant removes the standard flying rule, so a
+    player at 3 pieces is still in the MOVING phase (constrained to
+    adjacency).
     """
     player = state.current_player
     opp = opponent(player)
@@ -77,9 +80,9 @@ def encode_state(state: GameState) -> torch.Tensor:
     planes[2] = hand[player - 1] / NUM_PIECES_PER_PLAYER
     planes[3] = hand[opp - 1] / NUM_PIECES_PER_PLAYER
     planes[4 + phase] = 1.0
-    planes[7] = float(state.must_capture)
+    planes[6] = float(state.must_capture)
 
-    return torch.from_numpy(planes).unsqueeze(0)  # (1, 8, 24)
+    return torch.from_numpy(planes).unsqueeze(0)  # (1, 7, 24)
 
 
 # ---------------------------------------------------------------------------

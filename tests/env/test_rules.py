@@ -21,6 +21,7 @@ from morris_rl.env.rules import (
     get_phase,
     initial_state,
     is_terminal,
+    opponent,
 )
 
 # ---------------------------------------------------------------------------
@@ -238,11 +239,13 @@ def test_phase_moving_after_all_placed() -> None:
     assert get_phase(state, PLAYER_1) == Phase.MOVING
 
 
-def test_phase_flying_with_three_pieces() -> None:
+def test_phase_remains_moving_with_three_pieces() -> None:
+    # No FLYING phase in this variant — a player with 3 pieces is still in
+    # MOVING and stays bound to adjacency.
     board = [0] * NUM_POSITIONS
     board[0] = board[1] = board[2] = PLAYER_1  # exactly 3 pieces
     state = _make_state(board, current_player=PLAYER_1, p1_hand=0)
-    assert get_phase(state, PLAYER_1) == Phase.FLYING
+    assert get_phase(state, PLAYER_1) == Phase.MOVING
 
 
 # ---------------------------------------------------------------------------
@@ -275,21 +278,40 @@ def test_movement_increments_halfmove_clock() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Flying
+# Three-piece endgame (flying removed in this variant)
 # ---------------------------------------------------------------------------
 
 
-def test_flying_can_reach_any_empty_position() -> None:
+def test_three_pieces_only_adjacent_moves() -> None:
+    # With FLYING removed, a player at 3 pieces can still ONLY move to
+    # adjacent empties. Non-adjacent destinations remain illegal.
     board = [0] * NUM_POSITIONS
-    board[0] = board[2] = board[4] = PLAYER_1  # 3 pieces → flying
+    board[0] = board[2] = board[4] = PLAYER_1  # 3 pieces; would have been flying
     board[8] = board[9] = board[10] = PLAYER_2
     state = _make_state(board, current_player=PLAYER_1, p1_hand=0, p2_hand=0)
-    assert get_phase(state, PLAYER_1) == Phase.FLYING
+    assert get_phase(state, PLAYER_1) == Phase.MOVING
     legal = get_legal_actions(state)
-    # P1 piece at 0 should be able to fly to any empty square
-    empty_positions = [p for p in range(NUM_POSITIONS) if board[p] == EMPTY]
-    for dst in empty_positions:
-        assert _encode_move(0, dst) in legal
+    # Position 0 is only adjacent to 1 and 9 (and 9 is occupied by P2).
+    # Position 11 is empty but NOT adjacent to 0 → must be illegal even though
+    # under flying rules it would be reachable.
+    assert _encode_move(0, 11) not in legal
+    assert _encode_move(0, 1) in legal
+
+
+def test_three_pieces_blocked_loses() -> None:
+    # Endgame edge: at 3 pieces, if all of a player's pieces are adjacency-
+    # blocked, the "no legal moves" terminal condition wins for the opponent.
+    # Without flying this scenario becomes reachable; with flying it could not.
+    # P1 sits at outer corners 0, 2, 4 (each has exactly 2 adjacents).
+    # P2 occupies 1, 3, 5, 7 to block every P1 adjacency.
+    # Adjacencies: 0↔{1,7}, 2↔{1,3}, 4↔{3,5} — all P2-blocked.
+    board = [0] * NUM_POSITIONS
+    board[0] = board[2] = board[4] = PLAYER_1
+    board[1] = board[3] = board[5] = board[7] = PLAYER_2
+    state = _make_state(board, current_player=PLAYER_1, p1_hand=0, p2_hand=0)
+    done, outcome = is_terminal(state)
+    assert done
+    assert outcome == Outcome(opponent(PLAYER_1))
 
 
 # ---------------------------------------------------------------------------

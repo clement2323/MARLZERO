@@ -6,7 +6,7 @@ of the 24 board positions.
 
 Transforms apply to:
   - board arrays (shape (24,)): permute position indices
-  - encoded states (shape (8, 24)): permute only the position-dependent planes
+  - encoded states (shape (7, 24)): permute only the position-dependent planes
   - policy vectors (shape (600,)): permute place/capture and move/fly indices
   - value targets: unchanged (outcome is orientation-independent)
 
@@ -84,9 +84,9 @@ def transform_board(board: npt.NDArray[Any], perm: npt.NDArray[np.intp]) -> npt.
 def transform_encoded_state(
     encoded: npt.NDArray[np.float32], perm: npt.NDArray[np.intp]
 ) -> npt.NDArray[np.float32]:
-    """Apply a board symmetry to an encoded state of shape (8, 24).
+    """Apply a board symmetry to an encoded state of shape (7, 24).
 
-    Only planes 0-1 (piece positions) are position-dependent; planes 2-7 are
+    Only planes 0-1 (piece positions) are position-dependent; planes 2-6 are
     scalar broadcasts that are invariant under symmetry.
     """
     new_encoded = encoded.copy()

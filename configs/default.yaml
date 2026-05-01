@@ -18,13 +18,13 @@ network:
   value_head_hidden: 64
 
 input_encoding:
-  num_planes: 8
+  num_planes: 7
   # Plane 0: current player's pieces
   # Plane 1: opponent's pieces
   # Plane 2: pieces in current player's hand (scalar broadcast, divided by 9)
   # Plane 3: pieces in opponent's hand
-  # Planes 4-6: phase one-hot (placing, moving, flying)
-  # Plane 7: must-capture flag (set after forming a mill)
+  # Planes 4-5: phase one-hot (placing, moving) — no FLYING in this variant
+  # Plane 6: must-capture flag (set after forming a mill)
 
 mcts:
   num_simulations_train: 150
