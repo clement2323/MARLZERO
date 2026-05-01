@@ -33,11 +33,14 @@ import torch
 import torch.nn as nn
 
 from morris_rl.env.rules import (
+    MAX_HALFMOVES,
+    THREEFOLD_LIMIT,
     Outcome,
     apply_action,
     get_legal_actions,
     initial_state,
     is_terminal,
+    pieces_on_board,
 )
 from morris_rl.env.board import ACTION_SPACE_SIZE
 from morris_rl.network.resnet import MorrisResNet
@@ -59,6 +62,22 @@ class GameRecord:
     samples: list[SampleRecord]
     game_length: int            # total half-moves played
     outcome: int                # 1=player1, 2=player2, -1=draw
+
+    # Per-game observability stats (logged by the trainer for diagnostics).
+    # Defaults make the field backward-compatible with code that builds
+    # GameRecord positionally (older tests).
+    mills_p1: int = 0           # mills formed by P1 during the game
+    mills_p2: int = 0
+    captures_p1: int = 0        # opponent pieces removed by P1
+    captures_p2: int = 0
+    final_pieces_diff: int = 0  # pieces_p1 - pieces_p2 at game end (signed)
+    # Why the game ended. One of:
+    #   "pieces_below_3"    — losing player reduced to <3 on board (no hand left)
+    #   "no_legal_moves"    — losing player blocked by adjacency
+    #   "halfmove_cap"      — drew by MAX_HALFMOVES no-progress clock
+    #   "threefold"         — drew by repetition limit
+    #   "resign"            — losing player resigned (only with feature 1 active)
+    term_reason: str = "unknown"
 
 
 @dataclass
@@ -123,6 +142,15 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
         ]
     ] = []
     move_count = 0
+    # Per-game observability counters. Mills are detected via the
+    # not-must_capture → must_capture transition (forming a mill enables a
+    # capture); captures are the reverse transition (must_capture → not).
+    # Both events are credited to the player who was at the trait BEFORE
+    # the action.
+    mills_p1 = 0
+    mills_p2 = 0
+    captures_p1 = 0
+    captures_p2 = 0
 
     while True:
         done, _ = is_terminal(state)
@@ -137,13 +165,61 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
         legal_mask[get_legal_actions(state)] = True
         action, visit_probs = search.run(state, temperature=temp, add_noise=True)
         steps.append((encoded, visit_probs, state.current_player, legal_mask))
+
+        # Capture stats around the action: state.must_capture flips are the
+        # cleanest signal of mill / capture events.
+        was_must_capture = state.must_capture
+        actor = state.current_player
         state = apply_action(state, action)
+        if not was_must_capture and state.must_capture:
+            # The just-played placement/move formed a mill (forced capture next).
+            if actor == 1:
+                mills_p1 += 1
+            else:
+                mills_p2 += 1
+        elif was_must_capture and not state.must_capture:
+            # The just-played action consumed a forced-capture sub-turn.
+            if actor == 1:
+                captures_p1 += 1
+            else:
+                captures_p2 += 1
         move_count += 1
 
     _, outcome = is_terminal(state)
+    term_reason = _detect_term_reason(state, outcome)
+    final_pieces_diff = (
+        pieces_on_board(state.board, 1) - pieces_on_board(state.board, 2)
+    )
+
     samples = _assign_value_targets(steps, outcome)
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
-    return GameRecord(samples=samples, game_length=move_count, outcome=outcome_int)
+    return GameRecord(
+        samples=samples,
+        game_length=move_count,
+        outcome=outcome_int,
+        mills_p1=mills_p1,
+        mills_p2=mills_p2,
+        captures_p1=captures_p1,
+        captures_p2=captures_p2,
+        final_pieces_diff=final_pieces_diff,
+        term_reason=term_reason,
+    )
+
+
+def _detect_term_reason(state: Any, outcome: Outcome | None) -> str:
+    """Identify why the game just terminated, mirroring is_terminal()'s order."""
+    # Threefold has highest priority in is_terminal(), so check it first.
+    if state.position_counts and max(state.position_counts.values()) >= THREEFOLD_LIMIT:
+        return "threefold"
+    if state.halfmove_clock >= MAX_HALFMOVES:
+        return "halfmove_cap"
+    player = state.current_player
+    if state.pieces_in_hand[player - 1] == 0:
+        if pieces_on_board(state.board, player) < 3:
+            return "pieces_below_3"
+    if not get_legal_actions(state):
+        return "no_legal_moves"
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------

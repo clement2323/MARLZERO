@@ -154,6 +154,61 @@ def test_play_game_policy_nonnegative(search: MorrisSearch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-game observability stats (mills, captures, term_reason, pieces_diff)
+# ---------------------------------------------------------------------------
+
+
+def test_play_game_observability_fields_set(search: MorrisSearch) -> None:
+    """All observability counters and term_reason are populated."""
+    result = _play_game(search, temperature_threshold=2)
+    # Counters are non-negative integers.
+    assert result.mills_p1 >= 0
+    assert result.mills_p2 >= 0
+    assert result.captures_p1 >= 0
+    assert result.captures_p2 >= 0
+    # final_pieces_diff is signed but bounded by the 18 placed pieces.
+    assert -18 <= result.final_pieces_diff <= 18
+    # term_reason is one of the documented enum values (or "unknown" only as
+    # a sentinel — never expected on a properly terminated game).
+    assert result.term_reason in {
+        "pieces_below_3",
+        "no_legal_moves",
+        "halfmove_cap",
+        "threefold",
+        "resign",
+    }
+
+
+def test_play_game_captures_match_mills_in_count(search: MorrisSearch) -> None:
+    """Each mill formed enables exactly one capture (modulo unfinished sub-turns)."""
+    result = _play_game(search, temperature_threshold=2)
+    # The number of captures by a player can be at most the mills they formed.
+    # Equality usually holds; strict inequality only if the game terminated
+    # right between mill formation and capture (extremely rare with our rules).
+    assert result.captures_p1 <= result.mills_p1
+    assert result.captures_p2 <= result.mills_p2
+
+
+def test_play_game_term_reason_threefold_under_repetition() -> None:
+    """When a game ends by threefold, term_reason reflects that."""
+    # Force threefold by playing a game from scratch: the small net at depth 5
+    # sometimes oscillates. We just verify the detector logic given a state.
+    from morris_rl.training.self_play import _detect_term_reason
+    from morris_rl.env.rules import GameState, Outcome, THREEFOLD_LIMIT
+    state = GameState(
+        board=np.zeros(NUM_POSITIONS, dtype=np.int8),
+        current_player=1,
+        pieces_in_hand=(0, 0),
+        must_capture=False,
+        halfmove_clock=0,
+        position_counts={(0,) * 24 + (1, 0, 0, 0): THREEFOLD_LIMIT},
+    )
+    state.board[0] = state.board[1] = state.board[2] = 1
+    state.board[5] = state.board[6] = state.board[7] = 2
+    assert _detect_term_reason(state, Outcome.DRAW) == "threefold"
+
+
+# ---------------------------------------------------------------------------
 # SelfPlayManager — start / stop (slow: spawns processes)
 # ---------------------------------------------------------------------------
 

@@ -296,6 +296,12 @@ class Trainer:
         """
         games_collected = 0
         recent_lengths: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        # Per-game observability deques (rolling window). Each is the
+        # corresponding GameRecord field across the last N games.
+        recent_mills: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_captures: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_pieces_diff: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_term_reasons: deque[str] = deque(maxlen=_GAME_LENGTH_WINDOW)
         outcome_counts = {"p1_win": 0, "p2_win": 0, "draw": 0}
         self._buffer = buffer  # used by _auto_checkpoint to persist buffer state
 
@@ -324,6 +330,10 @@ class Trainer:
                 buffer.add_samples(game.samples)
                 games_collected += 1
                 recent_lengths.append(game.game_length)
+                recent_mills.append(game.mills_p1 + game.mills_p2)
+                recent_captures.append(game.captures_p1 + game.captures_p2)
+                recent_pieces_diff.append(game.final_pieces_diff)
+                recent_term_reasons.append(game.term_reason)
                 if game.outcome == 1:
                     outcome_counts["p1_win"] += 1
                 elif game.outcome == 2:
@@ -333,7 +343,15 @@ class Trainer:
 
                 self._log_scalar("train/buffer_size", len(buffer))
                 self._log_scalar("train/games_collected", games_collected)
-                self._log_game_stats(recent_lengths, outcome_counts, games_collected)
+                self._log_game_stats(
+                    recent_lengths,
+                    recent_mills,
+                    recent_captures,
+                    recent_pieces_diff,
+                    recent_term_reasons,
+                    outcome_counts,
+                    games_collected,
+                )
 
                 for _ in range(updates_per_game):
                     if self._step >= total_steps:
@@ -452,6 +470,10 @@ class Trainer:
     def _log_game_stats(
         self,
         recent_lengths: deque[int],
+        recent_mills: deque[int],
+        recent_captures: deque[int],
+        recent_pieces_diff: deque[int],
+        recent_term_reasons: deque[str],
         outcome_counts: dict[str, int],
         games_collected: int,
     ) -> None:
@@ -461,12 +483,39 @@ class Trainer:
         last = recent_lengths[-1]
         mean_len = sum(recent_lengths) / len(recent_lengths)
         total = sum(outcome_counts.values()) or 1
+        n_recent = len(recent_term_reasons) or 1
+        # Decompose categorical term_reason into 5 separate fractions so each
+        # one is a scalar metric MLflow/TB can plot directly. Values not seen
+        # in the window default to 0.
+        term_window = list(recent_term_reasons)
         stats: dict[str, float] = {
             "game/length_last": float(last),
             "game/length_mean_window": mean_len,
             "game/p1_win_rate": outcome_counts["p1_win"] / total,
             "game/p2_win_rate": outcome_counts["p2_win"] / total,
             "game/draw_rate": outcome_counts["draw"] / total,
+            "game/mills_per_game_mean": (
+                sum(recent_mills) / len(recent_mills) if recent_mills else 0.0
+            ),
+            "game/captures_per_game_mean": (
+                sum(recent_captures) / len(recent_captures) if recent_captures else 0.0
+            ),
+            "game/final_pieces_diff_mean": (
+                sum(recent_pieces_diff) / len(recent_pieces_diff)
+                if recent_pieces_diff
+                else 0.0
+            ),
+            "game/term_pieces_below_3_rate": (
+                term_window.count("pieces_below_3") / n_recent
+            ),
+            "game/term_no_legal_moves_rate": (
+                term_window.count("no_legal_moves") / n_recent
+            ),
+            "game/term_halfmove_cap_rate": (
+                term_window.count("halfmove_cap") / n_recent
+            ),
+            "game/term_threefold_rate": term_window.count("threefold") / n_recent,
+            "game/term_resign_rate": term_window.count("resign") / n_recent,
         }
         for tag, value in stats.items():
             if self._writer is not None:
