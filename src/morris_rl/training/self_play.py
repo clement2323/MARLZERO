@@ -21,8 +21,11 @@ Dirichlet exploration noise is always added at the MCTS root during training.
 from __future__ import annotations
 
 import multiprocessing as mp
+import threading
 from dataclasses import dataclass, field
 from typing import Any
+
+from morris_rl.utils.logging import logger
 
 import numpy as np
 import numpy.typing as npt
@@ -136,6 +139,33 @@ def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
 # ---------------------------------------------------------------------------
 
 
+def _should_recycle(
+    worker_id: int,
+    games_played: int,
+    proc: Any,
+    max_rss_mb: int,
+    recycle_games: int,
+) -> bool:
+    """Return True when the worker should exit cleanly so the manager respawns
+    it from a fresh Python interpreter — caps the impact of any growing RSS
+    (suspected ctree leaf accumulation in early training).
+    """
+    if recycle_games > 0 and games_played >= recycle_games:
+        from loguru import logger as _log
+        _log.info(f"worker {worker_id}: recycling after {games_played} games")
+        return True
+    if max_rss_mb > 0 and games_played > 0 and games_played % 5 == 0:
+        rss_mb = proc.memory_info().rss / 1e6
+        if rss_mb > max_rss_mb:
+            from loguru import logger as _log
+            _log.warning(
+                f"worker {worker_id}: rss={rss_mb:.0f}MB > {max_rss_mb}MB "
+                f"after {games_played} games, recycling"
+            )
+            return True
+    return False
+
+
 def _worker_fn(
     worker_id: int,
     network_cfg: dict[str, Any],
@@ -146,6 +176,8 @@ def _worker_fn(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     seed: int,
+    worker_max_rss_mb: int = 0,
+    worker_recycle_games: int = 0,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -203,6 +235,10 @@ def _worker_fn(
         dirichlet_epsilon=dirichlet_epsilon,
     )
 
+    import psutil
+    proc = psutil.Process()
+    games_played = 0
+
     while True:
         # Non-blocking check for updated weights or shutdown.
         try:
@@ -217,9 +253,15 @@ def _worker_fn(
         try:
             game = _play_game(search, temperature_threshold=temperature_threshold)
             results_queue.put(game)
+            games_played += 1
         except Exception as exc:
             results_queue.put(WorkerError(exception=exc, worker_id=worker_id))
             return  # Worker shuts down; main process will see the error immediately.
+
+        if _should_recycle(
+            worker_id, games_played, proc, worker_max_rss_mb, worker_recycle_games
+        ):
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +282,8 @@ def _worker_fn_remote(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     seed: int,
+    worker_max_rss_mb: int = 0,
+    worker_recycle_games: int = 0,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -298,12 +342,22 @@ def _worker_fn_remote(
         dirichlet_epsilon=dirichlet_epsilon,
     )
 
+    import psutil
+    proc = psutil.Process()
+    games_played = 0
+
     while not shutdown_event.is_set():
         try:
             game = _play_game(search, temperature_threshold=temperature_threshold)
             results_queue.put(game)
+            games_played += 1
         except Exception as exc:
             results_queue.put(WorkerError(exception=exc, worker_id=worker_id))
+            return
+
+        if _should_recycle(
+            worker_id, games_played, proc, worker_max_rss_mb, worker_recycle_games
+        ):
             return
 
 
@@ -348,6 +402,9 @@ class SelfPlayManager:
         max_batch_size: int = 32,
         max_wait_ms: float = 5.0,
         log_file: str | None = None,
+        worker_max_rss_mb: int = 0,
+        worker_recycle_games: int = 0,
+        watcher_interval_s: float = 5.0,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -364,6 +421,9 @@ class SelfPlayManager:
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
         self._log_file = log_file
+        self._worker_max_rss_mb = worker_max_rss_mb
+        self._worker_recycle_games = worker_recycle_games
+        self._watcher_interval_s = watcher_interval_s
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -375,7 +435,13 @@ class SelfPlayManager:
         ]
         self._shutdown_event: Any = self._ctx.Event()
         self._inference_server: Any = None
-        self._processes: list[Any] = []
+        # Slot per worker — None until first start, then the live Process. The
+        # watcher thread mutates this list when respawning, hence the lock.
+        self._processes: list[Any] = [None] * num_workers
+        self._processes_lock = threading.Lock()
+        self._respawn_count: list[int] = [0] * num_workers
+        self._watcher_thread: threading.Thread | None = None
+        self._watcher_stop = threading.Event()
         self._running = False
 
     def start(self) -> None:
@@ -383,50 +449,38 @@ class SelfPlayManager:
         if self._running:
             return
         if self._inference_mode == "shared_gpu":
-            self._start_shared_gpu()
-        else:
-            self._start_per_worker_cpu()
-        self._running = True
+            from morris_rl.training.inference_server import InferenceServer
 
-    def _start_per_worker_cpu(self) -> None:
-        initial_weights = {k: v.cpu() for k, v in self._network.state_dict().items()}
-        for i in range(self._num_workers):
-            p = self._ctx.Process(
-                target=_worker_fn,
-                args=(
-                    i,
-                    self._network_cfg,
-                    self._weights_queues[i],
-                    self._results_queue,
-                    self._num_simulations,
-                    self._temperature_threshold,
-                    self._dirichlet_alpha,
-                    self._dirichlet_epsilon,
-                    self._seed,
-                ),
-                daemon=True,
+            self._inference_server = InferenceServer(
+                network=self._network,
+                network_cfg=self._network_cfg,
+                num_workers=self._num_workers,
+                device=self._inference_device,
+                max_batch=self._max_batch_size,
+                max_wait_ms=self._max_wait_ms,
+                log_file=self._log_file,
             )
-            p.start()
-            self._processes.append(p)
-            self._weights_queues[i].put(initial_weights)
-
-    def _start_shared_gpu(self) -> None:
-        # Lazy import: InferenceServer pulls torch + the network module, no need
-        # to load it when only per_worker_cpu mode is used (e.g. CI smoke tests).
-        from morris_rl.training.inference_server import InferenceServer
-
-        self._inference_server = InferenceServer(
-            network=self._network,
-            network_cfg=self._network_cfg,
-            num_workers=self._num_workers,
-            device=self._inference_device,
-            max_batch=self._max_batch_size,
-            max_wait_ms=self._max_wait_ms,
-            log_file=self._log_file,
-        )
-        self._inference_server.start()
+            self._inference_server.start()
 
         for i in range(self._num_workers):
+            self._spawn_worker(i)
+
+        self._running = True
+        # Recycling watcher only spins up if at least one trigger is enabled.
+        if self._worker_max_rss_mb > 0 or self._worker_recycle_games > 0:
+            self._watcher_thread = threading.Thread(
+                target=self._watch_workers, daemon=True, name="self-play-watcher"
+            )
+            self._watcher_thread.start()
+
+    def _spawn_worker(self, i: int) -> None:
+        """(Re)spawn worker *i*. Used at start and on respawn after exit.
+
+        Pipes (shared_gpu) and weights queues (per_worker_cpu) are owned by the
+        manager, so they survive a worker restart and are reused as-is.
+        """
+        if self._inference_mode == "shared_gpu":
+            assert self._inference_server is not None
             req_send, reply_recv = self._inference_server.worker_pipes(i)
             p = self._ctx.Process(
                 target=_worker_fn_remote,
@@ -442,12 +496,77 @@ class SelfPlayManager:
                     self._temperature_threshold,
                     self._dirichlet_alpha,
                     self._dirichlet_epsilon,
-                    self._seed,
+                    # Reseed each respawn so we don't replay the same sequence.
+                    self._seed + 1000 * (self._respawn_count[i] + 1),
+                    self._worker_max_rss_mb,
+                    self._worker_recycle_games,
                 ),
                 daemon=True,
             )
             p.start()
-            self._processes.append(p)
+        else:
+            p = self._ctx.Process(
+                target=_worker_fn,
+                args=(
+                    i,
+                    self._network_cfg,
+                    self._weights_queues[i],
+                    self._results_queue,
+                    self._num_simulations,
+                    self._temperature_threshold,
+                    self._dirichlet_alpha,
+                    self._dirichlet_epsilon,
+                    self._seed + 1000 * (self._respawn_count[i] + 1),
+                    self._worker_max_rss_mb,
+                    self._worker_recycle_games,
+                ),
+                daemon=True,
+            )
+            p.start()
+            # Per-worker-cpu workers block on weights_queue.get() at startup,
+            # so push the latest weights right after spawn.
+            cpu_weights = {k: v.cpu() for k, v in self._network.state_dict().items()}
+            try:
+                # Drain any stale entry first (1-slot queue).
+                self._weights_queues[i].get_nowait()
+            except Exception:
+                pass
+            self._weights_queues[i].put(cpu_weights)
+
+        with self._processes_lock:
+            self._processes[i] = p
+
+    def _watch_workers(self) -> None:
+        """Background thread: detect dead workers and respawn them.
+
+        Runs every ``watcher_interval_s``. Workers exit cleanly on RSS or
+        game-count triggers (see :func:`_should_recycle`); this thread reacts
+        to that exit by starting a fresh process on the same slot — same pipes,
+        same shared-memory slot, just a brand-new Python interpreter (no leaked
+        state from ctree, torch, numpy, etc.).
+        """
+        while not self._watcher_stop.is_set():
+            with self._processes_lock:
+                snapshot = list(enumerate(self._processes))
+            for i, p in snapshot:
+                if self._watcher_stop.is_set():
+                    return
+                if p is None or p.is_alive():
+                    continue
+                exit_code = p.exitcode
+                self._respawn_count[i] += 1
+                logger.info(
+                    "worker {} exited (code={}); respawning (#{}, total respawns={})",
+                    i,
+                    exit_code,
+                    self._respawn_count[i],
+                    sum(self._respawn_count),
+                )
+                try:
+                    self._spawn_worker(i)
+                except Exception as exc:
+                    logger.exception(f"failed to respawn worker {i}: {exc}")
+            self._watcher_stop.wait(self._watcher_interval_s)
 
     def collect_game(self, timeout: float = 300.0) -> GameRecord:
         """Block until one completed game is available and return it.
@@ -509,22 +628,27 @@ class SelfPlayManager:
         """Send shutdown sentinels and join all worker processes."""
         if not self._running:
             return
+        # Stop the watcher first — otherwise it would race with shutdown and
+        # cheerfully respawn any worker we just told to exit.
+        self._watcher_stop.set()
+        if self._watcher_thread is not None:
+            self._watcher_thread.join(timeout=2)
+            self._watcher_thread = None
         if self._inference_mode == "shared_gpu":
             self._shutdown_event.set()
             if self._inference_server is not None:
-                # InferenceServer.stop() sends None on each worker reply pipe,
-                # waking blocked workers, then signals the server's shutdown
-                # pipe before joining.
                 self._inference_server.stop()
         else:
             for q in self._weights_queues:
                 q.put(None)
-        for p in self._processes:
+        with self._processes_lock:
+            procs = [p for p in self._processes if p is not None]
+            self._processes = [None] * self._num_workers
+        for p in procs:
             p.join(timeout=15)
             if p.is_alive():
                 p.terminate()
         self._running = False
-        self._processes.clear()
 
     def __enter__(self) -> SelfPlayManager:
         self.start()

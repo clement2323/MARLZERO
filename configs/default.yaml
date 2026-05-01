@@ -27,7 +27,7 @@ input_encoding:
   # Plane 7: must-capture flag (set after forming a mill)
 
 mcts:
-  num_simulations_train: 200
+  num_simulations_train: 150
   num_simulations_eval: 800
   num_simulations_demo: 5000
   c_puct: 1.5
@@ -38,7 +38,7 @@ self_play:
   # 16 workers in shared_gpu mode: workers spend ~80% of cycle waiting on the
   # GPU reply, so CPU usage stays light (~3-4 cores busy out of 16). Going
   # higher than ~24 hits diminishing returns as forward time scales with batch.
-  num_workers: 16
+  num_workers: 10
   # per_worker_cpu : each worker runs torch on CPU in-process. Simple, no IPC,
   #                  but does not exploit GPU during MCTS leaf evaluation.
   # shared_gpu     : centralized GPU inference server batches leaf evaluations
@@ -48,6 +48,11 @@ self_play:
   max_batch_size: 64          # GPU forward batch upper bound (≥ num_workers)
   max_wait_ms: 5              # batcher max latency budget per request
   inference_batch_size: 32    # legacy/unused, kept for backward compat
+  # Worker recycling — prevents accumulated RSS (suspected ctree leak in early
+  # training) from triggering an OOM. Worker exits cleanly on either trigger;
+  # the manager's watcher thread respawns it. Set 0 to disable a trigger.
+  worker_max_rss_mb: 1500     # exit if worker RSS exceeds this many MB
+  worker_recycle_games: 0   # exit after producing this many games
   temperature_schedule:
     moves_0_to_10: 1.0
     moves_10_plus: 0.0
@@ -58,7 +63,7 @@ training:
   learning_rate: 0.001
   weight_decay: 1.0e-4
   max_grad_norm: 1.0
-  replay_buffer_size: 500000
+  replay_buffer_size: 200000
   min_buffer_size: 2000          # wait for this many samples before first gradient step
   total_steps: 500000            # total gradient updates (stop condition)
   updates_per_collected_game: 4
@@ -66,6 +71,7 @@ training:
   checkpoint_interval: 1000      # save a .pt file every N gradient steps
   symmetry_augmentation: true    # 8x augmentation via dihedral group
   mixed_precision: true          # FP16 via torch.cuda.amp
+  resume: null                   # path to a .pt checkpoint to resume from, or null
 
 device: auto  # "auto" = cuda if available, else cpu
 
