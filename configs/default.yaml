@@ -79,11 +79,13 @@ training:
 device: auto  # "auto" = cuda if available, else cpu
 
 mlflow:
-  # Set enabled=true to mirror TensorBoard scalars + checkpoints to a running
-  # MLflow tracking server. The trainer falls back to "TB only" silently if
-  # the URI is unreachable, so this never blocks a training run.
+  # File-based tracking by default — the trainer writes runs to ./mlruns
+  # without needing a server process running, which would otherwise spawn
+  # ~9 subprocesses and consume 1.5-2 GB of RAM (we OOM'd once at 6 workers).
+  # To view the UI, run:  uv run mlflow ui --backend-store-uri file:./mlruns
+  # To use a remote server instead, set tracking_uri to its http URL.
   enabled: false
-  tracking_uri: http://127.0.0.1:5000
+  tracking_uri: file:./mlruns
   experiment_name: morris-az
   run_name: null  # null → use the Hydra run_dir name (e.g. "20-13-15")
 
