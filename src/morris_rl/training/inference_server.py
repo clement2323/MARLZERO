@@ -156,6 +156,165 @@ def _drain_weight_update(weights_queue: mp.Queue, network: torch.nn.Module) -> b
 
 
 # ---------------------------------------------------------------------------
+# CUDA-graphed forward (Tier 2.1)
+# ---------------------------------------------------------------------------
+
+
+def _bucket_sizes_for(max_batch: int) -> list[int]:
+    """Powers of two up to max_batch (inclusive). Picked to balance memory
+    vs padding waste — at most we round up by 2× to the next bucket."""
+    sizes: list[int] = []
+    b = 1
+    while b < max_batch:
+        sizes.append(b)
+        b *= 2
+    sizes.append(max_batch)
+    return sizes
+
+
+class GraphedForward:
+    """Replays a CUDA-captured forward pass per bucketed batch size.
+
+    Why CUDA Graphs here
+    --------------------
+    With a 16×192 ResNet at small batches (mean=6 in our trace), each forward
+    issues ~80 CUDA kernels. The launch overhead floor (~5–10 µs/kernel) is
+    a non-trivial fraction of the 1.5–2 ms forward, and serialises with
+    Python-side bookkeeping. ``cudaGraph`` collapses all those launches into
+    a single replay → fewer host↔device round trips, tighter inter-batch gap.
+
+    Bucketing
+    ---------
+    CUDA Graphs require static shapes, but our batch size varies (1..max).
+    We capture one graph per power-of-two bucket and pad smaller batches with
+    zeros + an all-True mask in the unused rows. The padding is wasted compute
+    but bounded to <2× compared to the snug batch.
+
+    Weight updates
+    --------------
+    Captured graphs reference the *memory addresses* of the network's
+    parameters. ``load_state_dict`` writes in-place by default, so the next
+    replay automatically picks up fresh weights — no recapture needed.
+    """
+
+    def __init__(
+        self,
+        network: torch.nn.Module,
+        max_batch: int,
+        num_planes: int,
+        action_space: int,
+        device: torch.device,
+    ) -> None:
+        self._network = network
+        self._device = device
+        self._buckets = _bucket_sizes_for(max_batch)
+
+        # Pinned host staging for inputs — built once, copied into the bucket's
+        # static GPU tensor on each call.
+        self._host_states = torch.empty(
+            (max_batch, num_planes, 24), dtype=torch.float32, pin_memory=True
+        )
+        self._host_mask = torch.empty(
+            (max_batch, action_space), dtype=torch.bool, pin_memory=True
+        )
+
+        # Per-bucket static GPU tensors and graph handles.
+        self._static_states: dict[int, torch.Tensor] = {}
+        self._static_mask: dict[int, torch.Tensor] = {}
+        self._static_log_policy: dict[int, torch.Tensor] = {}
+        self._static_value: dict[int, torch.Tensor] = {}
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+
+        for b in self._buckets:
+            self._static_states[b] = torch.zeros(
+                (b, num_planes, 24), dtype=torch.float32, device=device
+            )
+            # Mask must be all-True in padding rows so the policy head's
+            # masked log-softmax doesn't divide by zero.
+            self._static_mask[b] = torch.ones(
+                (b, action_space), dtype=torch.bool, device=device
+            )
+
+        self._capture()
+
+    def _capture(self) -> None:
+        # Warm cudnn / autotune on a side stream so the captured graph reuses
+        # the selected algos. Required by torch.cuda.graph contract.
+        s = torch.cuda.Stream(device=self._device)
+        s.wait_stream(torch.cuda.current_stream(self._device))
+        with torch.cuda.stream(s):
+            for b in self._buckets:
+                with (
+                    torch.no_grad(),
+                    torch.cuda.amp.autocast(dtype=torch.float16),
+                ):
+                    for _ in range(3):  # 3 warmup passes per bucket
+                        _ = self._network(
+                            self._static_states[b], self._static_mask[b]
+                        )
+        torch.cuda.current_stream(self._device).wait_stream(s)
+        torch.cuda.synchronize(self._device)
+
+        for b in self._buckets:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                with (
+                    torch.no_grad(),
+                    torch.cuda.amp.autocast(dtype=torch.float16),
+                ):
+                    log_policy, value = self._network(
+                        self._static_states[b], self._static_mask[b]
+                    )
+                self._static_log_policy[b] = log_policy
+                self._static_value[b] = value
+            self._graphs[b] = graph
+
+    def _bucket_for(self, n: int) -> int:
+        for b in self._buckets:
+            if b >= n:
+                return b
+        return self._buckets[-1]  # unreachable: n is bounded by max_batch
+
+    def forward(
+        self,
+        request_states: np.ndarray,
+        worker_ids: list[int],
+        legal_actions_per_req: list[tuple[int, ...]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run forward on a packed batch and return (probs, values) as numpy."""
+        n = len(worker_ids)
+        bucket = self._bucket_for(n)
+
+        # Stage inputs in pinned host buffers (CPU-side fill, async H2D copy).
+        host_states_view = self._host_states.numpy()
+        host_mask_view = self._host_mask.numpy()
+        for i, wid in enumerate(worker_ids):
+            host_states_view[i] = request_states[wid]
+        host_mask_view[:n] = False
+        for i, legal in enumerate(legal_actions_per_req):
+            if legal:
+                host_mask_view[i, list(legal)] = True
+
+        static_s = self._static_states[bucket]
+        static_m = self._static_mask[bucket]
+        static_s[:n].copy_(self._host_states[:n], non_blocking=True)
+        if n < bucket:
+            static_s[n:].zero_()
+        static_m[:n].copy_(self._host_mask[:n], non_blocking=True)
+        if n < bucket:
+            static_m[n:].fill_(True)  # all-True so masked softmax is finite
+
+        self._graphs[bucket].replay()
+
+        # Outputs live in static_log_policy/static_value — clone+truncate then
+        # bring back to CPU. .float() upcasts FP16 logits before exp() to keep
+        # the existing numpy contract identical to the pre-graph code path.
+        probs = self._static_log_policy[bucket][:n].float().exp().cpu().numpy()
+        values = self._static_value[bucket][:n].float().cpu().numpy()
+        return probs, values
+
+
+# ---------------------------------------------------------------------------
 # Server-side
 # ---------------------------------------------------------------------------
 
@@ -247,22 +406,20 @@ def _server_loop(
     network.load_state_dict(initial)
     network.eval()
 
-    # Dedicated CUDA stream so the inference forward overlaps with the
-    # trainer's gradient steps on the default stream instead of serialising.
     use_cuda = device.type == "cuda"
-    inference_stream = torch.cuda.Stream(device=device) if use_cuda else None
 
-    # Pinned host buffer for staging inputs: pinned + non_blocking H2D yields
-    # async transfer overlapped with kernel execution. Sized to max_batch so
-    # we never reallocate inside the hot loop.
+    # Build the CUDA-graphed forward once on GPU. CPU fallback uses a plain
+    # eager forward (no graphs) — used for tests / smoke runs without a GPU.
     if use_cuda:
-        host_states = torch.empty(
-            (max_batch, _NUM_PLANES, 24), dtype=torch.float32, pin_memory=True
+        graphed_forward = GraphedForward(
+            network=network,
+            max_batch=max_batch,
+            num_planes=_NUM_PLANES,
+            action_space=ACTION_SPACE_SIZE,
+            device=device,
         )
-        host_states_view = host_states.numpy()
     else:
-        host_states = None
-        host_states_view = None
+        graphed_forward = None
 
     batch_count = 0
     total_in_batches = 0
@@ -280,38 +437,26 @@ def _server_loop(
 
             try:
                 worker_ids = [req.worker_id for req in batch]
+                legal_per_req = [req.legal_actions for req in batch]
                 n = len(batch)
+
+                t0 = time.perf_counter()
                 if use_cuda:
-                    for i, wid in enumerate(worker_ids):
-                        host_states_view[i] = request_states[wid]
-                    states_t = host_states[:n].to(device, non_blocking=True)
+                    assert graphed_forward is not None
+                    probs, values = graphed_forward.forward(
+                        request_states, worker_ids, legal_per_req
+                    )
                 else:
                     states = np.stack(
                         [request_states[wid] for wid in worker_ids], axis=0
                     )
                     states_t = torch.from_numpy(states).to(device)
-
-                mask = torch.zeros(
-                    n, ACTION_SPACE_SIZE, dtype=torch.bool, device=device
-                )
-                for i, req in enumerate(batch):
-                    if req.legal_actions:
-                        mask[i, list(req.legal_actions)] = True
-
-                t0 = time.perf_counter()
-                if use_cuda:
-                    with torch.cuda.stream(inference_stream):  # type: ignore[arg-type]
-                        with (
-                            torch.no_grad(),
-                            torch.cuda.amp.autocast(dtype=torch.float16),
-                        ):
-                            log_policy, value = network(states_t, mask)
-                        probs_t = log_policy.float().exp()
-                        values_t = value.float()
-                    inference_stream.synchronize()  # type: ignore[union-attr]
-                    probs = probs_t.cpu().numpy()
-                    values = values_t.cpu().numpy()
-                else:
+                    mask = torch.zeros(
+                        n, ACTION_SPACE_SIZE, dtype=torch.bool, device=device
+                    )
+                    for i, req in enumerate(batch):
+                        if req.legal_actions:
+                            mask[i, list(req.legal_actions)] = True
                     with torch.no_grad():
                         log_policy, value = network(states_t, mask)
                     probs = log_policy.exp().cpu().numpy()
