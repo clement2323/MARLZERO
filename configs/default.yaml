@@ -9,11 +9,14 @@ algorithm: alphazero
 
 network:
   type: resnet
-  # 16x192 (~3M params): tuned for shared_gpu mode where the GPU can absorb
-  # larger forwards cheaply. With per_worker_cpu the CPU forwards become the
-  # bottleneck — drop back to 12x128 if you ever want to revert.
+  # 16x208 (~4.1M params): bumped from 16x192 to take advantage of the
+  # 7+ GB of free VRAM in shared_gpu mode after Tier 2.1 (CUDA-graphed
+  # forward at FP16 leaves plenty of headroom). Width-over-depth bump
+  # because shared_gpu favours larger conv ops on small batches.
+  # With per_worker_cpu the CPU forwards become the bottleneck — drop
+  # back to 12x128 if you ever want to revert.
   num_blocks: 16
-  num_channels: 192
+  num_channels: 208
   policy_head_hidden: 64
   value_head_hidden: 64
 
