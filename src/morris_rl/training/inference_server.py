@@ -227,7 +227,7 @@ def _server_loop(
             log_file,
             level="INFO",
             format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-            enqueue=False,
+            enqueue=True,  # async write so loguru never blocks the forward loop
             filter=lambda r: r["name"].startswith("morris_rl"),
         )
 
@@ -247,6 +247,23 @@ def _server_loop(
     network.load_state_dict(initial)
     network.eval()
 
+    # Dedicated CUDA stream so the inference forward overlaps with the
+    # trainer's gradient steps on the default stream instead of serialising.
+    use_cuda = device.type == "cuda"
+    inference_stream = torch.cuda.Stream(device=device) if use_cuda else None
+
+    # Pinned host buffer for staging inputs: pinned + non_blocking H2D yields
+    # async transfer overlapped with kernel execution. Sized to max_batch so
+    # we never reallocate inside the hot loop.
+    if use_cuda:
+        host_states = torch.empty(
+            (max_batch, _NUM_PLANES, 24), dtype=torch.float32, pin_memory=True
+        )
+        host_states_view = host_states.numpy()
+    else:
+        host_states = None
+        host_states_view = None
+
     batch_count = 0
     total_in_batches = 0
     total_forward_s = 0.0
@@ -263,20 +280,42 @@ def _server_loop(
 
             try:
                 worker_ids = [req.worker_id for req in batch]
-                states = np.stack([request_states[wid] for wid in worker_ids], axis=0)
-                states_t = torch.from_numpy(states).to(device)
+                n = len(batch)
+                if use_cuda:
+                    for i, wid in enumerate(worker_ids):
+                        host_states_view[i] = request_states[wid]
+                    states_t = host_states[:n].to(device, non_blocking=True)
+                else:
+                    states = np.stack(
+                        [request_states[wid] for wid in worker_ids], axis=0
+                    )
+                    states_t = torch.from_numpy(states).to(device)
+
                 mask = torch.zeros(
-                    len(batch), ACTION_SPACE_SIZE, dtype=torch.bool, device=device
+                    n, ACTION_SPACE_SIZE, dtype=torch.bool, device=device
                 )
                 for i, req in enumerate(batch):
                     if req.legal_actions:
                         mask[i, list(req.legal_actions)] = True
 
                 t0 = time.perf_counter()
-                with torch.no_grad():
-                    log_policy, value = network(states_t, mask)
-                probs = log_policy.exp().cpu().numpy()
-                values = value.cpu().numpy()
+                if use_cuda:
+                    with torch.cuda.stream(inference_stream):  # type: ignore[arg-type]
+                        with (
+                            torch.no_grad(),
+                            torch.cuda.amp.autocast(dtype=torch.float16),
+                        ):
+                            log_policy, value = network(states_t, mask)
+                        probs_t = log_policy.float().exp()
+                        values_t = value.float()
+                    inference_stream.synchronize()  # type: ignore[union-attr]
+                    probs = probs_t.cpu().numpy()
+                    values = values_t.cpu().numpy()
+                else:
+                    with torch.no_grad():
+                        log_policy, value = network(states_t, mask)
+                    probs = log_policy.exp().cpu().numpy()
+                    values = value.cpu().numpy()
                 total_forward_s += time.perf_counter() - t0
             except Exception as exc:
                 for req in batch:

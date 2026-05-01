@@ -46,7 +46,10 @@ self_play:
   inference_mode: shared_gpu
   inference_device: cuda      # "cuda" or "cpu" (only used in shared_gpu mode)
   max_batch_size: 64          # GPU forward batch upper bound (≥ num_workers)
-  max_wait_ms: 5              # batcher max latency budget per request
+  max_wait_ms: 10             # batcher max latency budget per request — bumped
+                              # from 5 once the forward went FP16+CUDA-streamed
+                              # (per-leaf is cheaper, can wait a bit longer to
+                              # coalesce a larger batch)
   inference_batch_size: 32    # legacy/unused, kept for backward compat
   # Worker recycling — prevents accumulated RSS (suspected ctree leak in early
   # training) from triggering an OOM. Worker exits cleanly on either trigger;
