@@ -92,6 +92,12 @@ class GameRecord:
     was_verify_play: bool = False
     verify_resigning_player: int | None = None
 
+    # Playout-cap observability (Phase 2b). Per-game counters used by the
+    # trainer to log full vs fast move ratios. Both zero when the feature
+    # is disabled (every move counted as "full").
+    full_sim_moves: int = 0   # plies that ran the full-sim search
+    fast_sim_moves: int = 0   # plies that ran the fast-sim search
+
 
 @dataclass
 class WorkerError:
@@ -127,6 +133,30 @@ class ResignConfig:
     verify_fraction: float = 0.05
 
 
+@dataclass(frozen=True)
+class PlayoutCapConfig:
+    """Knobs for KataGo-style playout cap randomization (Phase 2b).
+
+    On each move, the worker picks "full" or "fast" search via Bernoulli:
+    full moves run the standard ``num_simulations`` and contribute samples
+    to the replay buffer; fast moves use a much smaller sim count and are
+    NOT stored (their visit distribution is too noisy to train on). This
+    increases games-per-hour at constant policy-target quality.
+
+    The number of full sims reuses the existing ``mcts.num_simulations_train``
+    setting — only the fast count is new here.
+    """
+
+    enabled: bool = False
+    # Probability that a given move uses the full-sim search. KataGo uses
+    # ~0.25; the rest run on fast_sim_count.
+    full_sim_fraction: float = 0.25
+    # Sim count for fast moves. Pick small enough that the speedup matters
+    # (≤ 1/3 of full) but large enough that the game still progresses
+    # plausibly (typically 30–80 for Morris).
+    fast_sim_count: int = 60
+
+
 # ---------------------------------------------------------------------------
 # Game-play helpers
 # ---------------------------------------------------------------------------
@@ -154,6 +184,7 @@ def _assign_value_targets(
             npt.NDArray[np.bool_],     # legal_mask
             int,                        # mill_count for current player at this state
             bool,                       # was the action played a capture?
+            bool,                       # was this ply a full-sim move (kept for buffer)?
         ]
     ],
     outcome: Outcome | None,
@@ -170,14 +201,23 @@ def _assign_value_targets(
       sample's player POV. Constant across all of one player's samples.
     - aux_capture: 1.0 if the sample's current player performs a capture
       within the next ``capture_horizon_plies`` plies, else 0.0.
+
+    Steps may carry a ``was_full_sim=False`` flag (Phase 2b playout cap):
+    these plies are skipped at emission time so they don't pollute the
+    buffer, but they still count for capture-lookahead so that
+    aux_capture targets remain accurate w.r.t. real game time.
     """
     records: list[SampleRecord] = []
     n_steps = len(steps)
-    # Lookahead arrays for capture_in_n.
+    # Lookahead arrays for capture_in_n. Both indexed by ply number so they
+    # cover *all* moves regardless of full/fast.
     captures_at = [bool(s[5]) for s in steps]
     players_at = [int(s[2]) for s in steps]
 
-    for i, (encoded, policy, player, mask, mill_count, _was_capture) in enumerate(steps):
+    for i, step in enumerate(steps):
+        encoded, policy, player, mask, mill_count, _was_capture, was_full_sim = step
+        if not was_full_sim:
+            continue  # fast-sim plies don't contribute to the buffer
         if outcome is None or outcome == Outcome.DRAW:
             v = 0.0
         elif int(outcome) == player:
@@ -220,8 +260,16 @@ def _play_game(
     capture_horizon_plies: int = 3,
     resign_config: ResignConfig | None = None,
     rng: np.random.Generator | None = None,
+    search_fast: "MorrisSearch | None" = None,
+    playout_cap_config: PlayoutCapConfig | None = None,
 ) -> GameRecord:
-    """Play one complete self-play game and return its training data."""
+    """Play one complete self-play game and return its training data.
+
+    When ``playout_cap_config.enabled`` and ``search_fast`` is provided,
+    each ply chooses between *search* (full sims, recorded in buffer) and
+    *search_fast* (fewer sims, not recorded) via Bernoulli on
+    ``full_sim_fraction``.
+    """
     from morris_rl.mcts.search import encode_state  # cached after worker import
 
     state = initial_state()
@@ -233,6 +281,7 @@ def _play_game(
             npt.NDArray[np.bool_],
             int,    # aux: mill_count for current_player at this state
             bool,   # aux: did this action turn out to be a capture?
+            bool,   # full-sim ply? (False = fast, skipped at buffer write)
         ]
     ] = []
     move_count = 0
@@ -259,6 +308,17 @@ def _play_game(
     verify_resigning_player: int | None = None
     if rng is None:
         rng = np.random.default_rng()
+
+    # Playout-cap state. When the feature is enabled and a fast search was
+    # provided, each ply independently tosses a Bernoulli(full_sim_fraction).
+    # When disabled (or no fast search), every ply runs the full search.
+    cap_active = (
+        playout_cap_config is not None
+        and playout_cap_config.enabled
+        and search_fast is not None
+    )
+    full_sim_moves = 0
+    fast_sim_moves = 0
 
     while True:
         done, _ = is_terminal(state)
@@ -301,7 +361,23 @@ def _play_game(
                     resigned_by_player = actor_now
                     break  # game ends here, value targets handled below
 
-        action, visit_probs = search.run(state, temperature=temp, add_noise=True)
+        # Pick search instance for this ply. Forced captures use the full
+        # search regardless: there's typically only one legal action so the
+        # cost is trivial, and skipping these from the buffer would lose
+        # cheap-but-real training signal.
+        if cap_active and not state.must_capture:
+            is_full = rng.random() < playout_cap_config.full_sim_fraction
+        else:
+            is_full = True
+        active_search = search if is_full else search_fast
+        if is_full:
+            full_sim_moves += 1
+        else:
+            fast_sim_moves += 1
+
+        action, visit_probs = active_search.run(
+            state, temperature=temp, add_noise=True
+        )
 
         # Capture stats around the action: state.must_capture flips are the
         # cleanest signal of mill / capture events.
@@ -311,7 +387,7 @@ def _play_game(
         was_capture = was_must_capture and not state.must_capture
 
         steps.append(
-            (encoded, visit_probs, actor, legal_mask, aux_mill_count, was_capture)
+            (encoded, visit_probs, actor, legal_mask, aux_mill_count, was_capture, is_full)
         )
 
         if not was_must_capture and state.must_capture:
@@ -360,6 +436,8 @@ def _play_game(
         resigned_by_player=resigned_by_player,
         was_verify_play=was_verify_play,
         verify_resigning_player=verify_resigning_player,
+        full_sim_moves=full_sim_moves,
+        fast_sim_moves=fast_sim_moves,
     )
 
 
@@ -440,6 +518,7 @@ def _worker_fn(
     worker_max_rss_mb: int = 0,
     worker_recycle_games: int = 0,
     resign_config: ResignConfig | None = None,
+    playout_cap_config: PlayoutCapConfig | None = None,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -496,6 +575,17 @@ def _worker_fn(
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
     )
+    # Build the fast-sim companion search only when the feature is on.
+    # Two ctree instances cohabit fine; the second adds ~30 MB RSS.
+    search_fast: MorrisSearch | None = None
+    if playout_cap_config is not None and playout_cap_config.enabled:
+        search_fast = MorrisSearch(
+            network,
+            torch.device("cpu"),
+            num_simulations=playout_cap_config.fast_sim_count,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+        )
 
     import psutil
     proc = psutil.Process()
@@ -519,6 +609,8 @@ def _worker_fn(
                 temperature_threshold=temperature_threshold,
                 resign_config=resign_config,
                 rng=rng,
+                search_fast=search_fast,
+                playout_cap_config=playout_cap_config,
             )
             results_queue.put(game)
             games_played += 1
@@ -553,6 +645,7 @@ def _worker_fn_remote(
     worker_max_rss_mb: int = 0,
     worker_recycle_games: int = 0,
     resign_config: ResignConfig | None = None,
+    playout_cap_config: PlayoutCapConfig | None = None,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -610,6 +703,16 @@ def _worker_fn_remote(
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
     )
+    # Same eval_fn (shared GPU server) drives both searches; only the sim
+    # budget differs. Cheap to instantiate — one extra ctree object.
+    search_fast: MorrisSearch | None = None
+    if playout_cap_config is not None and playout_cap_config.enabled:
+        search_fast = MorrisSearch(
+            eval_fn=eval_fn,
+            num_simulations=playout_cap_config.fast_sim_count,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+        )
 
     import psutil
     proc = psutil.Process()
@@ -623,6 +726,8 @@ def _worker_fn_remote(
                 temperature_threshold=temperature_threshold,
                 resign_config=resign_config,
                 rng=rng,
+                search_fast=search_fast,
+                playout_cap_config=playout_cap_config,
             )
             results_queue.put(game)
             games_played += 1
@@ -681,6 +786,7 @@ class SelfPlayManager:
         worker_recycle_games: int = 0,
         watcher_interval_s: float = 5.0,
         resign_config: ResignConfig | None = None,
+        playout_cap_config: PlayoutCapConfig | None = None,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -701,6 +807,7 @@ class SelfPlayManager:
         self._worker_recycle_games = worker_recycle_games
         self._watcher_interval_s = watcher_interval_s
         self._resign_config = resign_config
+        self._playout_cap_config = playout_cap_config
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -778,6 +885,7 @@ class SelfPlayManager:
                     self._worker_max_rss_mb,
                     self._worker_recycle_games,
                     self._resign_config,
+                    self._playout_cap_config,
                 ),
                 daemon=True,
             )
@@ -798,6 +906,7 @@ class SelfPlayManager:
                     self._worker_max_rss_mb,
                     self._worker_recycle_games,
                     self._resign_config,
+                    self._playout_cap_config,
                 ),
                 daemon=True,
             )

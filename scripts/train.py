@@ -153,6 +153,18 @@ def main(cfg: DictConfig) -> None:
             min_move_for_resign=int(resign_node.get("min_move_for_resign", 30)),
             verify_fraction=float(resign_node.get("verify_fraction", 0.05)),
         )
+    # Same pattern for the playout-cap feature: only build the config when
+    # turned on — the manager defaults to "full sims for every move" and
+    # disables the second MorrisSearch instance.
+    playout_cap_node = cfg.self_play.get("playout_cap", None)
+    playout_cap_config = None
+    if playout_cap_node is not None and bool(playout_cap_node.get("enabled", False)):
+        from morris_rl.training.self_play import PlayoutCapConfig
+        playout_cap_config = PlayoutCapConfig(
+            enabled=True,
+            full_sim_fraction=float(playout_cap_node.get("full_sim_fraction", 0.25)),
+            fast_sim_count=int(playout_cap_node.get("fast_sim_count", 60)),
+        )
     manager = SelfPlayManager(
         network=network,
         network_cfg=_network_cfg_dict(cfg),
@@ -170,6 +182,7 @@ def main(cfg: DictConfig) -> None:
         worker_max_rss_mb=cfg.self_play.get("worker_max_rss_mb", 0),
         worker_recycle_games=cfg.self_play.get("worker_recycle_games", 0),
         resign_config=resign_config,
+        playout_cap_config=playout_cap_config,
     )
 
     logger.info(

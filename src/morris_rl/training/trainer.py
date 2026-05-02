@@ -375,6 +375,11 @@ class Trainer:
         recent_resigned: deque[bool] = deque(maxlen=_GAME_LENGTH_WINDOW)
         verify_outcomes: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         verify_total = 0
+        # Playout-cap deques: total full / fast plies across the rolling
+        # window. Ratio = full / (full+fast), expected ≈ full_sim_fraction
+        # when the feature is on, and 1.0 when it's off.
+        recent_full_sim: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_fast_sim: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         outcome_counts = {"p1_win": 0, "p2_win": 0, "draw": 0}
         self._buffer = buffer  # used by _auto_checkpoint to persist buffer state
 
@@ -409,6 +414,8 @@ class Trainer:
                 recent_term_reasons.append(game.term_reason)
                 recent_resign_eligible.append(game.resign_eligible)
                 recent_resigned.append(game.resigned_by_player is not None)
+                recent_full_sim.append(game.full_sim_moves)
+                recent_fast_sim.append(game.fast_sim_moves)
                 if game.was_verify_play and game.verify_resigning_player is not None:
                     # The "would-be-resigner" lost iff the actual outcome went
                     # to the opponent. 1 = resign decision was correct (their
@@ -442,6 +449,11 @@ class Trainer:
                     recent_resigned,
                     verify_outcomes,
                     verify_total,
+                    games_collected,
+                )
+                self._log_playout_cap_stats(
+                    recent_full_sim,
+                    recent_fast_sim,
                     games_collected,
                 )
 
@@ -668,6 +680,37 @@ class Trainer:
             correct_rate = sum(verify_outcomes) / len(verify_outcomes)
             stats["resign/verified_correct_rate"] = correct_rate
             stats["resign/verified_false_positive_rate"] = 1.0 - correct_rate
+        for tag, value in stats.items():
+            if self._writer is not None:
+                self._writer.add_scalar(tag, value, games_collected)
+            self._mlflow_log(tag, value, games_collected)
+
+    def _log_playout_cap_stats(
+        self,
+        recent_full_sim: deque[int],
+        recent_fast_sim: deque[int],
+        games_collected: int,
+    ) -> None:
+        """Log full vs fast playout-cap ratios over the rolling window.
+
+        - playout_cap/full_moves_per_game and fast_moves_per_game: averages
+          per game; together they reconstruct the game length.
+        - playout_cap/full_ratio: full / (full + fast). When the feature
+          is on, expected ≈ full_sim_fraction. When off, exactly 1.0.
+        """
+        if not recent_full_sim:
+            return
+        n = len(recent_full_sim)
+        full_sum = sum(recent_full_sim)
+        fast_sum = sum(recent_fast_sim)
+        total = full_sum + fast_sum
+        if total == 0:
+            return
+        stats: dict[str, float] = {
+            "playout_cap/full_moves_per_game": full_sum / n,
+            "playout_cap/fast_moves_per_game": fast_sum / n,
+            "playout_cap/full_ratio": full_sum / total,
+        }
         for tag, value in stats.items():
             if self._writer is not None:
                 self._writer.add_scalar(tag, value, games_collected)

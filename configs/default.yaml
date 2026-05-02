@@ -84,6 +84,15 @@ self_play:
     min_consecutive_below: 3      # filter MCTS noise: N plies in a row required
     min_move_for_resign: 30       # never resign during placement (too noisy)
     verify_fraction: 0.05         # play out 5% of would-resign games for calibration
+  # Playout cap randomization (KataGo-style). When enabled, each ply tosses
+  # Bernoulli(full_sim_fraction): "full" plies use mcts.num_simulations_train
+  # and contribute samples to the buffer; "fast" plies use fast_sim_count and
+  # are NOT stored (visit distribution too noisy to train on). Increases
+  # games-per-hour at constant policy-target quality.
+  playout_cap:
+    enabled: false
+    full_sim_fraction: 0.25       # ~25% of moves are "full" (recorded)
+    fast_sim_count: 60            # sim count for the other 75% (not recorded)
   temperature_schedule:
     moves_0_to_10: 1.0
     moves_10_plus: 0.0

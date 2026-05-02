@@ -75,7 +75,7 @@ def test_value_target_winner_gets_plus_one() -> None:
         (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
          np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 1,
          np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
-         0, False),
+         0, False, True),
     ]
     records = _assign_value_targets(
         steps, Outcome.PLAYER_1_WINS, final_pieces_p1=5, final_pieces_p2=2
@@ -90,7 +90,7 @@ def test_value_target_loser_gets_minus_one() -> None:
         (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
          np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 2,
          np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
-         0, False),
+         0, False, True),
     ]
     records = _assign_value_targets(
         steps, Outcome.PLAYER_1_WINS, final_pieces_p1=5, final_pieces_p2=2
@@ -105,7 +105,7 @@ def test_value_target_draw_is_zero() -> None:
         (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
          np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 1,
          np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
-         0, False),
+         0, False, True),
     ]
     records = _assign_value_targets(
         steps, Outcome.DRAW, final_pieces_p1=3, final_pieces_p2=3
@@ -234,6 +234,65 @@ def test_play_game_resigns_when_threshold_crossed(monkeypatch) -> None:
         pass
     sign_set = {sample.value_target for sample in result.samples}
     assert sign_set <= {-1.0, 1.0}
+
+
+def test_play_game_playout_cap_fast_moves_skipped_from_buffer() -> None:
+    """When playout cap is active, fast-sim plies do NOT contribute samples
+    to the buffer — only full-sim plies become SampleRecords.
+    """
+    from morris_rl.training.self_play import PlayoutCapConfig
+    cfg = PlayoutCapConfig(
+        enabled=True,
+        full_sim_fraction=0.5,   # 50/50 split keeps the test fast and balanced
+        fast_sim_count=2,
+    )
+    rng = np.random.default_rng(42)
+    search_full = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=5)
+    search_fast = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=2)
+    result = _play_game(
+        search_full,
+        temperature_threshold=2,
+        rng=rng,
+        search_fast=search_fast,
+        playout_cap_config=cfg,
+    )
+    # Game length is total plies; samples count = full-sim plies only.
+    assert result.full_sim_moves + result.fast_sim_moves == result.game_length
+    # When at least one fast move was played, samples must be strictly fewer
+    # than the game length — proving fast-sim plies were filtered out.
+    if result.fast_sim_moves > 0:
+        assert len(result.samples) < result.game_length
+    assert len(result.samples) == result.full_sim_moves
+
+
+def test_play_game_playout_cap_disabled_keeps_all_moves() -> None:
+    """With playout_cap disabled, every ply contributes to the buffer
+    (back-compat with pre-2b behavior).
+    """
+    rng = np.random.default_rng(0)
+    search = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=5)
+    result = _play_game(search, temperature_threshold=2, rng=rng)
+    assert result.fast_sim_moves == 0
+    assert result.full_sim_moves == result.game_length
+    assert len(result.samples) == result.game_length
+
+
+def test_play_game_playout_cap_no_fast_search_treats_all_as_full() -> None:
+    """If playout_cap is enabled but no fast search is provided, every move
+    falls back to the full search (defensive)."""
+    from morris_rl.training.self_play import PlayoutCapConfig
+    cfg = PlayoutCapConfig(enabled=True, full_sim_fraction=0.0, fast_sim_count=2)
+    rng = np.random.default_rng(0)
+    search = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=5)
+    result = _play_game(
+        search,
+        temperature_threshold=2,
+        rng=rng,
+        search_fast=None,
+        playout_cap_config=cfg,
+    )
+    assert result.fast_sim_moves == 0
+    assert result.full_sim_moves == result.game_length
 
 
 def test_play_game_term_reason_threefold_under_repetition() -> None:
