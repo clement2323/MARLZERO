@@ -40,6 +40,7 @@ from morris_rl.env.rules import (
     get_legal_actions,
     initial_state,
     is_terminal,
+    opponent,
     pieces_on_board,
 )
 from morris_rl.env.board import ACTION_SPACE_SIZE, MILLS
@@ -79,6 +80,18 @@ class GameRecord:
     #   "resign"            — losing player resigned (only with feature 1 active)
     term_reason: str = "unknown"
 
+    # Resign-feature observability (Phase 2a). All zero-init when the feature
+    # is disabled — the trainer treats those games as "not eligible" so the
+    # resign metrics keep their meaning across mixed runs.
+    resign_eligible: bool = False         # threshold ever crossed during this game
+    resigned_by_player: int | None = None  # 1/2 if the game ended by resign, else None
+    # Verify-mode bookkeeping: when an eligible game is randomly selected
+    # (verify_fraction) to be played out instead of resigned, we record who
+    # *would* have resigned so the trainer can compare against the real
+    # outcome to compute the false-positive rate.
+    was_verify_play: bool = False
+    verify_resigning_player: int | None = None
+
 
 @dataclass
 class WorkerError:
@@ -86,6 +99,32 @@ class WorkerError:
 
     exception: Exception
     worker_id: int
+
+
+@dataclass(frozen=True)
+class ResignConfig:
+    """Knobs for the resign-threshold feature passed from cfg to workers.
+
+    A worker creates one of these (or None) at startup; _play_game consults
+    it on every move. Disabled by default so existing tests are unaffected.
+    """
+
+    enabled: bool = False
+    # Root-value (from current player's POV) below which a ply counts as
+    # "low". Has to be set on the same scale as the network's value head
+    # output — i.e., in [-1, 1].
+    threshold: float = -0.90
+    # How many consecutive low-value plies are required before a player can
+    # resign. Filters out one-off MCTS noise.
+    min_consecutive_below: int = 3
+    # Don't allow resignation during the placement phase (first ~18 plies)
+    # or the very early moving phase — value estimates are too noisy at
+    # init and mid-bootstrap.
+    min_move_for_resign: int = 30
+    # Fraction of "would-resign" games that we instead play out to the
+    # natural terminal, so the trainer can compute a post-hoc false-positive
+    # rate. Set to 0.0 to disable verification entirely.
+    verify_fraction: float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +218,8 @@ def _play_game(
     search: "MorrisSearch",
     temperature_threshold: int = 10,
     capture_horizon_plies: int = 3,
+    resign_config: ResignConfig | None = None,
+    rng: np.random.Generator | None = None,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data."""
     from morris_rl.mcts.search import encode_state  # cached after worker import
@@ -205,6 +246,20 @@ def _play_game(
     captures_p1 = 0
     captures_p2 = 0
 
+    # Resign-feature state. Per-player consecutive-low counters (index 0
+    # unused; players are 1 and 2). When the threshold is crossed the worker
+    # rolls verify_fraction once and either resigns or commits to playing
+    # the game out as a "verify" sample (and never resigns again, even if
+    # the threshold gets re-crossed by the same or other player).
+    resign_active = resign_config is not None and resign_config.enabled
+    consec_below = [0, 0, 0]
+    resign_eligible = False
+    resigned_by_player: int | None = None
+    was_verify_play = False
+    verify_resigning_player: int | None = None
+    if rng is None:
+        rng = np.random.default_rng()
+
     while True:
         done, _ = is_terminal(state)
         if done:
@@ -218,6 +273,33 @@ def _play_game(
         legal_mask[get_legal_actions(state)] = True
         # Aux target #1: number of mills the current player has on the board.
         aux_mill_count = _count_mills(state.board, state.current_player)
+
+        # Resign signal: query the network's value estimate for the current
+        # player at the root, BEFORE running MCTS. Cheap (one extra forward
+        # per move) and avoids patching ctree to expose the post-search Q.
+        if resign_active and not state.must_capture:
+            root_v = search.root_value(state)
+            actor_now = state.current_player
+            if root_v < resign_config.threshold:
+                consec_below[actor_now] += 1
+            else:
+                consec_below[actor_now] = 0
+
+            if (
+                consec_below[actor_now] >= resign_config.min_consecutive_below
+                and move_count >= resign_config.min_move_for_resign
+                and not was_verify_play
+                and resigned_by_player is None
+            ):
+                resign_eligible = True
+                # Bernoulli(verify_fraction) — in verify_fraction of cases we
+                # commit to playing the game out, locking in verify mode.
+                if rng.random() < resign_config.verify_fraction:
+                    was_verify_play = True
+                    verify_resigning_player = actor_now
+                else:
+                    resigned_by_player = actor_now
+                    break  # game ends here, value targets handled below
 
         action, visit_probs = search.run(state, temperature=temp, add_noise=True)
 
@@ -245,8 +327,13 @@ def _play_game(
                 captures_p2 += 1
         move_count += 1
 
-    _, outcome = is_terminal(state)
-    term_reason = _detect_term_reason(state, outcome)
+    if resigned_by_player is not None:
+        # Resignation = forfait: opponent wins, no natural is_terminal payload.
+        outcome = Outcome(opponent(resigned_by_player))
+        term_reason = "resign"
+    else:
+        _, outcome = is_terminal(state)
+        term_reason = _detect_term_reason(state, outcome)
     final_pieces_p1 = pieces_on_board(state.board, 1)
     final_pieces_p2 = pieces_on_board(state.board, 2)
     final_pieces_diff = final_pieces_p1 - final_pieces_p2
@@ -269,6 +356,10 @@ def _play_game(
         captures_p2=captures_p2,
         final_pieces_diff=final_pieces_diff,
         term_reason=term_reason,
+        resign_eligible=resign_eligible,
+        resigned_by_player=resigned_by_player,
+        was_verify_play=was_verify_play,
+        verify_resigning_player=verify_resigning_player,
     )
 
 
@@ -348,6 +439,7 @@ def _worker_fn(
     seed: int,
     worker_max_rss_mb: int = 0,
     worker_recycle_games: int = 0,
+    resign_config: ResignConfig | None = None,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -408,6 +500,7 @@ def _worker_fn(
     import psutil
     proc = psutil.Process()
     games_played = 0
+    rng = np.random.default_rng(worker_seed)
 
     while True:
         # Non-blocking check for updated weights or shutdown.
@@ -421,7 +514,12 @@ def _worker_fn(
             pass
 
         try:
-            game = _play_game(search, temperature_threshold=temperature_threshold)
+            game = _play_game(
+                search,
+                temperature_threshold=temperature_threshold,
+                resign_config=resign_config,
+                rng=rng,
+            )
             results_queue.put(game)
             games_played += 1
         except Exception as exc:
@@ -454,6 +552,7 @@ def _worker_fn_remote(
     seed: int,
     worker_max_rss_mb: int = 0,
     worker_recycle_games: int = 0,
+    resign_config: ResignConfig | None = None,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -515,10 +614,16 @@ def _worker_fn_remote(
     import psutil
     proc = psutil.Process()
     games_played = 0
+    rng = np.random.default_rng(worker_seed)
 
     while not shutdown_event.is_set():
         try:
-            game = _play_game(search, temperature_threshold=temperature_threshold)
+            game = _play_game(
+                search,
+                temperature_threshold=temperature_threshold,
+                resign_config=resign_config,
+                rng=rng,
+            )
             results_queue.put(game)
             games_played += 1
         except Exception as exc:
@@ -575,6 +680,7 @@ class SelfPlayManager:
         worker_max_rss_mb: int = 0,
         worker_recycle_games: int = 0,
         watcher_interval_s: float = 5.0,
+        resign_config: ResignConfig | None = None,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -594,6 +700,7 @@ class SelfPlayManager:
         self._worker_max_rss_mb = worker_max_rss_mb
         self._worker_recycle_games = worker_recycle_games
         self._watcher_interval_s = watcher_interval_s
+        self._resign_config = resign_config
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -670,6 +777,7 @@ class SelfPlayManager:
                     self._seed + 1000 * (self._respawn_count[i] + 1),
                     self._worker_max_rss_mb,
                     self._worker_recycle_games,
+                    self._resign_config,
                 ),
                 daemon=True,
             )
@@ -689,6 +797,7 @@ class SelfPlayManager:
                     self._seed + 1000 * (self._respawn_count[i] + 1),
                     self._worker_max_rss_mb,
                     self._worker_recycle_games,
+                    self._resign_config,
                 ),
                 daemon=True,
             )

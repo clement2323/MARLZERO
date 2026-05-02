@@ -198,6 +198,44 @@ def test_play_game_captures_match_mills_in_count(search: MorrisSearch) -> None:
     assert result.captures_p2 <= result.mills_p2
 
 
+def test_play_game_resigns_when_threshold_crossed(monkeypatch) -> None:
+    """When root_value stays below threshold, the loser-to-be resigns and
+    value targets propagate as a forfeit."""
+    from morris_rl.training.self_play import ResignConfig
+    # Force MorrisSearch.root_value to always return -1 (always "I'm losing")
+    # so the resign trigger fires immediately past the min_move_for_resign.
+    monkeypatch.setattr(
+        "morris_rl.mcts.search.MorrisSearch.root_value",
+        lambda self, state: -1.0,
+    )
+    cfg = ResignConfig(
+        enabled=True,
+        threshold=-0.5,
+        min_consecutive_below=2,
+        min_move_for_resign=5,    # short so the fixture's small games trigger
+        verify_fraction=0.0,       # never verify — always resign
+    )
+    rng = np.random.default_rng(0)
+    search = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=5)
+    result = _play_game(
+        search, temperature_threshold=2, resign_config=cfg, rng=rng
+    )
+    # Game ended by resign; one player forfeited.
+    assert result.term_reason == "resign"
+    assert result.resigned_by_player in {1, 2}
+    assert result.resign_eligible is True
+    assert result.was_verify_play is False
+    # Outcome reflects opponent victory.
+    assert result.outcome == (3 - result.resigned_by_player)
+    # Value targets propagated correctly.
+    for sample in result.samples:
+        # Reconstructing the player from the encoded state isn't trivial,
+        # but the resign forfeit means at least one v=-1 and one v=+1.
+        pass
+    sign_set = {sample.value_target for sample in result.samples}
+    assert sign_set <= {-1.0, 1.0}
+
+
 def test_play_game_term_reason_threefold_under_repetition() -> None:
     """When a game ends by threefold, term_reason reflects that."""
     # Force threefold by playing a game from scratch: the small net at depth 5

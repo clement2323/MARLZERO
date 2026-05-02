@@ -366,6 +366,15 @@ class Trainer:
         recent_captures: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         recent_pieces_diff: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         recent_term_reasons: deque[str] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        # Resign-feature deques: eligible / triggered are over the same window;
+        # verify_outcomes accumulates only the (rare) verify games and tracks
+        # whether the would-be-resigner actually lost (1) or not (0). The
+        # cumulative count is a separate counter so the rate plot shows real
+        # samples rather than a sliding window without enough data.
+        recent_resign_eligible: deque[bool] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_resigned: deque[bool] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        verify_outcomes: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        verify_total = 0
         outcome_counts = {"p1_win": 0, "p2_win": 0, "draw": 0}
         self._buffer = buffer  # used by _auto_checkpoint to persist buffer state
 
@@ -398,6 +407,18 @@ class Trainer:
                 recent_captures.append(game.captures_p1 + game.captures_p2)
                 recent_pieces_diff.append(game.final_pieces_diff)
                 recent_term_reasons.append(game.term_reason)
+                recent_resign_eligible.append(game.resign_eligible)
+                recent_resigned.append(game.resigned_by_player is not None)
+                if game.was_verify_play and game.verify_resigning_player is not None:
+                    # The "would-be-resigner" lost iff the actual outcome went
+                    # to the opponent. 1 = resign decision was correct (their
+                    # forfeit would have been right), 0 = false positive.
+                    expected_loser = game.verify_resigning_player
+                    actually_lost = (
+                        game.outcome != -1 and game.outcome != expected_loser
+                    )
+                    verify_outcomes.append(1 if actually_lost else 0)
+                    verify_total += 1
                 if game.outcome == 1:
                     outcome_counts["p1_win"] += 1
                 elif game.outcome == 2:
@@ -414,6 +435,13 @@ class Trainer:
                     recent_pieces_diff,
                     recent_term_reasons,
                     outcome_counts,
+                    games_collected,
+                )
+                self._log_resign_stats(
+                    recent_resign_eligible,
+                    recent_resigned,
+                    verify_outcomes,
+                    verify_total,
                     games_collected,
                 )
 
@@ -598,6 +626,52 @@ class Trainer:
                 torch.tensor(list(recent_lengths), dtype=torch.float32),
                 games_collected,
             )
+
+    def _log_resign_stats(
+        self,
+        recent_resign_eligible: deque[bool],
+        recent_resigned: deque[bool],
+        verify_outcomes: deque[int],
+        verify_total: int,
+        games_collected: int,
+    ) -> None:
+        """Log resign-feature diagnostics for post-hoc threshold calibration.
+
+        - resign/eligible_rate: rolling fraction of games where the threshold
+          was ever crossed (regardless of resign vs verify decision).
+        - resign/triggered_rate: rolling fraction of games that actually
+          ended by resignation. Always ≤ eligible_rate (verify_fraction
+          subset is played out instead).
+        - resign/verify_total: cumulative count of verify-play games (the
+          ones we sampled to play out). Useful to know how much data we
+          have for the false-positive estimate below.
+        - resign/verified_correct_rate: among verify games, fraction where
+          the would-be-resigner actually lost. Should sit ≥ ~0.95 with a
+          well-calibrated threshold.
+        - resign/verified_false_positive_rate: 1 − correct_rate. Above 5%
+          means the threshold is too aggressive (resigning winning/draw
+          positions); raise it (more negative — e.g. -0.95 from -0.90).
+        """
+        n_recent = len(recent_resign_eligible)
+        if n_recent == 0:
+            return
+        eligible_rate = sum(recent_resign_eligible) / n_recent
+        triggered_rate = sum(recent_resigned) / n_recent
+        # Skip the false-positive plot until we have *some* verify data,
+        # otherwise MLflow renders a misleading 0% curve from cold start.
+        stats: dict[str, float] = {
+            "resign/eligible_rate": eligible_rate,
+            "resign/triggered_rate": triggered_rate,
+            "resign/verify_total": float(verify_total),
+        }
+        if len(verify_outcomes) > 0:
+            correct_rate = sum(verify_outcomes) / len(verify_outcomes)
+            stats["resign/verified_correct_rate"] = correct_rate
+            stats["resign/verified_false_positive_rate"] = 1.0 - correct_rate
+        for tag, value in stats.items():
+            if self._writer is not None:
+                self._writer.add_scalar(tag, value, games_collected)
+            self._mlflow_log(tag, value, games_collected)
 
     def _log_memory_health(self, manager: SelfPlayManager) -> None:
         """Periodic check for memory/queue leaks. Cheap: ~1 ms per call.

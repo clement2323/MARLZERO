@@ -249,6 +249,11 @@ class MorrisSearch:
         self._sim_env = MorrisSimEnv()
         self._network = network
         self._device = device
+        # Keep a direct reference to the raw eval_fn so callers can query the
+        # network's value estimate at the root *without* running MCTS — used
+        # by the resign-threshold logic in self_play._play_game (one extra
+        # forward per move, ~0.4% overhead vs a 250-sim search).
+        self._eval_fn: EvalFn = eval_fn
         self._policy_fn = _adapt_eval_fn_to_lzero(eval_fn)
 
         if _CTREE_AVAILABLE:
@@ -316,3 +321,15 @@ class MorrisSearch:
         # ctree returns (action, probs, root_node); ptree returns (action, probs)
         action, action_probs = result[0], result[1]
         return int(action), np.array(action_probs, dtype=np.float32)
+
+    def root_value(self, state: GameState) -> float:
+        """Return the network's value estimate for *state* (no MCTS).
+
+        Used by the resign-threshold logic: it gives a per-move scalar in
+        [-1, 1] from the current player's POV, cheaper than running another
+        MCTS search.  ``MCTSCtree`` does not expose its post-search root Q
+        through Python, so we go straight to the eval_fn that MCTS uses for
+        leaf evaluation.
+        """
+        _, value = self._eval_fn(state)
+        return float(value)

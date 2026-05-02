@@ -139,6 +139,20 @@ def main(cfg: DictConfig) -> None:
     # ---- Self-play workers ----
     inference_mode = cfg.self_play.get("inference_mode", "per_worker_cpu")
     inference_device = cfg.self_play.get("inference_device", "cuda" if device.type == "cuda" else "cpu")
+    # Build a ResignConfig only when the feature is enabled. The class is a
+    # frozen dataclass so it pickles cheaply across the spawn boundary into
+    # each worker.
+    resign_node = cfg.self_play.get("resign", None)
+    resign_config = None
+    if resign_node is not None and bool(resign_node.get("enabled", False)):
+        from morris_rl.training.self_play import ResignConfig
+        resign_config = ResignConfig(
+            enabled=True,
+            threshold=float(resign_node.get("threshold", -0.90)),
+            min_consecutive_below=int(resign_node.get("min_consecutive_below", 3)),
+            min_move_for_resign=int(resign_node.get("min_move_for_resign", 30)),
+            verify_fraction=float(resign_node.get("verify_fraction", 0.05)),
+        )
     manager = SelfPlayManager(
         network=network,
         network_cfg=_network_cfg_dict(cfg),
@@ -155,6 +169,7 @@ def main(cfg: DictConfig) -> None:
         log_file=log_file_path,
         worker_max_rss_mb=cfg.self_play.get("worker_max_rss_mb", 0),
         worker_recycle_games=cfg.self_play.get("worker_recycle_games", 0),
+        resign_config=resign_config,
     )
 
     logger.info(
