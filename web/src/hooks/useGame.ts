@@ -59,6 +59,17 @@ export interface GameState {
   // Authoritative legal actions from the server. Used during the capture phase
   // because mill-protection rules are tricky to reimplement client-side.
   serverLegalActions: number[];
+  // Last position where a piece was newly added (placement or movement
+  // destination). null on captures or before the first move. Drives the
+  // "just placed" flash so dark pieces on a dark surface stay visible.
+  lastPlacedPos: number | null;
+}
+
+function findNewlyOccupied(prev: number[], next: number[]): number | null {
+  for (let i = 0; i < next.length; i++) {
+    if (prev[i] === 0 && next[i] !== 0) return i;
+  }
+  return null;
 }
 
 const INITIAL_BOARD = Array<number>(24).fill(0);
@@ -84,6 +95,7 @@ function initialState(humanPlayer: 1 | 2 = 1): GameState {
     errorMsg: "",
     serverReady: false,
     serverLegalActions: [],
+    lastPlacedPos: null,
   };
 }
 
@@ -130,6 +142,9 @@ export function useGame() {
               ? "thinking"
               : "waiting_human",
           errorMsg: "",
+          // Diff against the optimistic prev board: a non-null result means the
+          // agent just added a piece (place or move dst); null means a capture.
+          lastPlacedPos: findNewlyOccupied(prev.board, resp.board_after.board),
         }));
         if (agentMustContinue) {
           setTimeout(() => callAgent(newActions, humanPlayer), 400);
@@ -222,83 +237,90 @@ export function useGame() {
 
   const handlePositionClick = useCallback(
     (pos: number) => {
-      setGs((prev) => {
-        if (prev.status !== "waiting_human" || prev.gameOver) return prev;
+      // Side effects (setTimeout / network) MUST live outside the setGs updater:
+      // React StrictMode invokes updaters twice in dev to surface impurity, which
+      // would otherwise schedule two backend calls and duplicate the move history.
+      if (gs.status !== "waiting_human" || gs.gameOver) return;
 
-        const {
-          mustCapture,
-          piecesInHand,
-          currentPlayer,
-          selectedPos,
-          actions,
-          moveHistory,
-          humanPlayer,
-        } = prev;
+      const {
+        mustCapture,
+        piecesInHand,
+        currentPlayer,
+        selectedPos,
+        actions,
+        humanPlayer,
+        board,
+      } = gs;
 
-        // --- Capture phase ---
-        if (mustCapture) {
-          const newActions = [...actions, pos];
-          const newBoard = [...prev.board];
-          newBoard[pos] = 0;
-          setTimeout(() => proceedAfterHuman(newActions, humanPlayer), 0);
-          return {
-            ...prev,
-            board: newBoard,
-            actions: newActions,
-            moveHistory: [...moveHistory, { player: humanPlayer, desc: describeAction(pos, true) }],
-            status: "thinking",
-          };
-        }
-
-        // --- Placement phase ---
-        if (piecesInHand[currentPlayer - 1] > 0) {
-          const newActions = [...actions, pos];
-          const newBoard = [...prev.board];
-          newBoard[pos] = currentPlayer;
-          const newHand: [number, number] = [prev.piecesInHand[0], prev.piecesInHand[1]];
-          newHand[currentPlayer - 1]--;
-          setTimeout(() => proceedAfterHuman(newActions, humanPlayer), 0);
-          return {
-            ...prev,
-            board: newBoard,
-            piecesInHand: newHand,
-            actions: newActions,
-            moveHistory: [...moveHistory, { player: humanPlayer, desc: describeAction(pos, false) }],
-            status: "thinking",
-          };
-        }
-
-        // --- Movement phase: select source ---
-        if (selectedPos === null) {
-          if (prev.board[pos] === currentPlayer) {
-            return { ...prev, selectedPos: pos };
-          }
-          return prev;
-        }
-
-        // Reselect if clicking own piece again
-        if (prev.board[pos] === currentPlayer) {
-          return { ...prev, selectedPos: pos };
-        }
-
-        // Commit movement
-        const action = NUM_PLACE_CAPTURE_ACTIONS + selectedPos * 24 + pos;
-        const newActions = [...actions, action];
-        const newBoard = [...prev.board];
-        newBoard[selectedPos] = 0;
-        newBoard[pos] = currentPlayer;
-        setTimeout(() => proceedAfterHuman(newActions, humanPlayer), 0);
-        return {
+      // --- Capture phase ---
+      if (mustCapture) {
+        const newActions = [...actions, pos];
+        const newBoard = [...board];
+        newBoard[pos] = 0;
+        setGs((prev) => ({
           ...prev,
           board: newBoard,
           actions: newActions,
-          moveHistory: [...moveHistory, { player: humanPlayer, desc: describeAction(action, false) }],
-          selectedPos: null,
+          moveHistory: [...prev.moveHistory, { player: humanPlayer, desc: describeAction(pos, true) }],
           status: "thinking",
-        };
-      });
+          lastPlacedPos: null,
+        }));
+        proceedAfterHuman(newActions, humanPlayer);
+        return;
+      }
+
+      // --- Placement phase ---
+      if (piecesInHand[currentPlayer - 1] > 0) {
+        const newActions = [...actions, pos];
+        const newBoard = [...board];
+        newBoard[pos] = currentPlayer;
+        const newHand: [number, number] = [piecesInHand[0], piecesInHand[1]];
+        newHand[currentPlayer - 1]--;
+        setGs((prev) => ({
+          ...prev,
+          board: newBoard,
+          piecesInHand: newHand,
+          actions: newActions,
+          moveHistory: [...prev.moveHistory, { player: humanPlayer, desc: describeAction(pos, false) }],
+          status: "thinking",
+          lastPlacedPos: pos,
+        }));
+        proceedAfterHuman(newActions, humanPlayer);
+        return;
+      }
+
+      // --- Movement phase: select source ---
+      if (selectedPos === null) {
+        if (board[pos] === currentPlayer) {
+          setGs((prev) => ({ ...prev, selectedPos: pos }));
+        }
+        return;
+      }
+
+      // Reselect if clicking own piece again
+      if (board[pos] === currentPlayer) {
+        setGs((prev) => ({ ...prev, selectedPos: pos }));
+        return;
+      }
+
+      // Commit movement
+      const action = NUM_PLACE_CAPTURE_ACTIONS + selectedPos * 24 + pos;
+      const newActions = [...actions, action];
+      const newBoard = [...board];
+      newBoard[selectedPos] = 0;
+      newBoard[pos] = currentPlayer;
+      setGs((prev) => ({
+        ...prev,
+        board: newBoard,
+        actions: newActions,
+        moveHistory: [...prev.moveHistory, { player: humanPlayer, desc: describeAction(action, false) }],
+        selectedPos: null,
+        status: "thinking",
+        lastPlacedPos: pos,
+      }));
+      proceedAfterHuman(newActions, humanPlayer);
     },
-    [proceedAfterHuman]
+    [gs, proceedAfterHuman]
   );
 
   const legalActions: number[] = gs.status === "waiting_human"

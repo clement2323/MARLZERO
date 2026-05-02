@@ -13,15 +13,28 @@ interface Props {
   humanPlayer: 1 | 2;
 }
 
+const ACCENT_VIOLET = "#a78bfa";
+const ACCENT_CYAN = "#22d3ee";
+const ACCENT_MAGENTA = "#f472b6";
+const INK = "#e8ecf2";
+const INK_DIM = "#8b94a3";
+const INK_MUTE = "#4a5260";
+const RULE = "#1c1f29";
+
+const MONO =
+  'ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace';
+
 function ValueBar({ value }: { value: number }) {
   const pct = ((value + 1) / 2) * 100;
+  const agentWinning = value >= 0;
+  const fillColor = agentWinning ? ACCENT_CYAN : ACCENT_MAGENTA;
   return (
-    <div style={{ margin: "8px 0" }}>
+    <div style={{ margin: "10px 0 4px" }}>
       <div
         style={{
-          height: 12,
-          background: "#333",
-          borderRadius: 6,
+          height: 6,
+          background: RULE,
+          borderRadius: 999,
           overflow: "hidden",
           position: "relative",
         }}
@@ -32,7 +45,8 @@ function ValueBar({ value }: { value: number }) {
             left: `${pct < 50 ? pct : 50}%`,
             width: `${Math.abs(pct - 50)}%`,
             height: "100%",
-            background: value >= 0 ? "#e8e8e8" : "#1a1a2e",
+            background: fillColor,
+            boxShadow: `0 0 10px ${fillColor}aa`,
             transition: "all 0.3s",
           }}
         />
@@ -40,20 +54,49 @@ function ValueBar({ value }: { value: number }) {
           style={{
             position: "absolute",
             left: "50%",
-            top: 0,
-            width: 2,
-            height: "100%",
-            background: "#f0a500",
+            top: -2,
+            width: 1,
+            height: 10,
+            background: ACCENT_VIOLET,
+            opacity: 0.7,
           }}
         />
       </div>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#aaa", marginTop: 2 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: 10,
+          color: INK_MUTE,
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          marginTop: 8,
+          fontFamily: MONO,
+        }}
+      >
         <span>Agent losing</span>
-        <span style={{ fontWeight: "bold", color: value >= 0 ? "#e8e8e8" : "#888" }}>
-          {value >= 0 ? `+${value.toFixed(2)}` : value.toFixed(2)}
+        <span style={{ color: fillColor, fontWeight: 600 }}>
+          {agentWinning ? `+${value.toFixed(2)}` : value.toFixed(2)}
         </span>
         <span>Agent winning</span>
       </div>
+    </div>
+  );
+}
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        fontSize: 10,
+        color: INK_MUTE,
+        letterSpacing: "0.18em",
+        textTransform: "uppercase",
+        marginBottom: 8,
+        fontFamily: MONO,
+      }}
+    >
+      {children}
     </div>
   );
 }
@@ -79,60 +122,104 @@ export default function AnalysisPanel({
     }
   }, [moveHistory.length]);
   return (
-    <div style={{ color: "#e0e0e0", fontFamily: "monospace", fontSize: 14 }}>
-      <h3 style={{ margin: "0 0 4px", color: "#f0a500", fontSize: 16 }}>Analysis</h3>
-      <div style={{ fontSize: 13, color: "#ccc", marginBottom: 12, fontWeight: "bold" }}>
+    <div style={{ color: INK, fontSize: 13 }}>
+      <h3
+        style={{
+          margin: "0 0 4px",
+          color: INK,
+          fontSize: 12,
+          letterSpacing: "0.2em",
+          textTransform: "uppercase",
+          fontWeight: 600,
+        }}
+      >
+        <span
+          style={{
+            display: "inline-block",
+            width: 6,
+            height: 6,
+            borderRadius: "50%",
+            marginRight: 8,
+            verticalAlign: "middle",
+            background: ACCENT_VIOLET,
+            boxShadow: `0 0 10px ${ACCENT_VIOLET}`,
+          }}
+        />
+        Analysis
+      </h3>
+      <div
+        style={{
+          fontSize: 11,
+          color: INK_DIM,
+          marginBottom: 18,
+          fontFamily: MONO,
+          letterSpacing: "0.04em",
+        }}
+      >
         {agentName || (usingNetwork ? "AlphaZero network" : "Minimax fallback")}
       </div>
 
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ fontSize: 12, color: "#aaa", marginBottom: 4 }}>
-          Engine: {usingNetwork ? "AlphaZero network" : "Minimax fallback"}
-        </div>
+      <div style={{ marginBottom: 20 }}>
+        <SectionTitle>Engine eval</SectionTitle>
         <ValueBar value={valueEstimate} />
       </div>
 
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>Top moves</div>
-        {topMoves.map((m, i) => (
-          <div
-            key={m.action}
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              padding: "4px 8px",
-              marginBottom: 3,
-              background: i === 0 ? "rgba(240,165,0,0.15)" : "rgba(255,255,255,0.05)",
-              borderRadius: 4,
-              borderLeft: i === 0 ? "3px solid #f0a500" : "3px solid transparent",
-            }}
-          >
-            <span style={{ color: "#ddd" }}>{m.description}</span>
-            <span style={{ color: "#aaa" }}>{(m.visit_prob * 100).toFixed(1)}%</span>
-          </div>
-        ))}
+      <div style={{ marginBottom: 20 }}>
+        <SectionTitle>Top moves</SectionTitle>
+        {topMoves.length === 0 && (
+          <div style={{ color: INK_MUTE, fontSize: 12, fontFamily: MONO }}>—</div>
+        )}
+        {topMoves.map((m, i) => {
+          const isTop = i === 0;
+          return (
+            <div
+              key={m.action}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "6px 10px",
+                marginBottom: 3,
+                background: isTop
+                  ? `linear-gradient(90deg, ${ACCENT_VIOLET}1a, transparent)`
+                  : "transparent",
+                borderRadius: 6,
+                borderLeft: `2px solid ${isTop ? ACCENT_VIOLET : "transparent"}`,
+                fontFamily: MONO,
+                fontSize: 12,
+              }}
+            >
+              <span style={{ color: isTop ? INK : INK_DIM }}>{m.description}</span>
+              <span style={{ color: isTop ? ACCENT_VIOLET : INK_MUTE, fontVariantNumeric: "tabular-nums" }}>
+                {(m.visit_prob * 100).toFixed(1)}%
+              </span>
+            </div>
+          );
+        })}
       </div>
 
-      <div style={{ borderTop: "1px solid #333", paddingTop: 12 }}>
-        <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>Material</div>
-        <div style={{ display: "flex", gap: 24 }}>
+      <div style={{ borderTop: `1px solid ${RULE}`, paddingTop: 14, marginBottom: 14 }}>
+        <SectionTitle>Material</SectionTitle>
+        <div style={{ display: "flex", gap: 24, fontFamily: MONO, fontSize: 12 }}>
           <div>
-            <div style={{ color: "#888" }}>You ({youGlyph})</div>
-            <div>{playerPieces[humanIdx]} on board</div>
-            <div style={{ color: "#aaa" }}>{piecesInHand[humanIdx]} in hand</div>
+            <div style={{ color: INK_MUTE, fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+              You {youGlyph}
+            </div>
+            <div style={{ color: INK }}>{playerPieces[humanIdx]} on board</div>
+            <div style={{ color: INK_DIM }}>{piecesInHand[humanIdx]} in hand</div>
           </div>
           <div>
-            <div style={{ color: "#888" }}>Agent ({agentGlyph})</div>
-            <div>{playerPieces[agentIdx]} on board</div>
-            <div style={{ color: "#aaa" }}>{piecesInHand[agentIdx]} in hand</div>
+            <div style={{ color: INK_MUTE, fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+              Agent {agentGlyph}
+            </div>
+            <div style={{ color: INK }}>{playerPieces[agentIdx]} on board</div>
+            <div style={{ color: INK_DIM }}>{piecesInHand[agentIdx]} in hand</div>
           </div>
         </div>
       </div>
 
-      <div style={{ borderTop: "1px solid #333", paddingTop: 12, marginTop: 12 }}>
-        <div style={{ fontSize: 12, color: "#aaa", marginBottom: 6 }}>
-          Move history ({moveHistory.length})
-        </div>
+      <div style={{ borderTop: `1px solid ${RULE}`, paddingTop: 14 }}>
+        <SectionTitle>Move history · {moveHistory.length}</SectionTitle>
         <div
           ref={historyRef}
           style={{
@@ -144,7 +231,7 @@ export default function AnalysisPanel({
           }}
         >
           {moveHistory.length === 0 && (
-            <div style={{ color: "#555", fontSize: 12 }}>No moves yet.</div>
+            <div style={{ color: INK_MUTE, fontSize: 12, fontFamily: MONO }}>No moves yet.</div>
           )}
           {moveHistory.map((entry, i) => (
             <div
@@ -152,24 +239,25 @@ export default function AnalysisPanel({
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 6,
-                padding: "2px 6px",
-                borderRadius: 3,
-                background: "rgba(255,255,255,0.03)",
+                gap: 8,
+                padding: "3px 8px",
+                borderRadius: 4,
+                background: i % 2 === 0 ? "rgba(255,255,255,0.015)" : "transparent",
+                fontFamily: MONO,
               }}
             >
-              <span style={{ color: "#555", fontSize: 11, minWidth: 24 }}>
-                {i + 1}.
+              <span style={{ color: INK_MUTE, fontSize: 10, minWidth: 24, fontVariantNumeric: "tabular-nums" }}>
+                {(i + 1).toString().padStart(2, "0")}
               </span>
               <span
                 style={{
                   fontSize: 11,
-                  color: entry.player === humanPlayer ? "#aad4ff" : "#ddd",
+                  color: entry.player === humanPlayer ? ACCENT_CYAN : INK_DIM,
                 }}
               >
                 {entry.player === 1 ? "○" : "●"}
               </span>
-              <span style={{ fontSize: 12, color: "#ccc" }}>{entry.desc}</span>
+              <span style={{ fontSize: 11, color: INK_DIM }}>{entry.desc}</span>
             </div>
           ))}
         </div>

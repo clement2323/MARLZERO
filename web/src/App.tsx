@@ -1,6 +1,9 @@
+import { useState } from "react";
 import Board from "./components/Board";
 import AnalysisPanel from "./components/AnalysisPanel";
+import RulesTheater from "./components/RulesTheater";
 import { useGame } from "./hooks/useGame";
+import { useShake } from "./hooks/useShake";
 import "./App.css";
 
 function statusMessage(
@@ -29,6 +32,8 @@ function statusMessage(
 
 export default function App() {
   const { gs, legalActions, handlePositionClick, resetGame } = useGame();
+  const { jitter, trigger: triggerShake } = useShake();
+  const [loserKey, setLoserKey] = useState(0);
 
   const playerPieces: [number, number] = [
     gs.board.filter((x) => x === 1).length,
@@ -53,16 +58,21 @@ export default function App() {
       <header className="app-header">
         <h1>Nine Men&apos;s Morris</h1>
         <div className="legend">
-          <span className="piece p1" /> You ({youGlyph} {humanIsWhite ? "white" : "black"})
-          <span className="piece p2" /> Agent ({agentGlyph} {humanIsWhite ? "black" : "white"})
+          <span>
+            <span className={humanIsWhite ? "piece p1" : "piece p2"} />
+            You ({youGlyph} {humanIsWhite ? "white" : "black"})
+          </span>
+          <span>
+            <span className={humanIsWhite ? "piece p2" : "piece p1"} />
+            Agent ({agentGlyph} {humanIsWhite ? "black" : "white"})
+          </span>
         </div>
       </header>
 
       <main className="app-main">
         <div className="board-section">
           <div
-            className="status-bar"
-            style={{ color: gs.status === "game_over" ? "#f0a500" : "#ddd" }}
+            className={`status-bar${gs.status === "game_over" ? " is-game-over" : ""}`}
           >
             {msg}
           </div>
@@ -72,34 +82,41 @@ export default function App() {
             selectedPos={gs.selectedPos}
             onPositionClick={handlePositionClick}
             disabled={gs.status !== "waiting_human"}
+            jitter={jitter}
+            lastPlacedPos={gs.lastPlacedPos}
+            lastMoveKey={gs.moveHistory.length}
           />
-          <div className="controls" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div className="controls">
             <button onClick={() => resetGame(gs.humanPlayer)} className="btn">
               New Game
             </button>
-            <span style={{ color: "#888", fontSize: 12, marginLeft: 12 }}>Play as:</span>
+            <span className="controls-label">Play as</span>
             <button
               onClick={() => resetGame(1)}
-              className="btn"
-              style={{
-                background: gs.humanPlayer === 1 ? "#e8e8e8" : "#333",
-                color: gs.humanPlayer === 1 ? "#1a1a2e" : "#ccc",
-                fontWeight: gs.humanPlayer === 1 ? "bold" : "normal",
-              }}
+              className={`btn${gs.humanPlayer === 1 ? " is-active-white" : ""}`}
             >
-              ○ White (first)
+              ○ White
             </button>
             <button
               onClick={() => resetGame(2)}
-              className="btn"
-              style={{
-                background: gs.humanPlayer === 2 ? "#1a1a2e" : "#333",
-                color: gs.humanPlayer === 2 ? "#e8e8e8" : "#ccc",
-                fontWeight: gs.humanPlayer === 2 ? "bold" : "normal",
-              }}
+              className={`btn${gs.humanPlayer === 2 ? " is-active-black" : ""}`}
             >
-              ● Black (second)
+              ● Black
             </button>
+            <span className="controls-label">Test</span>
+            <button onClick={triggerShake} className="btn is-test">
+              Shake
+            </button>
+            <button
+              onClick={() => setLoserKey((k) => k + 1)}
+              className="btn is-test"
+            >
+              Loser
+            </button>
+          </div>
+
+          <div className="rules-block">
+            <RulesTheater triggerKey={loserKey} />
           </div>
         </div>
 
