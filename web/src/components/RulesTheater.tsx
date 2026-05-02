@@ -31,10 +31,11 @@ const AREA_HEIGHT = 168;
 const PARAGRAPH_PAD_X = 4;
 const PARAGRAPH_TOP = 18;
 
-const ANIM_DURATION_MS = 3200;
-const SAMPLE_COUNT = 18;
-const BLOB_RADIUS = 13;
-const BODY_FRACTION = 0.55;
+const ANIM_DURATION_MS = 31000;
+const SAMPLE_COUNT = 22;
+const BLOB_RADIUS = 12;
+const BODY_PIXELS = 340;
+const OFFSCREEN_PAD = 90;
 const MIN_GAP_WIDTH = 60;
 
 interface Obstacle {
@@ -44,12 +45,14 @@ interface Obstacle {
 }
 
 interface SnakeParams {
-  baseY: number;
+  // Path goes from `entry` (offscreen at one corner) to `exit` (offscreen at
+  // the opposite corner). The diagonal guarantees the body crosses the full
+  // text region, so reflow is visible the whole way.
+  entry: [number, number];
+  exit: [number, number];
   amplitude: number;
   period: number;
   phase: number;
-  direction: 1 | -1; // +1 = left to right, -1 = right to left
-  yTilt: number; // additional drift along y across the run
 }
 
 interface SnakeFrame {
@@ -67,42 +70,77 @@ function pseudoRandom(seed: number, salt: number): number {
   return v - Math.floor(v);
 }
 
+const CORNER_PAIRS: Array<[[number, number], [number, number]]> = [
+  // top-left → bottom-right
+  [
+    [-OFFSCREEN_PAD, -OFFSCREEN_PAD],
+    [AREA_WIDTH + OFFSCREEN_PAD, AREA_HEIGHT + OFFSCREEN_PAD],
+  ],
+  // top-right → bottom-left
+  [
+    [AREA_WIDTH + OFFSCREEN_PAD, -OFFSCREEN_PAD],
+    [-OFFSCREEN_PAD, AREA_HEIGHT + OFFSCREEN_PAD],
+  ],
+  // bottom-right → top-left
+  [
+    [AREA_WIDTH + OFFSCREEN_PAD, AREA_HEIGHT + OFFSCREEN_PAD],
+    [-OFFSCREEN_PAD, -OFFSCREEN_PAD],
+  ],
+  // bottom-left → top-right
+  [
+    [-OFFSCREEN_PAD, AREA_HEIGHT + OFFSCREEN_PAD],
+    [AREA_WIDTH + OFFSCREEN_PAD, -OFFSCREEN_PAD],
+  ],
+];
+
 function pickSnakeParams(seed: number): SnakeParams {
+  const cornerIdx = Math.floor(pseudoRandom(seed, 0) * CORNER_PAIRS.length) % CORNER_PAIRS.length;
+  const [entry, exit] = CORNER_PAIRS[cornerIdx];
   return {
-    baseY: AREA_HEIGHT * 0.35 + pseudoRandom(seed, 1) * AREA_HEIGHT * 0.3,
-    amplitude: 14 + pseudoRandom(seed, 2) * 22,
-    period: 110 + pseudoRandom(seed, 3) * 90,
+    entry,
+    exit,
+    amplitude: 14 + pseudoRandom(seed, 2) * 24,
+    period: 120 + pseudoRandom(seed, 3) * 90,
     phase: pseudoRandom(seed, 4) * Math.PI * 2,
-    direction: pseudoRandom(seed, 5) > 0.5 ? 1 : -1,
-    yTilt: (pseudoRandom(seed, 6) - 0.5) * AREA_HEIGHT * 0.25,
   };
 }
 
 function computeSnake(t: number, p: SnakeParams): SnakeFrame {
-  const bodyLen = AREA_WIDTH * BODY_FRACTION;
-  const total = AREA_WIDTH + bodyLen * 2;
   const eased = easeInOut(t);
-  const advance = eased * total;
-  // Head sweeps in the chosen direction; tail trails behind by bodyLen.
-  const xHead = p.direction > 0 ? -bodyLen + advance : AREA_WIDTH + bodyLen - advance;
-  const yDriftHead = (eased - 0.5) * 2 * p.yTilt;
+  const dx = p.exit[0] - p.entry[0];
+  const dy = p.exit[1] - p.entry[1];
+  const L = Math.hypot(dx, dy);
+  const Dx = dx / L; // unit vector along travel
+  const Dy = dy / L;
+  const Px = -Dy; // perpendicular for sin modulation
+  const Py = Dx;
+  const totalTravel = L + BODY_PIXELS;
+  const advance = eased * totalTravel;
 
   const points: [number, number][] = [];
   const obstacles: Obstacle[] = [];
   for (let i = 0; i < SAMPLE_COUNT; i++) {
-    const frac = i / (SAMPLE_COUNT - 1);
-    const xSample = xHead - p.direction * frac * bodyLen;
-    const yBase = p.baseY + (frac - 0.5) * (p.yTilt * 0.6) + yDriftHead * (1 - frac);
-    const ySample =
-      yBase + Math.sin((xSample / p.period) * Math.PI * 2 + p.phase) * p.amplitude;
-    points.push([xSample, ySample]);
-    if (xSample >= -BLOB_RADIUS && xSample <= AREA_WIDTH + BLOB_RADIUS) {
-      obstacles.push({ x: xSample, y: ySample, r: BLOB_RADIUS });
+    const along = advance - (i / (SAMPLE_COUNT - 1)) * BODY_PIXELS;
+    const xBase = p.entry[0] + along * Dx;
+    const yBase = p.entry[1] + along * Dy;
+    const sinPhase = (along / p.period) * Math.PI * 2 + p.phase;
+    const offset = Math.sin(sinPhase) * p.amplitude;
+    const x = xBase + Px * offset;
+    const y = yBase + Py * offset;
+    points.push([x, y]);
+    if (
+      x >= -BLOB_RADIUS &&
+      x <= AREA_WIDTH + BLOB_RADIUS &&
+      y >= -BLOB_RADIUS &&
+      y <= AREA_HEIGHT + BLOB_RADIUS
+    ) {
+      obstacles.push({ x, y, r: BLOB_RADIUS });
     }
   }
 
-  // SVG textPath needs a left-to-right path so glyphs aren't reversed.
-  const ordered = p.direction > 0 ? points : points.slice().reverse();
+  // Emit path from tail (last sample) to head (first sample) so the glyphs
+  // along <textPath> read in the same direction as the snake's motion.
+  const ordered = points.slice().reverse();
   let pathD = "";
   if (ordered.length > 0) {
     const [x0, y0] = ordered[0];
