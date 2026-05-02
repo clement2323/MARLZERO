@@ -74,9 +74,12 @@ def test_value_target_winner_gets_plus_one() -> None:
     steps = [
         (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
          np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 1,
-         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_)),
+         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
+         0, False),
     ]
-    records = _assign_value_targets(steps, Outcome.PLAYER_1_WINS)
+    records = _assign_value_targets(
+        steps, Outcome.PLAYER_1_WINS, final_pieces_p1=5, final_pieces_p2=2
+    )
     assert records[0].value_target == pytest.approx(1.0)
 
 
@@ -86,9 +89,12 @@ def test_value_target_loser_gets_minus_one() -> None:
     steps = [
         (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
          np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 2,
-         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_)),
+         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
+         0, False),
     ]
-    records = _assign_value_targets(steps, Outcome.PLAYER_1_WINS)
+    records = _assign_value_targets(
+        steps, Outcome.PLAYER_1_WINS, final_pieces_p1=5, final_pieces_p2=2
+    )
     assert records[0].value_target == pytest.approx(-1.0)
 
 
@@ -98,9 +104,12 @@ def test_value_target_draw_is_zero() -> None:
     steps = [
         (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
          np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 1,
-         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_)),
+         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
+         0, False),
     ]
-    records = _assign_value_targets(steps, Outcome.DRAW)
+    records = _assign_value_targets(
+        steps, Outcome.DRAW, final_pieces_p1=3, final_pieces_p2=3
+    )
     assert records[0].value_target == pytest.approx(0.0)
 
 

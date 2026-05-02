@@ -78,3 +78,36 @@ class ValueHead(nn.Module):
         x = x.flatten(start_dim=1)
         x = F.relu(self.fc1(x))
         return torch.tanh(self.fc2(x)).squeeze(1)
+
+
+class AuxScalarHead(nn.Module):
+    """Generic scalar auxiliary head — raw output, no activation.
+
+    Used for regression (mill_count, pieces_diff_at_end → MSE loss) and for
+    binary classification (capture_in_n → BCEWithLogitsLoss). The caller is
+    responsible for picking the appropriate loss for the target type, since
+    the head itself is task-agnostic.
+
+    Mirrors the ValueHead architecture (single-channel projection → flatten →
+    hidden → scalar) which is both small and well-conditioned. Hidden size is
+    configurable; we default to 32 to keep these heads cheap (~2k params each).
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        num_positions: int,
+        hidden_size: int = 32,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(num_channels, 1, kernel_size=1)
+        self.bn = nn.BatchNorm1d(1)
+        self.fc1 = nn.Linear(num_positions, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return raw scalar output of shape (batch,)."""
+        x = F.relu(self.bn(self.conv(x)))
+        x = x.flatten(start_dim=1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x).squeeze(1)

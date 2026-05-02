@@ -42,7 +42,7 @@ from morris_rl.env.rules import (
     is_terminal,
     pieces_on_board,
 )
-from morris_rl.env.board import ACTION_SPACE_SIZE
+from morris_rl.env.board import ACTION_SPACE_SIZE, MILLS
 from morris_rl.network.resnet import MorrisResNet
 from morris_rl.training.replay_buffer import SampleRecord
 
@@ -97,38 +97,89 @@ def _temperature_for_move(move_number: int, threshold: int) -> float:
     return 1.0 if move_number < threshold else _ARGMAX_TEMPERATURE
 
 
+def _count_mills(board: npt.NDArray[np.int8], player: int) -> int:
+    """Number of complete mills owned by *player* on *board*. O(16) checks."""
+    count = 0
+    for a, b, c in MILLS:
+        if board[a] == player and board[b] == player and board[c] == player:
+            count += 1
+    return count
+
+
 def _assign_value_targets(
     steps: list[
         tuple[
-            npt.NDArray[np.float32],
-            npt.NDArray[np.float32],
-            int,
-            npt.NDArray[np.bool_],
+            npt.NDArray[np.float32],   # encoded state
+            npt.NDArray[np.float32],   # policy_target
+            int,                        # current player
+            npt.NDArray[np.bool_],     # legal_mask
+            int,                        # mill_count for current player at this state
+            bool,                       # was the action played a capture?
         ]
     ],
     outcome: Outcome | None,
+    final_pieces_p1: int,
+    final_pieces_p2: int,
+    capture_horizon_plies: int = 3,
 ) -> list[SampleRecord]:
-    """Convert (encoded, policy, current_player, legal_mask) tuples into SampleRecords."""
+    """Convert per-step tuples into SampleRecords, computing aux targets.
+
+    Aux targets:
+    - aux_mill: number of mills the sample's current player has on the board
+      at this state (precomputed in *steps*).
+    - aux_pieces_diff: (own_pieces − opp_pieces) at game terminal, from the
+      sample's player POV. Constant across all of one player's samples.
+    - aux_capture: 1.0 if the sample's current player performs a capture
+      within the next ``capture_horizon_plies`` plies, else 0.0.
+    """
     records: list[SampleRecord] = []
-    for encoded, policy, player, mask in steps:
+    n_steps = len(steps)
+    # Lookahead arrays for capture_in_n.
+    captures_at = [bool(s[5]) for s in steps]
+    players_at = [int(s[2]) for s in steps]
+
+    for i, (encoded, policy, player, mask, mill_count, _was_capture) in enumerate(steps):
         if outcome is None or outcome == Outcome.DRAW:
             v = 0.0
         elif int(outcome) == player:
             v = 1.0
         else:
             v = -1.0
+
+        # pieces_diff_at_end from this sample's POV.
+        if player == 1:
+            pieces_diff = float(final_pieces_p1 - final_pieces_p2)
+        else:
+            pieces_diff = float(final_pieces_p2 - final_pieces_p1)
+
+        # capture_in_n: scan forward up to capture_horizon_plies, looking for
+        # any capture performed by the same player.
+        capture_target = 0.0
+        end = min(i + 1 + capture_horizon_plies, n_steps)
+        for j in range(i + 1, end):
+            if captures_at[j] and players_at[j] == player:
+                capture_target = 1.0
+                break
+
         records.append(
             SampleRecord(
                 encoded_state=encoded,
                 policy_target=policy,
                 value_target=v,
                 legal_mask=mask,
+                aux_mill=float(mill_count),
+                aux_pieces_diff=pieces_diff,
+                aux_capture=capture_target,
             )
         )
     return records
 
 
-def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameRecord:
+def _play_game(
+    search: "MorrisSearch",
+    temperature_threshold: int = 10,
+    capture_horizon_plies: int = 3,
+) -> GameRecord:
     """Play one complete self-play game and return its training data."""
     from morris_rl.mcts.search import encode_state  # cached after worker import
 
@@ -139,6 +190,8 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
             npt.NDArray[np.float32],
             int,
             npt.NDArray[np.bool_],
+            int,    # aux: mill_count for current_player at this state
+            bool,   # aux: did this action turn out to be a capture?
         ]
     ] = []
     move_count = 0
@@ -163,22 +216,29 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
         # the mask of the state the policy_target was computed for.
         legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
         legal_mask[get_legal_actions(state)] = True
+        # Aux target #1: number of mills the current player has on the board.
+        aux_mill_count = _count_mills(state.board, state.current_player)
+
         action, visit_probs = search.run(state, temperature=temp, add_noise=True)
-        steps.append((encoded, visit_probs, state.current_player, legal_mask))
 
         # Capture stats around the action: state.must_capture flips are the
         # cleanest signal of mill / capture events.
         was_must_capture = state.must_capture
         actor = state.current_player
         state = apply_action(state, action)
+        was_capture = was_must_capture and not state.must_capture
+
+        steps.append(
+            (encoded, visit_probs, actor, legal_mask, aux_mill_count, was_capture)
+        )
+
         if not was_must_capture and state.must_capture:
             # The just-played placement/move formed a mill (forced capture next).
             if actor == 1:
                 mills_p1 += 1
             else:
                 mills_p2 += 1
-        elif was_must_capture and not state.must_capture:
-            # The just-played action consumed a forced-capture sub-turn.
+        elif was_capture:
             if actor == 1:
                 captures_p1 += 1
             else:
@@ -187,11 +247,17 @@ def _play_game(search: "MorrisSearch", temperature_threshold: int = 10) -> GameR
 
     _, outcome = is_terminal(state)
     term_reason = _detect_term_reason(state, outcome)
-    final_pieces_diff = (
-        pieces_on_board(state.board, 1) - pieces_on_board(state.board, 2)
-    )
+    final_pieces_p1 = pieces_on_board(state.board, 1)
+    final_pieces_p2 = pieces_on_board(state.board, 2)
+    final_pieces_diff = final_pieces_p1 - final_pieces_p2
 
-    samples = _assign_value_targets(steps, outcome)
+    samples = _assign_value_targets(
+        steps,
+        outcome,
+        final_pieces_p1=final_pieces_p1,
+        final_pieces_p2=final_pieces_p2,
+        capture_horizon_plies=capture_horizon_plies,
+    )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(
         samples=samples,
@@ -234,6 +300,7 @@ def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
         num_planes=cfg.get("num_planes", _NUM_PLANES),
         policy_head_hidden=cfg["policy_head_hidden"],
         value_head_hidden=cfg["value_head_hidden"],
+        aux_heads_config=cfg.get("aux_heads_config"),
     )
 
 

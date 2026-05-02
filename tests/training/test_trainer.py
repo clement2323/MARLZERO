@@ -82,7 +82,7 @@ def test_compute_loss_returns_three_tensors() -> None:
     value = torch.tanh(torch.randn(batch))
     policy_target = torch.softmax(torch.randn(batch, ACTION_SPACE_SIZE), dim=1)
     value_target = torch.tensor([-1.0, 0.0, 1.0, -1.0])
-    total, pl, vl = compute_loss(log_policy, value, policy_target, value_target)
+    total, pl, vl, aux = compute_loss(log_policy, value, policy_target, value_target)
     assert total.shape == ()
     assert pl.shape == ()
     assert vl.shape == ()
@@ -94,7 +94,7 @@ def test_compute_loss_total_equals_sum() -> None:
     value = torch.tanh(torch.randn(batch))
     policy_target = torch.softmax(torch.randn(batch, ACTION_SPACE_SIZE), dim=1)
     value_target = torch.zeros(batch)
-    total, pl, vl = compute_loss(log_policy, value, policy_target, value_target)
+    total, pl, vl, aux = compute_loss(log_policy, value, policy_target, value_target)
     assert torch.isclose(total, pl + vl)
 
 
@@ -105,7 +105,7 @@ def test_perfect_policy_gives_zero_policy_loss() -> None:
     log_policy = policy_target.log()
     value = torch.zeros(batch)
     value_target = torch.zeros(batch)
-    _, pl, _ = compute_loss(log_policy, value, policy_target, value_target)
+    _, pl, _, _ = compute_loss(log_policy, value, policy_target, value_target)
     # Cross-entropy H(p,p) = entropy H(p) ≥ 0, not necessarily 0.
     assert pl.item() >= 0.0
 
@@ -114,7 +114,7 @@ def test_perfect_value_gives_zero_value_loss() -> None:
     batch = 4
     log_policy = torch.log_softmax(torch.zeros(batch, ACTION_SPACE_SIZE), dim=1)
     value_target = torch.tensor([-1.0, 0.0, 1.0, -1.0])
-    _, _, vl = compute_loss(log_policy, value_target, log_policy.exp(), value_target)
+    _, _, vl, _ = compute_loss(log_policy, value_target, log_policy.exp(), value_target)
     assert vl.item() == pytest.approx(0.0, abs=1e-5)
 
 
