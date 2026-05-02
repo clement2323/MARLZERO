@@ -22,6 +22,7 @@ from morris_rl.env.rules import (
     initial_state,
     is_terminal,
     opponent,
+    random_late_game_state,
 )
 
 # ---------------------------------------------------------------------------
@@ -434,3 +435,53 @@ def _play_random_game(seed: int) -> None:
 def test_random_games_1000() -> None:
     for seed in range(1000):
         _play_random_game(seed)
+
+
+# ---------------------------------------------------------------------------
+# random_late_game_state (Phase 3 curriculum)
+# ---------------------------------------------------------------------------
+
+
+def test_random_late_game_state_has_requested_pieces_per_player() -> None:
+    rng = np.random.default_rng(0)
+    for pieces in (4, 5, 6, 7):
+        state = random_late_game_state(rng, pieces_per_player=pieces)
+        assert int(np.sum(state.board == PLAYER_1)) == pieces
+        assert int(np.sum(state.board == PLAYER_2)) == pieces
+
+
+def test_random_late_game_state_no_pre_existing_mill() -> None:
+    """Sampled state must not already be in must_capture (no pre-existing mill)."""
+    rng = np.random.default_rng(1)
+    for _ in range(50):
+        state = random_late_game_state(rng, pieces_per_player=6)
+        assert not state.must_capture
+        for player in (PLAYER_1, PLAYER_2):
+            for pos in range(NUM_POSITIONS):
+                if state.board[pos] == player:
+                    assert not forms_mill(state.board, pos, player)
+
+
+def test_random_late_game_state_has_legal_moves() -> None:
+    rng = np.random.default_rng(2)
+    for _ in range(50):
+        state = random_late_game_state(rng, pieces_per_player=6)
+        assert get_legal_actions(state), "Sampled state must not be terminal"
+
+
+def test_random_late_game_state_hands_empty_and_moving_phase() -> None:
+    rng = np.random.default_rng(3)
+    state = random_late_game_state(rng, pieces_per_player=6)
+    assert state.pieces_in_hand == (0, 0)
+    assert get_phase(state, PLAYER_1) == Phase.MOVING
+    assert get_phase(state, PLAYER_2) == Phase.MOVING
+    assert state.halfmove_clock == 0
+
+
+def test_random_late_game_state_rejects_invalid_piece_counts() -> None:
+    rng = np.random.default_rng(0)
+    import pytest
+    with pytest.raises(ValueError):
+        random_late_game_state(rng, pieces_per_player=2)
+    with pytest.raises(ValueError):
+        random_late_game_state(rng, pieces_per_player=NUM_POSITIONS)

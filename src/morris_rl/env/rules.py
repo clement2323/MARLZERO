@@ -120,6 +120,62 @@ def initial_state() -> GameState:
     return state
 
 
+def random_late_game_state(
+    rng: np.random.Generator,
+    pieces_per_player: int = 6,
+    max_attempts: int = 100,
+) -> GameState:
+    """Return a random mid/late-game position with both hands empty.
+
+    Used by the curriculum feature to bias self-play toward decisive
+    endgame positions: most pieces are already on the board, so games end
+    in a clear win/loss far more often than from the empty board (which
+    drifts toward the draw attractor in early training).
+
+    Constraints on the sampled state:
+    - exactly *pieces_per_player* pieces per side, in moving phase
+    - no pre-existing mill (avoids waking up in the must_capture sub-turn)
+    - the chosen mover has at least one legal action
+
+    If no valid configuration is found in *max_attempts* tries, falls back
+    to ``initial_state()``. Returning rather than raising keeps self-play
+    workers from crashing on a degenerate run.
+    """
+    if pieces_per_player < 3 or 2 * pieces_per_player > NUM_POSITIONS:
+        raise ValueError(
+            f"pieces_per_player must be in [3, {NUM_POSITIONS // 2}], got {pieces_per_player}"
+        )
+    n_pieces = 2 * pieces_per_player
+    for _ in range(max_attempts):
+        positions = rng.choice(NUM_POSITIONS, size=n_pieces, replace=False)
+        p1_positions = positions[:pieces_per_player]
+        p2_positions = positions[pieces_per_player:]
+        board = np.zeros(NUM_POSITIONS, dtype=np.int8)
+        board[p1_positions] = PLAYER_1
+        board[p2_positions] = PLAYER_2
+        # Reject configurations that would put the game directly into
+        # must_capture (any pre-existing mill).
+        if any(forms_mill(board, int(pos), PLAYER_1) for pos in p1_positions):
+            continue
+        if any(forms_mill(board, int(pos), PLAYER_2) for pos in p2_positions):
+            continue
+        current_player = PLAYER_1 if rng.random() < 0.5 else PLAYER_2
+        candidate = GameState(
+            board=board,
+            current_player=current_player,
+            pieces_in_hand=(0, 0),
+            must_capture=False,
+            halfmove_clock=0,
+        )
+        # Reject states where the mover has no legal action — that would be
+        # an immediate terminal (loss by no_legal_moves), 0-ply game.
+        if not get_legal_actions(candidate):
+            continue
+        _register_position(candidate)
+        return candidate
+    return initial_state()
+
+
 def get_legal_actions(state: GameState) -> list[int]:
     """Return all legal action indices for the current state."""
     if state.must_capture:

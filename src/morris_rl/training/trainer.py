@@ -380,6 +380,10 @@ class Trainer:
         # when the feature is on, and 1.0 when it's off.
         recent_full_sim: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         recent_fast_sim: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        # Curriculum deque: per-game flag of whether the game started from
+        # a random late-game position. Rolling rate confirms the feature is
+        # firing at the configured random_start_fraction.
+        recent_curriculum: deque[bool] = deque(maxlen=_GAME_LENGTH_WINDOW)
         outcome_counts = {"p1_win": 0, "p2_win": 0, "draw": 0}
         self._buffer = buffer  # used by _auto_checkpoint to persist buffer state
 
@@ -416,6 +420,7 @@ class Trainer:
                 recent_resigned.append(game.resigned_by_player is not None)
                 recent_full_sim.append(game.full_sim_moves)
                 recent_fast_sim.append(game.fast_sim_moves)
+                recent_curriculum.append(game.curriculum_start)
                 if game.was_verify_play and game.verify_resigning_player is not None:
                     # The "would-be-resigner" lost iff the actual outcome went
                     # to the opponent. 1 = resign decision was correct (their
@@ -456,6 +461,7 @@ class Trainer:
                     recent_fast_sim,
                     games_collected,
                 )
+                self._log_curriculum_stats(recent_curriculum, games_collected)
 
                 for _ in range(updates_per_game):
                     if self._step >= total_steps:
@@ -715,6 +721,25 @@ class Trainer:
             if self._writer is not None:
                 self._writer.add_scalar(tag, value, games_collected)
             self._mlflow_log(tag, value, games_collected)
+
+    def _log_curriculum_stats(
+        self,
+        recent_curriculum: deque[bool],
+        games_collected: int,
+    ) -> None:
+        """Log the rate at which games started from a random late-game state.
+
+        - curriculum/start_rate: fraction of games over the rolling window
+          that began with a random mid-game position. With the feature off,
+          this is exactly 0; with random_start_fraction=0.5 it should sit
+          around 0.5.
+        """
+        if not recent_curriculum:
+            return
+        rate = sum(recent_curriculum) / len(recent_curriculum)
+        if self._writer is not None:
+            self._writer.add_scalar("curriculum/start_rate", rate, games_collected)
+        self._mlflow_log("curriculum/start_rate", rate, games_collected)
 
     def _log_memory_health(self, manager: SelfPlayManager) -> None:
         """Periodic check for memory/queue leaks. Cheap: ~1 ms per call.

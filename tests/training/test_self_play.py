@@ -295,6 +295,36 @@ def test_play_game_playout_cap_no_fast_search_treats_all_as_full() -> None:
     assert result.full_sim_moves == result.game_length
 
 
+def test_play_game_curriculum_disabled_starts_from_initial() -> None:
+    """With curriculum off, every game starts from initial_state()."""
+    rng = np.random.default_rng(0)
+    search = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=5)
+    result = _play_game(search, temperature_threshold=2, rng=rng)
+    assert result.curriculum_start is False
+    assert result.curriculum_pieces == 0
+
+
+def test_play_game_curriculum_enabled_records_curriculum_start() -> None:
+    """random_start_fraction=1.0 forces a curriculum start every game."""
+    from morris_rl.training.self_play import CurriculumConfig
+    cfg = CurriculumConfig(
+        enabled=True, random_start_fraction=1.0, pieces_per_player=5
+    )
+    rng = np.random.default_rng(7)
+    search = MorrisSearch(_make_small_net(), _DEVICE, num_simulations=5)
+    result = _play_game(
+        search, temperature_threshold=2, rng=rng, curriculum_config=cfg
+    )
+    assert result.curriculum_start is True
+    assert result.curriculum_pieces == 5
+    # First sample's encoded state should reflect a board that already has
+    # pieces — planes 0+1 (own/opp pieces) sum to 2*pieces_per_player=10.
+    if result.samples:
+        first = result.samples[0].encoded_state
+        # Plane 0 = current player's pieces, Plane 1 = opp's pieces.
+        assert first[0].sum() + first[1].sum() == pytest.approx(10.0)
+
+
 def test_play_game_term_reason_threefold_under_repetition() -> None:
     """When a game ends by threefold, term_reason reflects that."""
     # Force threefold by playing a game from scratch: the small net at depth 5

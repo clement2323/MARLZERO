@@ -42,6 +42,7 @@ from morris_rl.env.rules import (
     is_terminal,
     opponent,
     pieces_on_board,
+    random_late_game_state,
 )
 from morris_rl.env.board import ACTION_SPACE_SIZE, MILLS
 from morris_rl.network.resnet import MorrisResNet
@@ -97,6 +98,12 @@ class GameRecord:
     # is disabled (every move counted as "full").
     full_sim_moves: int = 0   # plies that ran the full-sim search
     fast_sim_moves: int = 0   # plies that ran the fast-sim search
+
+    # Curriculum observability (Phase 3). True if this game started from
+    # a random late-game position rather than initial_state(). Pieces is
+    # the per-side count at start (used to compute the avg start density).
+    curriculum_start: bool = False
+    curriculum_pieces: int = 0
 
 
 @dataclass
@@ -155,6 +162,30 @@ class PlayoutCapConfig:
     # (≤ 1/3 of full) but large enough that the game still progresses
     # plausibly (typically 30–80 for Morris).
     fast_sim_count: int = 60
+
+
+@dataclass(frozen=True)
+class CurriculumConfig:
+    """Knobs for curriculum (random late-game starts) — Phase 3.
+
+    With probability ``random_start_fraction`` per game, the worker starts
+    self-play from a randomly drawn mid-game position (both hands empty,
+    *pieces_per_player* pieces per side) instead of the canonical empty
+    board. This biases the data distribution toward decisive endgames and
+    away from the placement-phase draw attractor.
+
+    Crucially, value targets remain those produced by the network's *own*
+    play from this start — no external "winning side" label is injected,
+    matching the user's "see something learn from scratch" requirement.
+    """
+
+    enabled: bool = False
+    # Per-game Bernoulli probability of using a random start. 1.0 means
+    # every game starts mid-board; 0.0 keeps the canonical loop.
+    random_start_fraction: float = 0.5
+    # How many pieces per side at the random start. 6 is a reasonable
+    # mid-game (each side has lost ~3); lower → closer to terminal.
+    pieces_per_player: int = 6
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +293,7 @@ def _play_game(
     rng: np.random.Generator | None = None,
     search_fast: "MorrisSearch | None" = None,
     playout_cap_config: PlayoutCapConfig | None = None,
+    curriculum_config: CurriculumConfig | None = None,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data.
 
@@ -269,10 +301,35 @@ def _play_game(
     each ply chooses between *search* (full sims, recorded in buffer) and
     *search_fast* (fewer sims, not recorded) via Bernoulli on
     ``full_sim_fraction``.
+
+    When ``curriculum_config.enabled``, the game starts from a random
+    late-game position with probability ``random_start_fraction``.
     """
     from morris_rl.mcts.search import encode_state  # cached after worker import
 
-    state = initial_state()
+    if rng is None:
+        rng = np.random.default_rng()
+    # Curriculum start (Phase 3). Per-game Bernoulli — independent of any
+    # per-move randomness inside the search.
+    curriculum_start = False
+    curriculum_pieces = 0
+    if (
+        curriculum_config is not None
+        and curriculum_config.enabled
+        and rng.random() < curriculum_config.random_start_fraction
+    ):
+        state = random_late_game_state(
+            rng, pieces_per_player=curriculum_config.pieces_per_player
+        )
+        # If the helper exhausted retries it falls back to initial_state()
+        # — detect that to avoid mis-attributing those games to curriculum.
+        if state.pieces_in_hand == (0, 0):
+            curriculum_start = True
+            curriculum_pieces = curriculum_config.pieces_per_player
+        else:
+            state = initial_state()
+    else:
+        state = initial_state()
     steps: list[
         tuple[
             npt.NDArray[np.float32],
@@ -306,8 +363,6 @@ def _play_game(
     resigned_by_player: int | None = None
     was_verify_play = False
     verify_resigning_player: int | None = None
-    if rng is None:
-        rng = np.random.default_rng()
 
     # Playout-cap state. When the feature is enabled and a fast search was
     # provided, each ply independently tosses a Bernoulli(full_sim_fraction).
@@ -438,6 +493,8 @@ def _play_game(
         verify_resigning_player=verify_resigning_player,
         full_sim_moves=full_sim_moves,
         fast_sim_moves=fast_sim_moves,
+        curriculum_start=curriculum_start,
+        curriculum_pieces=curriculum_pieces,
     )
 
 
@@ -519,6 +576,7 @@ def _worker_fn(
     worker_recycle_games: int = 0,
     resign_config: ResignConfig | None = None,
     playout_cap_config: PlayoutCapConfig | None = None,
+    curriculum_config: CurriculumConfig | None = None,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -611,6 +669,7 @@ def _worker_fn(
                 rng=rng,
                 search_fast=search_fast,
                 playout_cap_config=playout_cap_config,
+                curriculum_config=curriculum_config,
             )
             results_queue.put(game)
             games_played += 1
@@ -646,6 +705,7 @@ def _worker_fn_remote(
     worker_recycle_games: int = 0,
     resign_config: ResignConfig | None = None,
     playout_cap_config: PlayoutCapConfig | None = None,
+    curriculum_config: CurriculumConfig | None = None,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -728,6 +788,7 @@ def _worker_fn_remote(
                 rng=rng,
                 search_fast=search_fast,
                 playout_cap_config=playout_cap_config,
+                curriculum_config=curriculum_config,
             )
             results_queue.put(game)
             games_played += 1
@@ -787,6 +848,7 @@ class SelfPlayManager:
         watcher_interval_s: float = 5.0,
         resign_config: ResignConfig | None = None,
         playout_cap_config: PlayoutCapConfig | None = None,
+        curriculum_config: CurriculumConfig | None = None,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -808,6 +870,7 @@ class SelfPlayManager:
         self._watcher_interval_s = watcher_interval_s
         self._resign_config = resign_config
         self._playout_cap_config = playout_cap_config
+        self._curriculum_config = curriculum_config
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -886,6 +949,7 @@ class SelfPlayManager:
                     self._worker_recycle_games,
                     self._resign_config,
                     self._playout_cap_config,
+                    self._curriculum_config,
                 ),
                 daemon=True,
             )
@@ -907,6 +971,7 @@ class SelfPlayManager:
                     self._worker_recycle_games,
                     self._resign_config,
                     self._playout_cap_config,
+                    self._curriculum_config,
                 ),
                 daemon=True,
             )

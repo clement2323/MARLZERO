@@ -165,6 +165,18 @@ def main(cfg: DictConfig) -> None:
             full_sim_fraction=float(playout_cap_node.get("full_sim_fraction", 0.25)),
             fast_sim_count=int(playout_cap_node.get("fast_sim_count", 60)),
         )
+    # Curriculum (random late-game starts) — same opt-in pattern.
+    curriculum_node = cfg.self_play.get("curriculum", None)
+    curriculum_config = None
+    if curriculum_node is not None and bool(curriculum_node.get("enabled", False)):
+        from morris_rl.training.self_play import CurriculumConfig
+        curriculum_config = CurriculumConfig(
+            enabled=True,
+            random_start_fraction=float(
+                curriculum_node.get("random_start_fraction", 0.5)
+            ),
+            pieces_per_player=int(curriculum_node.get("pieces_per_player", 6)),
+        )
     manager = SelfPlayManager(
         network=network,
         network_cfg=_network_cfg_dict(cfg),
@@ -183,6 +195,7 @@ def main(cfg: DictConfig) -> None:
         worker_recycle_games=cfg.self_play.get("worker_recycle_games", 0),
         resign_config=resign_config,
         playout_cap_config=playout_cap_config,
+        curriculum_config=curriculum_config,
     )
 
     logger.info(

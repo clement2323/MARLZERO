@@ -93,6 +93,16 @@ self_play:
     enabled: false
     full_sim_fraction: 0.25       # ~25% of moves are "full" (recorded)
     fast_sim_count: 60            # sim count for the other 75% (not recorded)
+  # Curriculum (random late-game starts). With prob random_start_fraction
+  # per game, self-play starts from a randomly drawn position with
+  # pieces_per_player pieces per side and empty hands — biases the data
+  # toward decisive endgames so the value head sees more clear signals.
+  # No external winning-side label is injected; the network plays the
+  # game from this start as usual.
+  curriculum:
+    enabled: false
+    random_start_fraction: 0.5    # fraction of games started from random mid-game
+    pieces_per_player: 6          # per-side piece count at the random start
   temperature_schedule:
     moves_0_to_10: 1.0
     moves_10_plus: 0.0
