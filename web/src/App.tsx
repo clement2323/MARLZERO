@@ -31,7 +31,7 @@ function statusMessage(
 }
 
 export default function App() {
-  const { gs, legalActions, handlePositionClick, resetGame } = useGame();
+  const { gs, legalActions, handlePositionClick, resetGame, setSelectedAgent } = useGame();
   const { jitter, trigger: triggerShake } = useShake();
   const [loserKey, setLoserKey] = useState(0);
 
@@ -103,6 +103,7 @@ export default function App() {
             >
               ● Black
             </button>
+
             <span className="controls-label">Test</span>
             <button onClick={triggerShake} className="btn is-test">
               Shake
@@ -114,6 +115,28 @@ export default function App() {
               Loser
             </button>
           </div>
+
+          {gs.availableAgents.length > 0 && (
+            <div className="agent-row">
+              <span className="controls-label">Vs</span>
+              <select
+                className="agent-select"
+                value={gs.selectedAgent ?? ""}
+                onChange={(e) => setSelectedAgent(e.target.value)}
+              >
+                {gs.availableAgents.map((opt) => (
+                  <option
+                    key={opt.id}
+                    value={opt.id}
+                    disabled={!opt.available}
+                  >
+                    {opt.label}
+                    {opt.available ? "" : " (unavailable)"}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div className="rules-block">
             <RulesTheater triggerKey={loserKey} />
