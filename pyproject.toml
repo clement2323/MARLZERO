@@ -22,6 +22,8 @@ dependencies = [
     "cmake>=4.3.2",
     "pybind11>=3.0.4",
     "mlflow[auth]>=2.5",
+    "streamlit>=1.35",
+    "plotly>=5.22",
 ]
 
 [tool.uv.sources]

@@ -1,4 +1,4 @@
-.PHONY: help train train-tmux train-tmux-kill serve web tensorboard mlflow-ui play dev clean
+.PHONY: help train train-tmux train-tmux-kill serve web tensorboard mlflow-ui play dev dashboard clean
 .DEFAULT_GOAL := help
 
 # ---------------------------------------------------------------------------
@@ -30,10 +30,8 @@ train-tmux:  ## Run training in a detached tmux session (canonical 100k-step con
 	tmux new-session -d -s $(TRAIN_SESSION) "uv run python scripts/train.py \
 	  mcts.num_simulations_train=250 \
 	  self_play.num_workers=6 \
-	  self_play.worker_recycle_games=0 \
-	  self_play.worker_max_rss_mb=0 \
 	  training.min_buffer_size=2000 \
-	  training.checkpoint_interval=500 \
+	  training.checkpoint_interval=250 \
 	  training.total_steps=100000 \
 	  mlflow.enabled=true 2>&1 | tee train.log"
 	@echo "Training started in tmux session '$(TRAIN_SESSION)'."
@@ -74,10 +72,15 @@ serve:  ## Run the FastAPI inference backend alone (uses MODEL_CHECKPOINT env)
 web:  ## Run the React/Vite frontend alone (expects backend on :8000)
 	cd web && npm run dev
 
+##@ Analysis
+
+dashboard:  ## Launch Streamlit training dashboard (port 8501, dark theme, auto-refresh)
+	uv run streamlit run scripts/dashboard.py --server.port 8501
+
 ##@ Monitoring
 
 mlflow-ui:  ## Read-only MLflow UI on file:./mlruns (~50 MB RAM)
-	uv run mlflow ui --backend-store-uri file:./mlruns --port 5000
+	.venv/bin/mlflow ui --backend-store-uri file:./mlruns --port 5000
 
 tensorboard:  ## TensorBoard UI on outputs/ (port 6006)
 	uv run tensorboard --logdir outputs --port 6006 --reload_multifile true
