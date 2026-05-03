@@ -7,14 +7,13 @@ from fastapi.testclient import TestClient
 
 from morris_rl.inference import server as _server_module
 from morris_rl.inference.server import app
-from morris_rl.eval.baselines import MinimaxAgent
 
 
 @pytest.fixture(autouse=True)
 def use_minimax_agent() -> None:
-    """Force MinimaxAgent(1) so tests run fast without a trained checkpoint."""
-    _server_module._agent = MinimaxAgent(depth=1)
+    """Force the depth-1 minimax default so tests run fast without a checkpoint."""
     _server_module._network = None
+    _server_module._default_agent_id = "minimax-1"
 
 
 @pytest.fixture()

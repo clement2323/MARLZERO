@@ -46,12 +46,17 @@ def _load_network(checkpoint_path: Path, device: torch.device) -> tuple[MorrisRe
     net_cfg = cfg["network"]
     enc_cfg = cfg["input_encoding"]
 
+    aux_node = net_cfg.get("aux_heads", None)
+    aux_heads_config = (
+        aux_node if aux_node is not None and aux_node.get("enabled", False) else None
+    )
     network = MorrisResNet(
         num_blocks=net_cfg["num_blocks"],
         num_channels=net_cfg["num_channels"],
         num_planes=enc_cfg["num_planes"],
         policy_head_hidden=net_cfg["policy_head_hidden"],
         value_head_hidden=net_cfg["value_head_hidden"],
+        aux_heads_config=aux_heads_config,
     )
     network.load_state_dict(payload["state_dict"])
     network.eval().to(device)

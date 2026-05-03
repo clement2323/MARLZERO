@@ -25,3 +25,14 @@ export interface PlayResponse {
 }
 
 export type GamePhase = "placing" | "moving" | "game_over";
+
+export interface AgentOption {
+  id: string;
+  label: string;
+  available: boolean;
+}
+
+export interface AgentsResponse {
+  options: AgentOption[];
+  default: string;
+}

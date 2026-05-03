@@ -1,6 +1,6 @@
-import { useState, useCallback, useEffect } from "react";
-import { fetchNewGame, fetchPlay, fetchState } from "../api/client";
-import type { BoardState, MoveInfo, PlayResponse } from "../types/game";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { fetchAgents, fetchNewGame, fetchPlay, fetchState } from "../api/client";
+import type { AgentOption, BoardState, MoveInfo, PlayResponse } from "../types/game";
 
 const NUM_PLACE_CAPTURE_ACTIONS = 24;
 const NUM_POSITIONS = 24;
@@ -63,6 +63,9 @@ export interface GameState {
   // destination). null on captures or before the first move. Drives the
   // "just placed" flash so dark pieces on a dark surface stay visible.
   lastPlacedPos: number | null;
+  // Adversary catalog and current selection. Populated on mount via /agents.
+  availableAgents: AgentOption[];
+  selectedAgent: string | null;
 }
 
 function findNewlyOccupied(prev: number[], next: number[]): number | null {
@@ -96,6 +99,8 @@ function initialState(humanPlayer: 1 | 2 = 1): GameState {
     serverReady: false,
     serverLegalActions: [],
     lastPlacedPos: null,
+    availableAgents: [],
+    selectedAgent: null,
   };
 }
 
@@ -114,13 +119,17 @@ function applyBoardState(gs: GameState, bs: BoardState): GameState {
 
 export function useGame() {
   const [gs, setGs] = useState<GameState>(() => initialState(1));
+  // Latest selected agent for in-flight network calls. Mirrors gs.selectedAgent
+  // so the long-lived useCallbacks below can read the freshest value without
+  // having to be re-created on every state change.
+  const selectedAgentRef = useRef<string | null>(null);
 
   // The agent runs on the post-action state; it must continue while it's still
   // its turn (e.g. it just formed a mill and now owes a capture).
   const callAgent = useCallback((actions: number[], humanPlayer: 1 | 2) => {
     setGs((prev) => ({ ...prev, status: "thinking" }));
     const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 700));
-    Promise.all([fetchPlay(actions), minDelay])
+    Promise.all([fetchPlay(actions, selectedAgentRef.current), minDelay])
       .then(([resp]: [PlayResponse, void]) => {
         const newActions = [...actions, resp.action];
         const agentPlayer = humanPlayer === 1 ? 2 : 1;
@@ -227,6 +236,28 @@ export function useGame() {
   useEffect(() => {
     startGame(1);
   }, [startGame]);
+
+  // Fetch the agent catalog once and seed the default selection.
+  useEffect(() => {
+    fetchAgents()
+      .then((resp) => {
+        selectedAgentRef.current = resp.default;
+        setGs((prev) => ({
+          ...prev,
+          availableAgents: resp.options,
+          selectedAgent: resp.default,
+        }));
+      })
+      .catch(() => {
+        // Non-fatal: /agents may briefly be unavailable on startup. fetchPlay
+        // will fall back to the server's own default in that case.
+      });
+  }, []);
+
+  const setSelectedAgent = useCallback((agent: string) => {
+    selectedAgentRef.current = agent;
+    setGs((prev) => ({ ...prev, selectedAgent: agent }));
+  }, []);
 
   const resetGame = useCallback(
     (humanPlayer: 1 | 2 = gs.humanPlayer) => {
@@ -340,5 +371,5 @@ export function useGame() {
       })()
     : [];
 
-  return { gs, legalActions, handlePositionClick, resetGame };
+  return { gs, legalActions, handlePositionClick, resetGame, setSelectedAgent };
 }

@@ -38,8 +38,7 @@ from morris_rl.env.rules import (
     get_legal_actions,
     is_terminal,
 )
-from morris_rl.eval.arena import Agent
-from morris_rl.eval.baselines import MinimaxAgent, NetworkAgent
+from morris_rl.eval.baselines import MinimaxAgent
 from morris_rl.inference.play import (
     IllegalActionError,
     describe_action,
@@ -52,12 +51,17 @@ from morris_rl.utils.logging import logger
 
 _NUM_PLANES = 7
 
-# Module-level agent and (optional) network — set during lifespan startup.
-_agent: Agent | None = None
+# Module-level network (only set when a checkpoint loads). Minimax agents are
+# instantiated per-request — they're cheap (just an int) and stateless.
 _network: nn.Module | None = None
 _device: torch.device = torch.device("cpu")
 _num_simulations: int = 200
-_agent_name: str = "unknown"
+_checkpoint_label: str | None = None
+_default_agent_id: str = "minimax-5"
+
+_AGENT_CHECKPOINT = "checkpoint"
+_AGENT_MINIMAX_3 = "minimax-3"
+_AGENT_MINIMAX_5 = "minimax-5"
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +73,26 @@ class PlayRequest(BaseModel):
     """Client sends the complete list of actions played so far."""
 
     actions: list[int]
+    # Which adversary to run for this turn. None falls back to the server's
+    # default (checkpoint when loaded, otherwise minimax-5).
+    agent: str | None = None
 
 
 class MoveInfo(BaseModel):
     action: int
     visit_prob: float
     description: str
+
+
+class AgentOption(BaseModel):
+    id: str
+    label: str
+    available: bool
+
+
+class AgentsResponse(BaseModel):
+    options: list[AgentOption]
+    default: str
 
 
 class BoardState(BaseModel):
@@ -105,41 +123,48 @@ class PlayResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _load_agent() -> None:
-    global _agent, _network, _device, _num_simulations
+def _load_network() -> None:
+    """Load the ResNet checkpoint if configured. The default agent flips to
+    'checkpoint' when a network is available, otherwise stays on 'minimax-5'."""
+    global _network, _device, _num_simulations, _checkpoint_label, _default_agent_id
 
     _device = torch.device(os.getenv("DEVICE", "cpu"))
     _num_simulations = int(os.getenv("NUM_SIMULATIONS", "200"))
     checkpoint_path = os.getenv("MODEL_CHECKPOINT", "")
 
     if checkpoint_path and Path(checkpoint_path).exists():
-        num_blocks = int(os.getenv("NUM_BLOCKS", "10"))
-        num_channels = int(os.getenv("NUM_CHANNELS", "128"))
+        payload = load_checkpoint(checkpoint_path)
+        net_cfg = (payload.get("config") or {}).get("network", {})
+        num_blocks = net_cfg.get("num_blocks", int(os.getenv("NUM_BLOCKS", "10")))
+        num_channels = net_cfg.get("num_channels", int(os.getenv("NUM_CHANNELS", "128")))
+        aux_heads_config = net_cfg.get("aux_heads") if net_cfg.get("aux_heads", {}).get("enabled") else None
         network = MorrisResNet(
             num_blocks=num_blocks,
             num_channels=num_channels,
             num_planes=_NUM_PLANES,
-            policy_head_hidden=64,
-            value_head_hidden=64,
+            policy_head_hidden=net_cfg.get("policy_head_hidden", 64),
+            value_head_hidden=net_cfg.get("value_head_hidden", 64),
+            aux_heads_config=aux_heads_config,
         )
-        payload = load_checkpoint(checkpoint_path)
         network.load_state_dict(payload["state_dict"])
         network.eval().to(_device)
         _network = network
-        _agent = NetworkAgent(network, _device, num_simulations=_num_simulations)
         step = payload["step"]
-        _agent_name = f"ResNet{num_blocks}×{num_channels} step={step} ({_num_simulations} sims)"
+        _checkpoint_label = (
+            f"ResNet{num_blocks}×{num_channels} step={step} ({_num_simulations} sims)"
+        )
+        _default_agent_id = _AGENT_CHECKPOINT
         logger.info(f"Loaded network from {checkpoint_path} (step {step})")
     else:
-        depth = int(os.getenv("MINIMAX_DEPTH", "3"))
-        _agent = MinimaxAgent(depth=depth)
-        _agent_name = f"Minimax depth={depth}"
-        logger.info(f"No checkpoint found — using MinimaxAgent(depth={depth})")
+        _network = None
+        _checkpoint_label = None
+        _default_agent_id = _AGENT_MINIMAX_5
+        logger.info("No checkpoint found — defaulting to Minimax depth=5")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
-    _load_agent()
+    _load_network()
     yield
 
 
@@ -186,7 +211,22 @@ def _state_to_board(state: GameState, game_over: bool, winner: int | None) -> Bo
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "agent_name": _agent_name}
+    return {"status": "ok", "default_agent": _default_agent_id}
+
+
+@app.get("/agents", response_model=AgentsResponse)
+def list_agents() -> AgentsResponse:
+    """Return the agents the client can pick from, plus the server default."""
+    options = [
+        AgentOption(
+            id=_AGENT_CHECKPOINT,
+            label=_checkpoint_label or "Trained checkpoint",
+            available=_network is not None,
+        ),
+        AgentOption(id=_AGENT_MINIMAX_3, label="Minimax depth 3", available=True),
+        AgentOption(id=_AGENT_MINIMAX_5, label="Minimax depth 5", available=True),
+    ]
+    return AgentsResponse(options=options, default=_default_agent_id)
 
 
 @app.get("/new-game", response_model=BoardState)
@@ -220,14 +260,11 @@ def get_state(request: PlayRequest) -> BoardState:
 
 @app.post("/play", response_model=PlayResponse)
 def play(request: PlayRequest) -> PlayResponse:
-    """Reconstruct state from action history, run the agent, return its move.
+    """Reconstruct state from action history, run the requested agent, return its move.
 
     The client should call this endpoint only when it is the agent's turn.
     The reconstructed state must NOT be terminal; if it is, a 400 is returned.
     """
-    if _agent is None:
-        raise HTTPException(status_code=503, detail="Agent not initialised")
-
     try:
         state = reconstruct_state(request.actions)
     except IllegalActionError as exc:
@@ -241,9 +278,15 @@ def play(request: PlayRequest) -> PlayResponse:
     if not legal:
         raise HTTPException(status_code=400, detail="No legal moves available")
 
-    # Run the agent.
-    using_network = _network is not None
-    if using_network and _network is not None:
+    # Pick the agent for this turn.
+    agent_id = request.agent or _default_agent_id
+
+    if agent_id == _AGENT_CHECKPOINT:
+        if _network is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Checkpoint agent requested but no checkpoint is loaded",
+            )
         action, top_moves_raw, value = run_mcts_analysis(
             _network, _device, state, num_simulations=_num_simulations
         )
@@ -255,8 +298,20 @@ def play(request: PlayRequest) -> PlayResponse:
             )
             for a, p in top_moves_raw
         ]
-    else:
-        action = _agent.select_action(state)
+        using_network = True
+        agent_label = _checkpoint_label or "Trained checkpoint"
+    elif agent_id.startswith("minimax-"):
+        # Accepts any depth ≥ 1; /agents only advertises 3 and 5, but lower
+        # depths exist for tests that need fast moves.
+        try:
+            depth = int(agent_id.split("-", 1)[1])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid minimax depth in '{agent_id}'"
+            ) from exc
+        if depth < 1:
+            raise HTTPException(status_code=400, detail="Minimax depth must be ≥ 1")
+        action = MinimaxAgent(depth=depth).select_action(state)
         top_moves = [
             MoveInfo(
                 action=action,
@@ -265,11 +320,19 @@ def play(request: PlayRequest) -> PlayResponse:
             )
         ]
         value = 0.0
+        using_network = False
+        agent_label = f"Minimax depth={depth}"
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown agent: {agent_id}")
 
     # Apply the agent's action.
     next_state = apply_action(state, action)
     done_after, outcome_after = is_terminal(next_state)
-    winner = int(outcome_after) if (done_after and outcome_after is not None and outcome_after.value > 0) else None
+    winner = (
+        int(outcome_after)
+        if (done_after and outcome_after is not None and outcome_after.value > 0)
+        else None
+    )
 
     return PlayResponse(
         action=action,
@@ -278,5 +341,5 @@ def play(request: PlayRequest) -> PlayResponse:
         value_estimate=value,
         board_after=_state_to_board(next_state, done_after, winner),
         using_network=using_network,
-        agent_name=_agent_name,
+        agent_name=agent_label,
     )
