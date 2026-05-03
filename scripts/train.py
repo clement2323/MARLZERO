@@ -60,6 +60,7 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
         "num_planes": cfg.input_encoding.num_planes,
         "policy_head_hidden": cfg.network.policy_head_hidden,
         "value_head_hidden": cfg.network.value_head_hidden,
+        "value_head_type": cfg.network.get("value_head_type", "scalar"),
         "aux_heads_config": aux_heads_config,
     }
 
@@ -119,6 +120,7 @@ def main(cfg: DictConfig) -> None:
         checkpoint_dir=checkpoint_dir,
         checkpoint_interval=cfg.training.checkpoint_interval,
         config=OmegaConf.to_container(cfg, resolve=True),  # type: ignore[arg-type]
+        value_head_type=cfg.network.get("value_head_type", "scalar"),
         mlflow_uri=mlflow_uri,
         mlflow_experiment=mlflow_experiment,
         mlflow_run_name=mlflow_run_name,

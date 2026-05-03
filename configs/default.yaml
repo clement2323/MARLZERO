@@ -19,6 +19,10 @@ network:
   num_channels: 208
   policy_head_hidden: 64
   value_head_hidden: 64
+  # "scalar" = tanh + MSE (default). "categorical" = 3-logit cross-entropy
+  # (KataGo-style). Categorical avoids lazy-mean collapse in draw-heavy games.
+  # Incompatible across types: a checkpoint trained with one cannot load the other.
+  value_head_type: scalar
   # Auxiliary heads (KataGo-style) — extra supervision targets that help
   # the trunk learn tactical features faster, breaking the "draw attractor"
   # collapse where value head converges to ~0 before policy head can push.

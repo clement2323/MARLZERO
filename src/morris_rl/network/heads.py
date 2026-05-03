@@ -80,6 +80,41 @@ class ValueHead(nn.Module):
         return torch.tanh(self.fc2(x)).squeeze(1)
 
 
+class CategoricalValueHead(nn.Module):
+    """Maps trunk features to 3 outcome logits [win, draw, loss] and a scalar.
+
+    The scalar P(win)−P(loss) is returned for MCTS backward-compat (same shape
+    as ValueHead). The raw logits are returned for cross-entropy training.
+
+    Args:
+        num_channels: Number of channels from the residual trunk.
+        num_positions: Number of board positions (24).
+        hidden_size: Size of the intermediate linear layer.
+    """
+
+    def __init__(self, num_channels: int, num_positions: int, hidden_size: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(num_channels, 1, kernel_size=1)
+        self.bn = nn.BatchNorm1d(1)
+        self.fc1 = nn.Linear(num_positions, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 3)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (scalar, logits).
+
+        Returns:
+            scalar: (batch,) — P(win)−P(loss), always in (−1, +1).
+            logits: (batch, 3) — raw [win, draw, loss] for cross-entropy.
+        """
+        x = F.relu(self.bn(self.conv(x)))
+        x = x.flatten(start_dim=1)
+        x = F.relu(self.fc1(x))
+        logits = self.fc2(x)
+        probs = torch.softmax(logits, dim=-1)
+        scalar = probs[..., 0] - probs[..., 2]
+        return scalar, logits
+
+
 class AuxScalarHead(nn.Module):
     """Generic scalar auxiliary head — raw output, no activation.
 

@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_POSITIONS
-from morris_rl.network.heads import AuxScalarHead, PolicyHead, ValueHead
+from morris_rl.network.heads import AuxScalarHead, CategoricalValueHead, PolicyHead, ValueHead
 
 # The names of the auxiliary heads recognised by MorrisResNet. Each entry in
 # the aux_heads_config dict must use one of these keys; unknown keys are
@@ -69,6 +69,7 @@ class MorrisResNet(nn.Module):
         num_planes: int,
         policy_head_hidden: int,
         value_head_hidden: int,
+        value_head_type: str = "scalar",
         aux_heads_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -78,7 +79,13 @@ class MorrisResNet(nn.Module):
         self.policy_head = PolicyHead(
             num_channels, NUM_POSITIONS, ACTION_SPACE_SIZE, policy_head_hidden
         )
-        self.value_head = ValueHead(num_channels, NUM_POSITIONS, value_head_hidden)
+        self._value_head_type = value_head_type
+        if value_head_type == "categorical":
+            self.value_head: ValueHead | CategoricalValueHead = CategoricalValueHead(
+                num_channels, NUM_POSITIONS, value_head_hidden
+            )
+        else:
+            self.value_head = ValueHead(num_channels, NUM_POSITIONS, value_head_hidden)
 
         # Auxiliary heads: each one is opt-in, none by default. Stored in a
         # ModuleDict keyed by name so the trainer can iterate them generically.
@@ -98,30 +105,38 @@ class MorrisResNet(nn.Module):
         x: torch.Tensor,
         legal_mask: torch.Tensor,
         return_aux: bool = False,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
-    ):
+        return_value_logits: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Run a forward pass.
 
         Args:
             x: Encoded state tensor of shape (batch, num_planes, NUM_POSITIONS).
             legal_mask: Boolean mask of shape (batch, ACTION_SPACE_SIZE).
                         True indicates a legal action.
-            return_aux: If True, also return a dict mapping aux head name →
-                        scalar output tensor of shape (batch,). Defaults to
-                        False so existing inference / MCTS callers keep their
-                        2-tuple contract.
+            return_aux: If True, also return aux head outputs dict.
+            return_value_logits: If True, also return raw value logits (batch, 3).
+                                 Only meaningful when value_head_type="categorical".
 
         Returns:
-            (log_policy, value)            if return_aux=False
-            (log_policy, value, aux_dict)  if return_aux=True
+            (log_policy, scalar)                      default
+            (log_policy, scalar, aux_dict)            return_aux=True
+            (log_policy, scalar, logits)              return_value_logits=True
+            (log_policy, scalar, aux_dict, logits)    both True
         """
         x = F.relu(self.input_bn(self.input_conv(x)))
         x = self.trunk(x)
         log_policy = self.policy_head(x, legal_mask)
-        value = self.value_head(x)
-        if not return_aux:
-            return log_policy, value
-        aux_outputs = {name: head(x) for name, head in self.aux_heads.items()}
-        return log_policy, value, aux_outputs
+
+        if self._value_head_type == "categorical":
+            scalar, logits = self.value_head(x)  # type: ignore[misc]
+        else:
+            scalar = self.value_head(x)
+            logits = None
+
+        result: tuple[torch.Tensor, ...] = (log_policy, scalar)
+        if return_aux:
+            aux_outputs = {name: head(x) for name, head in self.aux_heads.items()}
+            result = result + (aux_outputs,)  # type: ignore[operator]
+        if return_value_logits:
+            result = result + (logits,)  # type: ignore[operator]
+        return result

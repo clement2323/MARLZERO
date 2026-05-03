@@ -103,6 +103,7 @@ def compute_loss(
     aux_outputs: dict[str, torch.Tensor] | None = None,
     aux_targets: dict[str, torch.Tensor] | None = None,
     aux_weights: dict[str, float] | None = None,
+    value_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Compute AlphaZero combined loss with optional auxiliary supervision.
 
@@ -128,7 +129,12 @@ def compute_loss(
     contrib = policy_target * log_policy
     contrib = torch.where(policy_target > 0, contrib, torch.zeros_like(contrib))
     policy_loss = -contrib.sum(dim=1).mean()
-    value_loss = F.mse_loss(value, value_target)
+    if value_logits is not None:
+        # Categorical head: cross-entropy on {win=0, draw=1, loss=2}.
+        # {+1→0, 0→1, -1→2} via (1 - target).long()
+        value_loss = F.cross_entropy(value_logits, (1.0 - value_target).long())
+    else:
+        value_loss = F.mse_loss(value, value_target)
     total_loss = policy_loss + value_loss
 
     aux_losses: dict[str, torch.Tensor] = {}
@@ -185,6 +191,7 @@ class Trainer:
         checkpoint_dir: str | Path | None = None,
         checkpoint_interval: int = 1000,
         config: dict[str, Any] | None = None,
+        value_head_type: str = "scalar",
         mlflow_uri: str | None = None,
         mlflow_experiment: str = "morris-az",
         mlflow_run_name: str | None = None,
@@ -195,6 +202,7 @@ class Trainer:
         self._checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self._checkpoint_interval = checkpoint_interval
         self._config: dict[str, Any] = config or {}
+        self._value_head_type = value_head_type
         self._step = 0
         # Optional buffer ref so _auto_checkpoint can persist it alongside weights.
         self._buffer: ReplayBuffer | None = None
@@ -281,18 +289,27 @@ class Trainer:
         # config.network.aux_heads subtree resolved into a flat dict in
         # __init__ (see self._aux_weights below).
         aux_active = bool(self._aux_weights) and len(self._network.aux_heads) > 0
+        categorical = self._value_head_type == "categorical"
 
         with torch.autocast(device_type=self._device.type, enabled=self._amp_enabled):
-            # Masked log_softmax: same operator as inference. The MCTS visit
-            # distribution is implicitly conditional on legal actions, so we
-            # match by normalising over the same support during training.
-            if aux_active:
+            if aux_active and categorical:
+                log_policy, value, aux_outputs, value_logits = self._network(
+                    states, legal_masks, return_aux=True, return_value_logits=True
+                )
+            elif aux_active:
                 log_policy, value, aux_outputs = self._network(
                     states, legal_masks, return_aux=True
                 )
+                value_logits = None
+            elif categorical:
+                log_policy, value, value_logits = self._network(
+                    states, legal_masks, return_value_logits=True
+                )
+                aux_outputs = None
             else:
                 log_policy, value = self._network(states, legal_masks)
                 aux_outputs = None
+                value_logits = None
 
             total_loss, policy_loss, value_loss, aux_losses = compute_loss(
                 log_policy,
@@ -302,6 +319,7 @@ class Trainer:
                 aux_outputs=aux_outputs if aux_active else None,
                 aux_targets=aux_targets if aux_active else None,
                 aux_weights=self._aux_weights if aux_active else None,
+                value_logits=value_logits,
             )
 
         # Capture value distribution stats before backward (no in-place risk).

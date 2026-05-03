@@ -34,12 +34,14 @@ def build_network(config: DictConfig) -> nn.Module:
             from omegaconf import OmegaConf
             aux_heads_config = OmegaConf.to_container(aux_cfg_node, resolve=True)  # type: ignore[assignment]
 
+        value_head_type: str = net_cfg.get("value_head_type", "scalar")
         return MorrisResNet(
             num_blocks=net_cfg.num_blocks,
             num_channels=net_cfg.num_channels,
             num_planes=_NUM_INPUT_PLANES,
             policy_head_hidden=net_cfg.policy_head_hidden,
             value_head_hidden=net_cfg.value_head_hidden,
+            value_head_type=value_head_type,
             aux_heads_config=aux_heads_config,
         )
     raise ValueError(f"Unknown network type: {net_cfg.type!r}")
