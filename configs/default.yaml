@@ -103,6 +103,10 @@ self_play:
     enabled: false
     random_start_fraction: 0.5    # fraction of games started from random mid-game
     pieces_per_player: 6          # per-side piece count at the random start
+  # Discard halfmove-cap games from the replay buffer entirely. Their value=0
+  # targets on non-draw positions reinforce the draw attractor. Enabled = fewer
+  # samples but cleaner signal; the curriculum compensates with more decisive games.
+  discard_timeout_games: false
   temperature_schedule:
     moves_0_to_10: 1.0
     moves_10_plus: 0.0

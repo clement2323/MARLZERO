@@ -196,6 +196,7 @@ def main(cfg: DictConfig) -> None:
         resign_config=resign_config,
         playout_cap_config=playout_cap_config,
         curriculum_config=curriculum_config,
+        discard_timeout_games=bool(cfg.self_play.get("discard_timeout_games", False)),
     )
 
     logger.info(

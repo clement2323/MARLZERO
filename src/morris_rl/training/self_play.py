@@ -104,6 +104,10 @@ class GameRecord:
     # the per-side count at start (used to compute the avg start density).
     curriculum_start: bool = False
     curriculum_pieces: int = 0
+    # Set to True when discard_timeout_games=True and the game ended by
+    # halfmove_cap. The trainer counts discards for the timeout_discard_rate
+    # metric but does NOT push these samples to the buffer.
+    timeout_discarded: bool = False
 
 
 @dataclass
@@ -294,6 +298,7 @@ def _play_game(
     search_fast: "MorrisSearch | None" = None,
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
+    discard_timeout_games: bool = False,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data.
 
@@ -469,12 +474,19 @@ def _play_game(
     final_pieces_p2 = pieces_on_board(state.board, 2)
     final_pieces_diff = final_pieces_p1 - final_pieces_p2
 
-    samples = _assign_value_targets(
-        steps,
-        outcome,
-        final_pieces_p1=final_pieces_p1,
-        final_pieces_p2=final_pieces_p2,
-        capture_horizon_plies=capture_horizon_plies,
+    # Halfmove-cap games produce value=0 on non-draw positions → draw attractor
+    # fuel. When the flag is set, drop their samples from the buffer entirely.
+    timeout_discarded = discard_timeout_games and term_reason == "halfmove_cap"
+    samples = (
+        []
+        if timeout_discarded
+        else _assign_value_targets(
+            steps,
+            outcome,
+            final_pieces_p1=final_pieces_p1,
+            final_pieces_p2=final_pieces_p2,
+            capture_horizon_plies=capture_horizon_plies,
+        )
     )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(
@@ -495,6 +507,7 @@ def _play_game(
         fast_sim_moves=fast_sim_moves,
         curriculum_start=curriculum_start,
         curriculum_pieces=curriculum_pieces,
+        timeout_discarded=timeout_discarded,
     )
 
 
@@ -577,6 +590,7 @@ def _worker_fn(
     resign_config: ResignConfig | None = None,
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
+    discard_timeout_games: bool = False,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -670,6 +684,7 @@ def _worker_fn(
                 search_fast=search_fast,
                 playout_cap_config=playout_cap_config,
                 curriculum_config=curriculum_config,
+                discard_timeout_games=discard_timeout_games,
             )
             results_queue.put(game)
             games_played += 1
@@ -706,6 +721,7 @@ def _worker_fn_remote(
     resign_config: ResignConfig | None = None,
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
+    discard_timeout_games: bool = False,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -789,6 +805,7 @@ def _worker_fn_remote(
                 search_fast=search_fast,
                 playout_cap_config=playout_cap_config,
                 curriculum_config=curriculum_config,
+                discard_timeout_games=discard_timeout_games,
             )
             results_queue.put(game)
             games_played += 1
@@ -849,6 +866,7 @@ class SelfPlayManager:
         resign_config: ResignConfig | None = None,
         playout_cap_config: PlayoutCapConfig | None = None,
         curriculum_config: CurriculumConfig | None = None,
+        discard_timeout_games: bool = False,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -871,6 +889,7 @@ class SelfPlayManager:
         self._resign_config = resign_config
         self._playout_cap_config = playout_cap_config
         self._curriculum_config = curriculum_config
+        self._discard_timeout_games = discard_timeout_games
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -950,6 +969,7 @@ class SelfPlayManager:
                     self._resign_config,
                     self._playout_cap_config,
                     self._curriculum_config,
+                    self._discard_timeout_games,
                 ),
                 daemon=True,
             )
@@ -972,6 +992,7 @@ class SelfPlayManager:
                     self._resign_config,
                     self._playout_cap_config,
                     self._curriculum_config,
+                    self._discard_timeout_games,
                 ),
                 daemon=True,
             )

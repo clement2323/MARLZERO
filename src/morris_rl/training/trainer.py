@@ -304,9 +304,13 @@ class Trainer:
                 aux_weights=self._aux_weights if aux_active else None,
             )
 
+        # Capture value distribution stats before backward (no in-place risk).
+        value_mean = float(value.detach().float().mean().item())
+        value_std  = float(value.detach().float().std().item())
+
         self._scaler.scale(total_loss).backward()  # type: ignore[no-untyped-call]
         self._scaler.unscale_(self._optimizer)
-        nn.utils.clip_grad_norm_(self._network.parameters(), self._max_grad_norm)
+        grad_norm = nn.utils.clip_grad_norm_(self._network.parameters(), self._max_grad_norm)
         self._scaler.step(self._optimizer)
         self._scaler.update()
         self._scheduler.step()
@@ -317,6 +321,9 @@ class Trainer:
             "policy_loss": float(policy_loss.item()),
             "value_loss": float(value_loss.item()),
             "learning_rate": float(self._scheduler.get_last_lr()[0]),
+            "grad_norm": float(grad_norm),
+            "value_mean": value_mean,
+            "value_std": value_std,
         }
         # Surface per-aux-head loss so MLflow / TensorBoard show convergence
         # of each task individually (a stalled aux head is informative).
@@ -375,6 +382,12 @@ class Trainer:
         recent_resigned: deque[bool] = deque(maxlen=_GAME_LENGTH_WINDOW)
         verify_outcomes: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         verify_total = 0
+        # Resign-specific game stats — populated only by games that actually
+        # ended by resignation (regardless of curriculum start). Kept separate
+        # from curriculum/normal so those two buckets contain only genuine
+        # game-engine outcomes.
+        recent_lengths_resign: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_captures_resign: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         # Playout-cap deques: total full / fast plies across the rolling
         # window. Ratio = full / (full+fast), expected ≈ full_sim_fraction
         # when the feature is on, and 1.0 when it's off.
@@ -384,7 +397,22 @@ class Trainer:
         # a random late-game position. Rolling rate confirms the feature is
         # firing at the configured random_start_fraction.
         recent_curriculum: deque[bool] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        # Three MUTUALLY EXCLUSIVE game populations (resign | curriculum | normal):
+        #   resign     — ended by resignation, any start; outcome may be wrong
+        #   curriculum — random start, played to natural engine termination
+        #   normal     — initial_state start, played to natural engine termination
+        # Mixing them would hide whether curriculum positions are genuinely more
+        # decisive or whether resign is just creating artificial decisive results.
+        recent_lengths_curriculum: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_captures_curriculum: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_term_reasons_curriculum: deque[str] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        outcome_counts_curriculum = {"win": 0, "draw": 0, "total": 0}
+        recent_lengths_normal: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_captures_normal: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        recent_term_reasons_normal: deque[str] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        outcome_counts_normal = {"win": 0, "draw": 0, "total": 0}
         outcome_counts = {"p1_win": 0, "p2_win": 0, "draw": 0}
+        timeout_discarded_count = 0
         self._buffer = buffer  # used by _auto_checkpoint to persist buffer state
 
         logger.info(f"Filling buffer to {min_buffer_size} samples (current: {len(buffer)})…")
@@ -421,6 +449,37 @@ class Trainer:
                 recent_full_sim.append(game.full_sim_moves)
                 recent_fast_sim.append(game.fast_sim_moves)
                 recent_curriculum.append(game.curriculum_start)
+                captures = game.captures_p1 + game.captures_p2
+                is_resigned = game.resigned_by_player is not None
+                is_decisive = game.outcome != -1
+                # Route into one of three mutually exclusive populations.
+                if is_resigned:
+                    recent_lengths_resign.append(game.game_length)
+                    recent_captures_resign.append(captures)
+                elif game.curriculum_start:
+                    recent_lengths_curriculum.append(game.game_length)
+                    recent_captures_curriculum.append(captures)
+                    recent_term_reasons_curriculum.append(game.term_reason)
+                    outcome_counts_curriculum["total"] += 1
+                    if is_decisive:
+                        outcome_counts_curriculum["win"] += 1
+                    else:
+                        outcome_counts_curriculum["draw"] += 1
+                else:
+                    recent_lengths_normal.append(game.game_length)
+                    recent_captures_normal.append(captures)
+                    recent_term_reasons_normal.append(game.term_reason)
+                    outcome_counts_normal["total"] += 1
+                    if is_decisive:
+                        outcome_counts_normal["win"] += 1
+                    else:
+                        outcome_counts_normal["draw"] += 1
+                if game.timeout_discarded:
+                    timeout_discarded_count += 1
+                self._log_scalar(
+                    "game/timeout_discard_rate",
+                    timeout_discarded_count / games_collected,
+                )
                 if game.was_verify_play and game.verify_resigning_player is not None:
                     # The "would-be-resigner" lost iff the actual outcome went
                     # to the opponent. 1 = resign decision was correct (their
@@ -455,13 +514,26 @@ class Trainer:
                     verify_outcomes,
                     verify_total,
                     games_collected,
+                    recent_lengths_resign=recent_lengths_resign,
+                    recent_captures_resign=recent_captures_resign,
                 )
                 self._log_playout_cap_stats(
                     recent_full_sim,
                     recent_fast_sim,
                     games_collected,
                 )
-                self._log_curriculum_stats(recent_curriculum, games_collected)
+                self._log_curriculum_stats(
+                    recent_curriculum,
+                    games_collected,
+                    recent_lengths_curriculum=recent_lengths_curriculum,
+                    recent_captures_curriculum=recent_captures_curriculum,
+                    outcome_counts_curriculum=outcome_counts_curriculum,
+                    recent_lengths_normal=recent_lengths_normal,
+                    recent_captures_normal=recent_captures_normal,
+                    outcome_counts_normal=outcome_counts_normal,
+                    recent_term_reasons_curriculum=recent_term_reasons_curriculum,
+                    recent_term_reasons_normal=recent_term_reasons_normal,
+                )
 
                 for _ in range(updates_per_game):
                     if self._step >= total_steps:
@@ -587,7 +659,7 @@ class Trainer:
         outcome_counts: dict[str, int],
         games_collected: int,
     ) -> None:
-        """Log per-game scalar stats and a periodic histogram of recent lengths."""
+        """Log overall per-game scalar stats (all games) and a periodic length histogram."""
         if not recent_lengths:
             return
         last = recent_lengths[-1]
@@ -652,6 +724,8 @@ class Trainer:
         verify_outcomes: deque[int],
         verify_total: int,
         games_collected: int,
+        recent_lengths_resign: deque[int] | None = None,
+        recent_captures_resign: deque[int] | None = None,
     ) -> None:
         """Log resign-feature diagnostics for post-hoc threshold calibration.
 
@@ -686,6 +760,14 @@ class Trainer:
             correct_rate = sum(verify_outcomes) / len(verify_outcomes)
             stats["resign/verified_correct_rate"] = correct_rate
             stats["resign/verified_false_positive_rate"] = 1.0 - correct_rate
+        if recent_lengths_resign:
+            stats["resign/length_mean"] = (
+                sum(recent_lengths_resign) / len(recent_lengths_resign)
+            )
+        if recent_captures_resign:
+            stats["resign/captures_per_game"] = (
+                sum(recent_captures_resign) / len(recent_captures_resign)
+            )
         for tag, value in stats.items():
             if self._writer is not None:
                 self._writer.add_scalar(tag, value, games_collected)
@@ -726,20 +808,71 @@ class Trainer:
         self,
         recent_curriculum: deque[bool],
         games_collected: int,
+        recent_lengths_curriculum: deque[int] | None = None,
+        recent_captures_curriculum: deque[int] | None = None,
+        outcome_counts_curriculum: dict[str, int] | None = None,
+        recent_lengths_normal: deque[int] | None = None,
+        recent_captures_normal: deque[int] | None = None,
+        outcome_counts_normal: dict[str, int] | None = None,
+        recent_term_reasons_curriculum: deque[str] | None = None,
+        recent_term_reasons_normal: deque[str] | None = None,
     ) -> None:
-        """Log the rate at which games started from a random late-game state.
+        """Log curriculum vs normal population split stats (resign games excluded).
 
-        - curriculum/start_rate: fraction of games over the rolling window
-          that began with a random mid-game position. With the feature off,
-          this is exactly 0; with random_start_fraction=0.5 it should sit
-          around 0.5.
+        Three mutually exclusive populations:
+        - resign/   games that ended by resignation (logged in _log_resign_stats)
+        - curriculum/ random-start games played to natural engine termination
+        - normal/     initial-state games played to natural engine termination
+
+        Metrics per population: length_mean, captures_per_game, draw_rate, win_rate.
+        curriculum/start_rate is the overall fraction (includes resigned games).
         """
         if not recent_curriculum:
             return
         rate = sum(recent_curriculum) / len(recent_curriculum)
-        if self._writer is not None:
-            self._writer.add_scalar("curriculum/start_rate", rate, games_collected)
-        self._mlflow_log("curriculum/start_rate", rate, games_collected)
+        stats: dict[str, float] = {"curriculum/start_rate": rate}
+
+        if recent_lengths_curriculum:
+            stats["curriculum/length_mean"] = (
+                sum(recent_lengths_curriculum) / len(recent_lengths_curriculum)
+            )
+        if recent_captures_curriculum:
+            stats["curriculum/captures_per_game"] = (
+                sum(recent_captures_curriculum) / len(recent_captures_curriculum)
+            )
+        if outcome_counts_curriculum and outcome_counts_curriculum["total"] > 0:
+            total = outcome_counts_curriculum["total"]
+            stats["curriculum/draw_rate"] = outcome_counts_curriculum["draw"] / total
+            stats["curriculum/win_rate"] = outcome_counts_curriculum["win"] / total
+
+        if recent_lengths_normal:
+            stats["normal/length_mean"] = (
+                sum(recent_lengths_normal) / len(recent_lengths_normal)
+            )
+        if recent_captures_normal:
+            stats["normal/captures_per_game"] = (
+                sum(recent_captures_normal) / len(recent_captures_normal)
+            )
+        if outcome_counts_normal and outcome_counts_normal["total"] > 0:
+            total = outcome_counts_normal["total"]
+            stats["normal/draw_rate"] = outcome_counts_normal["draw"] / total
+            stats["normal/win_rate"] = outcome_counts_normal["win"] / total
+
+        if recent_term_reasons_curriculum:
+            n = len(recent_term_reasons_curriculum)
+            stats["curriculum/halfmove_cap_rate"] = (
+                list(recent_term_reasons_curriculum).count("halfmove_cap") / n
+            )
+        if recent_term_reasons_normal:
+            n = len(recent_term_reasons_normal)
+            stats["normal/halfmove_cap_rate"] = (
+                list(recent_term_reasons_normal).count("halfmove_cap") / n
+            )
+
+        for tag, value in stats.items():
+            if self._writer is not None:
+                self._writer.add_scalar(tag, value, games_collected)
+            self._mlflow_log(tag, value, games_collected)
 
     def _log_memory_health(self, manager: SelfPlayManager) -> None:
         """Periodic check for memory/queue leaks. Cheap: ~1 ms per call.
