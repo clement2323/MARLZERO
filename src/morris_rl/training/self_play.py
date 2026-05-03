@@ -201,89 +201,39 @@ def _temperature_for_move(move_number: int, threshold: int) -> float:
     return 1.0 if move_number < threshold else _ARGMAX_TEMPERATURE
 
 
-def _count_mills(board: npt.NDArray[np.int8], player: int) -> int:
-    """Number of complete mills owned by *player* on *board*. O(16) checks."""
-    count = 0
-    for a, b, c in MILLS:
-        if board[a] == player and board[b] == player and board[c] == player:
-            count += 1
-    return count
-
-
 def _assign_value_targets(
     steps: list[
         tuple[
-            npt.NDArray[np.float32],   # encoded state
-            npt.NDArray[np.float32],   # policy_target
-            int,                        # current player
-            npt.NDArray[np.bool_],     # legal_mask
-            int,                        # mill_count for current player at this state
-            bool,                       # was the action played a capture?
-            bool,                       # was this ply a full-sim move (kept for buffer)?
+            npt.NDArray[np.float32],  # encoded state
+            npt.NDArray[np.float32],  # policy_target
+            int,                       # current player
+            npt.NDArray[np.bool_],    # legal_mask
+            bool,                      # was this ply a full-sim move (kept for buffer)?
         ]
     ],
     outcome: Outcome | None,
-    final_pieces_p1: int,
-    final_pieces_p2: int,
-    capture_horizon_plies: int = 3,
 ) -> list[SampleRecord]:
-    """Convert per-step tuples into SampleRecords, computing aux targets.
+    """Convert per-step tuples into SampleRecords.
 
-    Aux targets:
-    - aux_mill: number of mills the sample's current player has on the board
-      at this state (precomputed in *steps*).
-    - aux_pieces_diff: (own_pieces − opp_pieces) at game terminal, from the
-      sample's player POV. Constant across all of one player's samples.
-    - aux_capture: 1.0 if the sample's current player performs a capture
-      within the next ``capture_horizon_plies`` plies, else 0.0.
-
-    Steps may carry a ``was_full_sim=False`` flag (Phase 2b playout cap):
-    these plies are skipped at emission time so they don't pollute the
-    buffer, but they still count for capture-lookahead so that
-    aux_capture targets remain accurate w.r.t. real game time.
+    Fast-sim plies (was_full_sim=False, playout cap) are skipped so they
+    don't pollute the buffer.
     """
     records: list[SampleRecord] = []
-    n_steps = len(steps)
-    # Lookahead arrays for capture_in_n. Both indexed by ply number so they
-    # cover *all* moves regardless of full/fast.
-    captures_at = [bool(s[5]) for s in steps]
-    players_at = [int(s[2]) for s in steps]
-
-    for i, step in enumerate(steps):
-        encoded, policy, player, mask, mill_count, _was_capture, was_full_sim = step
+    for encoded, policy, player, mask, was_full_sim in steps:
         if not was_full_sim:
-            continue  # fast-sim plies don't contribute to the buffer
+            continue
         if outcome is None or outcome == Outcome.DRAW:
             v = 0.0
         elif int(outcome) == player:
             v = 1.0
         else:
             v = -1.0
-
-        # pieces_diff_at_end from this sample's POV.
-        if player == 1:
-            pieces_diff = float(final_pieces_p1 - final_pieces_p2)
-        else:
-            pieces_diff = float(final_pieces_p2 - final_pieces_p1)
-
-        # capture_in_n: scan forward up to capture_horizon_plies, looking for
-        # any capture performed by the same player.
-        capture_target = 0.0
-        end = min(i + 1 + capture_horizon_plies, n_steps)
-        for j in range(i + 1, end):
-            if captures_at[j] and players_at[j] == player:
-                capture_target = 1.0
-                break
-
         records.append(
             SampleRecord(
                 encoded_state=encoded,
                 policy_target=policy,
                 value_target=v,
                 legal_mask=mask,
-                aux_mill=float(mill_count),
-                aux_pieces_diff=pieces_diff,
-                aux_capture=capture_target,
             )
         )
     return records
@@ -292,7 +242,6 @@ def _assign_value_targets(
 def _play_game(
     search: "MorrisSearch",
     temperature_threshold: int = 10,
-    capture_horizon_plies: int = 3,
     resign_config: ResignConfig | None = None,
     rng: np.random.Generator | None = None,
     search_fast: "MorrisSearch | None" = None,
@@ -391,8 +340,6 @@ def _play_game(
         # the mask of the state the policy_target was computed for.
         legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
         legal_mask[get_legal_actions(state)] = True
-        # Aux target #1: number of mills the current player has on the board.
-        aux_mill_count = _count_mills(state.board, state.current_player)
 
         # Resign signal: query the network's value estimate for the current
         # player at the root, BEFORE running MCTS. Cheap (one extra forward
@@ -446,9 +393,7 @@ def _play_game(
         state = apply_action(state, action)
         was_capture = was_must_capture and not state.must_capture
 
-        steps.append(
-            (encoded, visit_probs, actor, legal_mask, aux_mill_count, was_capture, is_full)
-        )
+        steps.append((encoded, visit_probs, actor, legal_mask, is_full))
 
         if not was_must_capture and state.must_capture:
             # The just-played placement/move formed a mill (forced capture next).
@@ -480,13 +425,7 @@ def _play_game(
     samples = (
         []
         if timeout_discarded
-        else _assign_value_targets(
-            steps,
-            outcome,
-            final_pieces_p1=final_pieces_p1,
-            final_pieces_p2=final_pieces_p2,
-            capture_horizon_plies=capture_horizon_plies,
-        )
+        else _assign_value_targets(steps, outcome)
     )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(
@@ -539,7 +478,7 @@ def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
         num_planes=cfg.get("num_planes", _NUM_PLANES),
         policy_head_hidden=cfg["policy_head_hidden"],
         value_head_hidden=cfg["value_head_hidden"],
-        aux_heads_config=cfg.get("aux_heads_config"),
+        value_head_type=cfg.get("value_head_type", "scalar"),
     )
 
 

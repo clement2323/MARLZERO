@@ -137,14 +137,13 @@ def _load_network() -> None:
         net_cfg = (payload.get("config") or {}).get("network", {})
         num_blocks = net_cfg.get("num_blocks", int(os.getenv("NUM_BLOCKS", "10")))
         num_channels = net_cfg.get("num_channels", int(os.getenv("NUM_CHANNELS", "128")))
-        aux_heads_config = net_cfg.get("aux_heads") if net_cfg.get("aux_heads", {}).get("enabled") else None
         network = MorrisResNet(
             num_blocks=num_blocks,
             num_channels=num_channels,
             num_planes=_NUM_PLANES,
             policy_head_hidden=net_cfg.get("policy_head_hidden", 64),
             value_head_hidden=net_cfg.get("value_head_hidden", 64),
-            aux_heads_config=aux_heads_config,
+            value_head_type=net_cfg.get("value_head_type", "scalar"),
         )
         network.load_state_dict(payload["state_dict"])
         network.eval().to(_device)

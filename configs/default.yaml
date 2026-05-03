@@ -23,22 +23,6 @@ network:
   # (KataGo-style). Categorical avoids lazy-mean collapse in draw-heavy games.
   # Incompatible across types: a checkpoint trained with one cannot load the other.
   value_head_type: scalar
-  # Auxiliary heads (KataGo-style) — extra supervision targets that help
-  # the trunk learn tactical features faster, breaking the "draw attractor"
-  # collapse where value head converges to ~0 before policy head can push.
-  # Opt-in master switch + per-head enable + fixed weights (no decay).
-  aux_heads:
-    enabled: false
-    mill_count:
-      enabled: true
-      weight: 0.1   # MSE on (number of mills the current player has, 0..6)
-    pieces_diff_at_end:
-      enabled: true
-      weight: 0.05  # MSE on (own_pieces - opp_pieces) at game terminal
-    capture_in_n:
-      enabled: true
-      weight: 0.1   # BCE on (does the current player capture within n_plies?)
-      n_plies: 3
 
 input_encoding:
   num_planes: 7

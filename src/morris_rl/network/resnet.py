@@ -2,20 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_POSITIONS
-from morris_rl.network.heads import AuxScalarHead, CategoricalValueHead, PolicyHead, ValueHead
-
-# The names of the auxiliary heads recognised by MorrisResNet. Each entry in
-# the aux_heads_config dict must use one of these keys; unknown keys are
-# silently ignored. Keep this list in sync with the head construction logic
-# below and the trainer's loss computation.
-AUX_HEAD_NAMES = ("mill_count", "pieces_diff_at_end", "capture_in_n")
+from morris_rl.network.heads import CategoricalValueHead, PolicyHead, ValueHead
 
 
 class ResidualBlock(nn.Module):
@@ -39,8 +31,8 @@ class MorrisResNet(nn.Module):
     """AlphaZero-style ResNet for Nine Men's Morris.
 
     Input:  (batch, num_planes, NUM_POSITIONS)  — encoded board state
-    Output: (log_policy, value) by default; (log_policy, value, aux_dict)
-            when ``forward(..., return_aux=True)`` and aux heads are enabled.
+    Output: (log_policy, scalar) by default; (log_policy, scalar, logits)
+            when ``forward(..., return_value_logits=True)``.
 
     Args:
         num_blocks: Number of residual blocks in the trunk.
@@ -48,18 +40,8 @@ class MorrisResNet(nn.Module):
         num_planes: Number of input feature planes (7 by default).
         policy_head_hidden: Hidden size for the policy head linear layer.
         value_head_hidden: Hidden size for the value head linear layer.
-        aux_heads_config: Optional dict gating which auxiliary heads are
-            instantiated. Shape::
-
-                {
-                    "mill_count":         {"enabled": bool, ...},
-                    "pieces_diff_at_end": {"enabled": bool, ...},
-                    "capture_in_n":       {"enabled": bool, ...},
-                }
-
-            Heads with ``enabled=False`` (or absent) are not constructed,
-            so they cost zero parameters and zero forward-time compute.
-            See :data:`AUX_HEAD_NAMES` for the recognised keys.
+        value_head_type: ``"scalar"`` (tanh + MSE) or ``"categorical"``
+            (3-class cross-entropy, KataGo-style).
     """
 
     def __init__(
@@ -70,7 +52,6 @@ class MorrisResNet(nn.Module):
         policy_head_hidden: int,
         value_head_hidden: int,
         value_head_type: str = "scalar",
-        aux_heads_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.input_conv = nn.Conv1d(num_planes, num_channels, kernel_size=3, padding=1)
@@ -87,24 +68,10 @@ class MorrisResNet(nn.Module):
         else:
             self.value_head = ValueHead(num_channels, NUM_POSITIONS, value_head_hidden)
 
-        # Auxiliary heads: each one is opt-in, none by default. Stored in a
-        # ModuleDict keyed by name so the trainer can iterate them generically.
-        self.aux_heads = nn.ModuleDict()
-        if aux_heads_config:
-            for name in AUX_HEAD_NAMES:
-                spec = aux_heads_config.get(name)
-                if spec is not None and spec.get("enabled", False):
-                    self.aux_heads[name] = AuxScalarHead(
-                        num_channels=num_channels,
-                        num_positions=NUM_POSITIONS,
-                        hidden_size=32,
-                    )
-
     def forward(
         self,
         x: torch.Tensor,
         legal_mask: torch.Tensor,
-        return_aux: bool = False,
         return_value_logits: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Run a forward pass.
@@ -112,16 +79,12 @@ class MorrisResNet(nn.Module):
         Args:
             x: Encoded state tensor of shape (batch, num_planes, NUM_POSITIONS).
             legal_mask: Boolean mask of shape (batch, ACTION_SPACE_SIZE).
-                        True indicates a legal action.
-            return_aux: If True, also return aux head outputs dict.
             return_value_logits: If True, also return raw value logits (batch, 3).
                                  Only meaningful when value_head_type="categorical".
 
         Returns:
-            (log_policy, scalar)                      default
-            (log_policy, scalar, aux_dict)            return_aux=True
-            (log_policy, scalar, logits)              return_value_logits=True
-            (log_policy, scalar, aux_dict, logits)    both True
+            ``(log_policy, scalar)`` by default.
+            ``(log_policy, scalar, logits)`` when ``return_value_logits=True``.
         """
         x = F.relu(self.input_bn(self.input_conv(x)))
         x = self.trunk(x)
@@ -133,10 +96,6 @@ class MorrisResNet(nn.Module):
             scalar = self.value_head(x)
             logits = None
 
-        result: tuple[torch.Tensor, ...] = (log_policy, scalar)
-        if return_aux:
-            aux_outputs = {name: head(x) for name, head in self.aux_heads.items()}
-            result = result + (aux_outputs,)  # type: ignore[operator]
         if return_value_logits:
-            result = result + (logits,)  # type: ignore[operator]
-        return result
+            return log_policy, scalar, logits  # type: ignore[return-value]
+        return log_policy, scalar

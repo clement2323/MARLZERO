@@ -100,60 +100,31 @@ def compute_loss(
     value: torch.Tensor,
     policy_target: torch.Tensor,
     value_target: torch.Tensor,
-    aux_outputs: dict[str, torch.Tensor] | None = None,
-    aux_targets: dict[str, torch.Tensor] | None = None,
-    aux_weights: dict[str, float] | None = None,
     value_logits: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute AlphaZero combined loss with optional auxiliary supervision.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute AlphaZero combined loss.
 
     Args:
         log_policy:    (batch, ACTION_SPACE_SIZE) log-probabilities from network.
-        value:         (batch,) value predictions in [-1, 1].
+        value:         (batch,) scalar value predictions (used for logging).
         policy_target: (batch, ACTION_SPACE_SIZE) MCTS visit distribution.
         value_target:  (batch,) game outcomes in {-1, 0, +1}.
-        aux_outputs:   Optional dict of aux head raw outputs, shape (batch,).
-        aux_targets:   Optional dict of aux targets, shape (batch,).
-        aux_weights:   Optional dict of per-head loss weights.
+        value_logits:  (batch, 3) raw logits from categorical value head, or None.
+                       When provided, cross-entropy replaces MSE for value loss.
 
     Returns:
-        Tuple of (total_loss, policy_loss, value_loss, aux_loss_dict).
-        aux_loss_dict contains the unweighted per-head losses (so the trainer
-        can log each individually); they have already been added (with their
-        weights) into total_loss.
+        Tuple of (total_loss, policy_loss, value_loss).
     """
-    # When the network forward uses a legal-action mask, illegal positions
-    # have log_policy=-inf. policy_target is 0 there (MCTS never visits an
-    # illegal action), but 0 × -inf = NaN in float math. Replace those terms
-    # with 0 explicitly.
+    # 0 × -inf = NaN when policy_target=0 on masked actions — zero out explicitly.
     contrib = policy_target * log_policy
     contrib = torch.where(policy_target > 0, contrib, torch.zeros_like(contrib))
     policy_loss = -contrib.sum(dim=1).mean()
     if value_logits is not None:
-        # Categorical head: cross-entropy on {win=0, draw=1, loss=2}.
-        # {+1→0, 0→1, -1→2} via (1 - target).long()
+        # Map {+1→0 (win), 0→1 (draw), -1→2 (loss)} to class indices.
         value_loss = F.cross_entropy(value_logits, (1.0 - value_target).long())
     else:
         value_loss = F.mse_loss(value, value_target)
-    total_loss = policy_loss + value_loss
-
-    aux_losses: dict[str, torch.Tensor] = {}
-    if aux_outputs and aux_targets and aux_weights:
-        for name, output in aux_outputs.items():
-            target = aux_targets.get(name)
-            weight = aux_weights.get(name, 0.0)
-            if target is None or weight <= 0.0:
-                continue
-            if name == "capture_in_n":
-                # Binary classification on raw logits.
-                loss = F.binary_cross_entropy_with_logits(output, target)
-            else:
-                # mill_count and pieces_diff_at_end: scalar regression.
-                loss = F.mse_loss(output, target)
-            aux_losses[name] = loss
-            total_loss = total_loss + weight * loss
-
-    return total_loss, policy_loss, value_loss, aux_losses
+    return policy_loss + value_loss, policy_loss, value_loss
 
 
 # ---------------------------------------------------------------------------
@@ -206,19 +177,6 @@ class Trainer:
         self._step = 0
         # Optional buffer ref so _auto_checkpoint can persist it alongside weights.
         self._buffer: ReplayBuffer | None = None
-
-        # Resolve aux-head weights from config once. Maps head_name → float.
-        # An empty dict (default) disables aux loss computation entirely;
-        # step() also defensively checks self._network.aux_heads before
-        # requesting return_aux from the forward pass.
-        self._aux_weights: dict[str, float] = {}
-        net_cfg = self._config.get("network", {}) if self._config else {}
-        aux_cfg = net_cfg.get("aux_heads") if isinstance(net_cfg, dict) else None
-        if aux_cfg and aux_cfg.get("enabled", False):
-            for name in ("mill_count", "pieces_diff_at_end", "capture_in_n"):
-                spec = aux_cfg.get(name)
-                if spec and spec.get("enabled", False) and spec.get("weight", 0) > 0:
-                    self._aux_weights[name] = float(spec["weight"])
 
         self._optimizer = torch.optim.Adam(
             network.parameters(),
@@ -275,54 +233,28 @@ class Trainer:
 
         Returns:
             Dict with keys ``total_loss``, ``policy_loss``, ``value_loss``,
-            ``learning_rate``, plus per-aux-head loss entries (``mill_loss``,
-            ``pieces_diff_loss``, ``capture_loss``) when aux heads are active.
+            ``learning_rate``, ``grad_norm``, ``value_mean``, ``value_std``.
         """
-        states, policy_targets, value_targets, legal_masks, aux_targets = (
+        states, policy_targets, value_targets, legal_masks = (
             buffer.sample(batch_size, device=self._device)
         )
 
         self._optimizer.zero_grad()
-
-        # Aux heads are active iff the network has any registered aux head
-        # AND the cached weights are non-empty. The weights come from the
-        # config.network.aux_heads subtree resolved into a flat dict in
-        # __init__ (see self._aux_weights below).
-        aux_active = bool(self._aux_weights) and len(self._network.aux_heads) > 0
         categorical = self._value_head_type == "categorical"
 
         with torch.autocast(device_type=self._device.type, enabled=self._amp_enabled):
-            if aux_active and categorical:
-                log_policy, value, aux_outputs, value_logits = self._network(
-                    states, legal_masks, return_aux=True, return_value_logits=True
-                )
-            elif aux_active:
-                log_policy, value, aux_outputs = self._network(
-                    states, legal_masks, return_aux=True
-                )
-                value_logits = None
-            elif categorical:
+            if categorical:
                 log_policy, value, value_logits = self._network(
                     states, legal_masks, return_value_logits=True
                 )
-                aux_outputs = None
             else:
                 log_policy, value = self._network(states, legal_masks)
-                aux_outputs = None
                 value_logits = None
 
-            total_loss, policy_loss, value_loss, aux_losses = compute_loss(
-                log_policy,
-                value,
-                policy_targets,
-                value_targets,
-                aux_outputs=aux_outputs if aux_active else None,
-                aux_targets=aux_targets if aux_active else None,
-                aux_weights=self._aux_weights if aux_active else None,
-                value_logits=value_logits,
+            total_loss, policy_loss, value_loss = compute_loss(
+                log_policy, value, policy_targets, value_targets, value_logits
             )
 
-        # Capture value distribution stats before backward (no in-place risk).
         value_mean = float(value.detach().float().mean().item())
         value_std  = float(value.detach().float().std().item())
 
@@ -343,10 +275,6 @@ class Trainer:
             "value_mean": value_mean,
             "value_std": value_std,
         }
-        # Surface per-aux-head loss so MLflow / TensorBoard show convergence
-        # of each task individually (a stalled aux head is informative).
-        for name, loss_t in aux_losses.items():
-            metrics[f"aux_{name}_loss"] = float(loss_t.item())
         self._log_metrics(metrics)
 
         if self._checkpoint_dir and self._step % self._checkpoint_interval == 0:

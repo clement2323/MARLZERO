@@ -33,43 +33,22 @@ class SampleRecord:
     """One training sample from a self-play position."""
 
     encoded_state: npt.NDArray[np.float32]   # (7, 24)
-    policy_target: npt.NDArray[np.float32]  # (ACTION_SPACE_SIZE,)
-    value_target: float                     # in {-1.0, 0.0, 1.0}, current-player perspective
-    legal_mask: npt.NDArray[np.bool_]       # (ACTION_SPACE_SIZE,) True on legal actions
-
-    # Auxiliary supervision targets (KataGo-style aux heads). All scalar.
-    # Defaults make the field backward-compatible when aux heads are disabled
-    # — the trainer simply ignores them in compute_loss.
-    aux_mill: float = 0.0           # number of mills the current player has on the board
-    aux_pieces_diff: float = 0.0    # pieces_own − pieces_opp at game terminal (own POV)
-    aux_capture: float = 0.0        # 1.0 if current player captures within next n_plies else 0.0
+    policy_target: npt.NDArray[np.float32]   # (ACTION_SPACE_SIZE,)
+    value_target: float                      # in {-1.0, 0.0, 1.0}, current-player perspective
+    legal_mask: npt.NDArray[np.bool_]        # (ACTION_SPACE_SIZE,) True on legal actions
 
 
 def _augment_sample(sample: SampleRecord) -> list[SampleRecord]:
-    """Return the 7 non-identity symmetric variants of a sample.
-
-    The legal_mask transforms exactly like the policy: a legal action under
-    the original orientation maps to the same legal action under the rotated
-    board (transform_policy is dtype-agnostic and works on bool arrays).
-
-    Auxiliary scalars (mill / pieces_diff / capture) are *invariant* under
-    spatial symmetry — they're global counts not tied to specific positions —
-    so all 8 variants share the original sample's aux targets.
-    """
-    augmented = []
-    for perm in SYMMETRY_PERMUTATIONS[1:]:
-        augmented.append(
-            SampleRecord(
-                encoded_state=transform_encoded_state(sample.encoded_state, perm),
-                policy_target=transform_policy(sample.policy_target, perm),
-                value_target=sample.value_target,
-                legal_mask=transform_policy(sample.legal_mask, perm),
-                aux_mill=sample.aux_mill,
-                aux_pieces_diff=sample.aux_pieces_diff,
-                aux_capture=sample.aux_capture,
-            )
+    """Return the 7 non-identity symmetric variants of a sample."""
+    return [
+        SampleRecord(
+            encoded_state=transform_encoded_state(sample.encoded_state, perm),
+            policy_target=transform_policy(sample.policy_target, perm),
+            value_target=sample.value_target,
+            legal_mask=transform_policy(sample.legal_mask, perm),
         )
-    return augmented
+        for perm in SYMMETRY_PERMUTATIONS[1:]
+    ]
 
 
 class ReplayBuffer:
@@ -93,19 +72,10 @@ class ReplayBuffer:
         self._use_augmentation = use_symmetry_augmentation
         self._lock = threading.Lock()
 
-        # Pre-allocate storage arrays for O(1) circular writes.
         self._states = np.zeros((capacity, _NUM_PLANES, NUM_POSITIONS), dtype=np.float32)
         self._policies = np.zeros((capacity, ACTION_SPACE_SIZE), dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
-        # Legal-action mask, kept aligned with the trainer's masked log_softmax.
-        # bool dtype = 1 byte/element; ~300 MB at capacity=500k. Could be packed
-        # via np.packbits for ~8× compression if memory ever becomes tight.
         self._masks = np.zeros((capacity, ACTION_SPACE_SIZE), dtype=np.bool_)
-        # Auxiliary scalar targets — three parallel float32 arrays. Each costs
-        # ~2 MB at capacity=500k, total ~6 MB (negligible).
-        self._aux_mill = np.zeros(capacity, dtype=np.float32)
-        self._aux_pieces_diff = np.zeros(capacity, dtype=np.float32)
-        self._aux_capture = np.zeros(capacity, dtype=np.float32)
 
         self._write_ptr = 0
         self._size = 0
@@ -140,19 +110,11 @@ class ReplayBuffer:
         self,
         batch_size: int,
         device: torch.device | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        dict[str, torch.Tensor],
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return a random minibatch.
 
         Returns:
-            (states, policies, values, masks, aux_targets) where aux_targets
-            is a dict ``{"mill_count": ..., "pieces_diff_at_end": ...,
-            "capture_in_n": ...}`` with each value of shape (batch_size,).
+            ``(states, policies, values, masks)``
 
         Shapes:
             states:   (batch_size, 7, 24)
@@ -173,28 +135,19 @@ class ReplayBuffer:
             policies_np = self._policies[indices].copy()
             values_np = self._values[indices].copy()
             masks_np = self._masks[indices].copy()
-            aux_mill_np = self._aux_mill[indices].copy()
-            aux_pieces_np = self._aux_pieces_diff[indices].copy()
-            aux_capture_np = self._aux_capture[indices].copy()
 
         states = torch.from_numpy(states_np)
         policies = torch.from_numpy(policies_np)
         values = torch.from_numpy(values_np)
         masks = torch.from_numpy(masks_np)
-        aux_targets = {
-            "mill_count": torch.from_numpy(aux_mill_np),
-            "pieces_diff_at_end": torch.from_numpy(aux_pieces_np),
-            "capture_in_n": torch.from_numpy(aux_capture_np),
-        }
 
         if device is not None:
             states = states.to(device)
             policies = policies.to(device)
             values = values.to(device)
             masks = masks.to(device)
-            aux_targets = {k: t.to(device) for k, t in aux_targets.items()}
 
-        return states, policies, values, masks, aux_targets
+        return states, policies, values, masks
 
     # ------------------------------------------------------------------
     # Introspection
@@ -222,9 +175,6 @@ class ReplayBuffer:
                 policies=self._policies[: self._size],
                 values=self._values[: self._size],
                 masks=self._masks[: self._size],
-                aux_mill=self._aux_mill[: self._size],
-                aux_pieces_diff=self._aux_pieces_diff[: self._size],
-                aux_capture=self._aux_capture[: self._size],
                 write_ptr=np.array([self._write_ptr], dtype=np.int64),
                 size=np.array([self._size], dtype=np.int64),
                 capacity=np.array([self._capacity], dtype=np.int64),
@@ -233,13 +183,8 @@ class ReplayBuffer:
     def load(self, path: str | "Path") -> None:
         """Restore buffer contents from a file written by :meth:`save`.
 
-        Capacity must match. Stored entries are placed at the start of the
-        circular buffer; the write pointer is restored so subsequent writes
-        continue evicting in FIFO order.
-
-        Backward compat: a buffer saved before legal_mask was introduced
-        won't have a "masks" key — in that case we fall back to all-True
-        masks (equivalent to the old full_mask behaviour for those samples).
+        Capacity must match. Backward compat: files saved before the legal_mask
+        field existed fall back to all-True masks.
         """
         from pathlib import Path
         data = np.load(Path(path))
@@ -258,16 +203,6 @@ class ReplayBuffer:
                 self._masks[:size] = data["masks"]
             else:
                 self._masks[:size] = True
-            # Aux arrays are also backward-compatible: a buffer saved before
-            # aux heads existed has no aux_* keys, in which case we leave
-            # the pre-allocated zeros — equivalent to "no aux supervision".
-            for key, arr in (
-                ("aux_mill", self._aux_mill),
-                ("aux_pieces_diff", self._aux_pieces_diff),
-                ("aux_capture", self._aux_capture),
-            ):
-                if key in data.files:
-                    arr[:size] = data[key]
             self._size = size
             self._write_ptr = int(data["write_ptr"][0])
 
@@ -281,9 +216,6 @@ class ReplayBuffer:
         self._policies[self._write_ptr] = sample.policy_target
         self._values[self._write_ptr] = sample.value_target
         self._masks[self._write_ptr] = sample.legal_mask
-        self._aux_mill[self._write_ptr] = sample.aux_mill
-        self._aux_pieces_diff[self._write_ptr] = sample.aux_pieces_diff
-        self._aux_capture[self._write_ptr] = sample.aux_capture
         self._write_ptr = (self._write_ptr + 1) % self._capacity
         if self._size < self._capacity:
             self._size += 1

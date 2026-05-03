@@ -140,7 +140,7 @@ def _build_server_network(network_cfg: dict[str, Any]) -> MorrisResNet:
         num_planes=network_cfg.get("num_planes", _NUM_PLANES),
         policy_head_hidden=network_cfg["policy_head_hidden"],
         value_head_hidden=network_cfg["value_head_hidden"],
-        aux_heads_config=network_cfg.get("aux_heads_config"),
+        value_head_type=network_cfg.get("value_head_type", "scalar"),
     )
 
 

@@ -50,10 +50,6 @@ def _resolve_device(device_str: str) -> torch.device:
 
 def _network_cfg_dict(cfg: DictConfig) -> dict:
     """Plain dict passed to worker processes (must be picklable)."""
-    aux_node = cfg.network.get("aux_heads", None)
-    aux_heads_config = None
-    if aux_node is not None and bool(aux_node.get("enabled", False)):
-        aux_heads_config = OmegaConf.to_container(aux_node, resolve=True)
     return {
         "num_blocks": cfg.network.num_blocks,
         "num_channels": cfg.network.num_channels,
@@ -61,7 +57,6 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
         "policy_head_hidden": cfg.network.policy_head_hidden,
         "value_head_hidden": cfg.network.value_head_hidden,
         "value_head_type": cfg.network.get("value_head_type", "scalar"),
-        "aux_heads_config": aux_heads_config,
     }
 
 

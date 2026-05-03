@@ -68,48 +68,34 @@ def test_temperature_at_and_after_threshold_is_near_zero() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _make_step(player: int, is_full: bool = True) -> tuple:
+    return (
+        np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
+        np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE,
+        player,
+        np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
+        is_full,
+    )
+
+
 def test_value_target_winner_gets_plus_one() -> None:
     from morris_rl.env.rules import Outcome
 
-    steps = [
-        (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
-         np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 1,
-         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
-         0, False, True),
-    ]
-    records = _assign_value_targets(
-        steps, Outcome.PLAYER_1_WINS, final_pieces_p1=5, final_pieces_p2=2
-    )
+    records = _assign_value_targets([_make_step(1)], Outcome.PLAYER_1_WINS)
     assert records[0].value_target == pytest.approx(1.0)
 
 
 def test_value_target_loser_gets_minus_one() -> None:
     from morris_rl.env.rules import Outcome
 
-    steps = [
-        (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
-         np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 2,
-         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
-         0, False, True),
-    ]
-    records = _assign_value_targets(
-        steps, Outcome.PLAYER_1_WINS, final_pieces_p1=5, final_pieces_p2=2
-    )
+    records = _assign_value_targets([_make_step(2)], Outcome.PLAYER_1_WINS)
     assert records[0].value_target == pytest.approx(-1.0)
 
 
 def test_value_target_draw_is_zero() -> None:
     from morris_rl.env.rules import Outcome
 
-    steps = [
-        (np.zeros((_NUM_PLANES, NUM_POSITIONS), dtype=np.float32),
-         np.ones(ACTION_SPACE_SIZE, dtype=np.float32) / ACTION_SPACE_SIZE, 1,
-         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
-         0, False, True),
-    ]
-    records = _assign_value_targets(
-        steps, Outcome.DRAW, final_pieces_p1=3, final_pieces_p2=3
-    )
+    records = _assign_value_targets([_make_step(1)], Outcome.DRAW)
     assert records[0].value_target == pytest.approx(0.0)
 
 
