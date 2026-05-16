@@ -132,7 +132,7 @@ class MorrisSimEnv:
         integration artifact) — those are ignored and _root_state takes over.
         Direct callers (e.g. tests) pass a real GameState object.
         """
-        if init_state is not None and not isinstance(init_state, bytes):
+        if init_state is not None and not isinstance(init_state, (bytes, np.ndarray)):
             self._state = init_state.copy()
         elif self._root_state is not None:
             self._state = self._root_state.copy()
