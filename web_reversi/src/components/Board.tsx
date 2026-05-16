@@ -63,12 +63,13 @@ export default function Board({
 
   return (
     <svg
-      width={SIZE}
-      height={SIZE}
+      viewBox={`0 0 ${SIZE} ${SIZE}`}
       style={{
         background: COLORS.surface,
         borderRadius: 16,
         display: "block",
+        width: "100%",
+        height: "auto",
         boxShadow:
           "0 0 0 1px rgba(255,255,255,0.04), 0 30px 80px rgba(0,0,0,0.55), 0 0 60px rgba(167,139,250,0.06)",
       }}

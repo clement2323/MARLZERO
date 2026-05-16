@@ -1,0 +1,16 @@
+outputs/
+mlruns/
+mlflow.db
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+web_reversi/node_modules/
+web_reversi/dist/
+tests/
+notebooks/
+docs/
+.github/
+.claude/
+train*.log

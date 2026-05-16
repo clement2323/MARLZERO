@@ -213,16 +213,52 @@
   margin: 0;
 }
 
+.board-section svg {
+  width: 100%;
+  height: auto;
+  max-width: 520px;
+}
+
 @media (max-width: 700px) {
+  .app-header {
+    padding: 12px 16px;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
   .app-main {
     flex-direction: column;
-    padding: 16px;
+    padding: 12px;
+    gap: 20px;
     align-items: center;
+  }
+
+  .board-section {
+    width: 100%;
+    gap: 12px;
   }
 
   .panel-section {
     max-width: 100%;
     width: 100%;
+  }
+
+  .btn {
+    padding: 10px 16px;
+  }
+}
+
+@media (max-width: 400px) {
+  .app-main {
+    padding: 8px;
+  }
+
+  .controls {
+    gap: 6px;
+  }
+
+  .app-header h1 {
+    font-size: 14px;
   }
 }
 

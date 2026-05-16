@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml .
+COPY src/ src/
+
+# CPU-only torch — avoids the 3 GB CUDA wheel
+RUN pip install --no-cache-dir torch==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir -e "."
+
+# Download checkpoint from HF Hub model repo (avoids binary in git)
+RUN pip install --no-cache-dir huggingface_hub && \
+    python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='Clem2323/reversi-checkpoint', filename='checkpoint.pt', local_dir='/app', local_dir_use_symlinks=False)"
+
+ENV MODEL_CHECKPOINT=/app/checkpoint.pt
+ENV NUM_SIMULATIONS=200
+ENV DEVICE=cpu
+
+EXPOSE 7860
+CMD ["uvicorn", "morris_rl.inference.reversi_server:app", \
+     "--host", "0.0.0.0", "--port", "7860"]
