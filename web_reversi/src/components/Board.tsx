@@ -12,8 +12,8 @@ const RADIUS = 22;
 const COLORS = {
   surface: "#11141c",
   grid: "#0d1117",
-  gridBorder: "#1e2a3a",
-  labelColor: "#d946ef",
+  gridBorder: "#2e4a6a",
+  labelColor: "#e879f9",
   // Black piece (PLAYER_1 = 1): near-black fill, light-grey stroke
   p1Fill: "#0a0c12",
   p1Stroke: "#a4adb9",
@@ -166,7 +166,7 @@ export default function Board({
             height={CELL}
             fill={isLastMove ? COLORS.lastMoveBg : COLORS.grid}
             stroke={isLastMove ? COLORS.lastMove : COLORS.gridBorder}
-            strokeWidth={isLastMove ? 2 : 1}
+            strokeWidth={isLastMove ? 2 : 1.5}
             rx={1}
           />
         );

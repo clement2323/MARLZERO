@@ -5,101 +5,53 @@ interface Props {
 const MONO = 'ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace';
 
 export default function EvalBar({ valueEstimate }: Props) {
-  // Map [-1, 1] → [0, 1] where 1.0 = full Black advantage
   const blackPct = Math.max(0, Math.min(1, (valueEstimate + 1) / 2));
-  const whitePct = 1 - blackPct;
-
-  const blackH = Math.round(blackPct * 100);
-  const whiteH = Math.round(whitePct * 100);
+  const blackW = Math.round(blackPct * 100);
+  const whiteW = 100 - blackW;
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 6,
-      }}
-    >
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
+      {/* Bar — always full width, split black | white */}
       <div
         style={{
-          fontSize: 10,
-          color: "#8b94a3",
-          letterSpacing: "0.12em",
-          textTransform: "uppercase",
-          fontFamily: MONO,
-        }}
-      >
-        Eval (Black POV)
-      </div>
-
-      {/* Vertical bar */}
-      <div
-        style={{
-          width: 28,
-          height: 180,
-          borderRadius: 6,
+          width: "100%",
+          height: 14,
+          borderRadius: 7,
           overflow: "hidden",
-          background: "#1c1f29",
-          position: "relative",
-          boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.04)",
+          display: "flex",
+          boxShadow: "0 0 0 1px rgba(255,255,255,0.06), 0 2px 8px rgba(0,0,0,0.4)",
         }}
       >
-        {/* Black section (top) */}
         <div
           style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            right: 0,
-            height: `${blackH}%`,
-            background: "linear-gradient(180deg, #1a1d28 0%, #0a0c12 100%)",
-            transition: "height 0.4s cubic-bezier(0.4, 0, 0.2, 1)",
+            width: `${blackW}%`,
+            background: "#0a0c12",
+            transition: "width 0.5s cubic-bezier(0.4, 0, 0.2, 1)",
+            flexShrink: 0,
+            position: "relative",
           }}
         />
-        {/* White section (bottom) */}
         <div
           style={{
-            position: "absolute",
-            bottom: 0,
-            left: 0,
-            right: 0,
-            height: `${whiteH}%`,
-            background: "linear-gradient(180deg, #d8dce8 0%, #f5f6f8 100%)",
-            transition: "height 0.4s cubic-bezier(0.4, 0, 0.2, 1)",
-          }}
-        />
-        {/* Centre line */}
-        <div
-          style={{
-            position: "absolute",
-            top: "50%",
-            left: 0,
-            right: 0,
-            height: 1,
-            background: "rgba(167,139,250,0.6)",
-            boxShadow: "0 0 4px rgba(167,139,250,0.6)",
+            flex: 1,
+            background: "#f5f6f8",
+            transition: "flex 0.5s cubic-bezier(0.4, 0, 0.2, 1)",
           }}
         />
       </div>
 
-      {/* Labels */}
+      {/* Labels below */}
       <div
         style={{
           display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 2,
+          justifyContent: "space-between",
           fontFamily: MONO,
-          fontSize: 10,
+          fontSize: 11,
+          color: "#8b94a3",
         }}
       >
-        <span style={{ color: "#8b94a3" }}>
-          ⚫ {blackH}%
-        </span>
-        <span style={{ color: "#8b94a3" }}>
-          ⚪ {whiteH}%
-        </span>
+        <span>⚫ {blackW}%</span>
+        <span>⚪ {whiteW}%</span>
       </div>
     </div>
   );

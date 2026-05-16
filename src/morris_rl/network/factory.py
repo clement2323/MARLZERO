@@ -7,14 +7,24 @@ from omegaconf import DictConfig
 
 from morris_rl.network.resnet import MorrisResNet
 
-_NUM_INPUT_PLANES = 7  # defined by the encoding scheme (see mcts/search.py:encode_state)
+_DEFAULT_NUM_INPUT_PLANES = 7   # Morris encoding
+_DEFAULT_NUM_POSITIONS = 24     # Morris board size
+_DEFAULT_ACTION_SPACE_SIZE = 600  # Morris action space
 
 
-def build_network(config: DictConfig) -> nn.Module:
+def build_network(
+    config: DictConfig,
+    num_planes: int = _DEFAULT_NUM_INPUT_PLANES,
+    num_positions: int = _DEFAULT_NUM_POSITIONS,
+    action_space_size: int = _DEFAULT_ACTION_SPACE_SIZE,
+) -> nn.Module:
     """Return a network instance configured from *config.network*.
 
     Args:
         config: Top-level Hydra config containing a ``network`` sub-node.
+        num_planes: Number of input planes. Defaults to 7 (Morris).
+        num_positions: Board positions. Defaults to 24 (Morris).
+        action_space_size: Total actions. Defaults to 600 (Morris).
 
     Returns:
         An ``nn.Module`` ready for training or inference.
@@ -28,9 +38,11 @@ def build_network(config: DictConfig) -> nn.Module:
         return MorrisResNet(
             num_blocks=net_cfg.num_blocks,
             num_channels=net_cfg.num_channels,
-            num_planes=_NUM_INPUT_PLANES,
+            num_planes=num_planes,
             policy_head_hidden=net_cfg.policy_head_hidden,
             value_head_hidden=net_cfg.value_head_hidden,
             value_head_type=value_head_type,
+            num_positions=num_positions,
+            action_space_size=action_space_size,
         )
     raise ValueError(f"Unknown network type: {net_cfg.type!r}")

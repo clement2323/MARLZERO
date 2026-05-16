@@ -18,36 +18,39 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_POSITIONS
+from morris_rl.env.board import ACTION_SPACE_SIZE as _MORRIS_ACTION_SPACE_SIZE
+from morris_rl.env.board import NUM_POSITIONS as _MORRIS_NUM_POSITIONS
 from morris_rl.env.symmetries import (
-    SYMMETRY_PERMUTATIONS,
-    transform_encoded_state,
-    transform_policy,
+    SYMMETRY_PERMUTATIONS as _MORRIS_SYMMETRY_PERMUTATIONS,
+    transform_encoded_state as _morris_transform_encoded_state,
+    transform_policy as _morris_transform_policy,
 )
 
-_NUM_PLANES = 7
+_DEFAULT_NUM_PLANES = 7
+
+AugmentFn = "Callable[[SampleRecord], list[SampleRecord]]"
 
 
 @dataclass
 class SampleRecord:
     """One training sample from a self-play position."""
 
-    encoded_state: npt.NDArray[np.float32]   # (7, 24)
-    policy_target: npt.NDArray[np.float32]   # (ACTION_SPACE_SIZE,)
+    encoded_state: npt.NDArray[np.float32]   # (num_planes, num_positions)
+    policy_target: npt.NDArray[np.float32]   # (action_space_size,)
     value_target: float                      # in {-1.0, 0.0, 1.0}, current-player perspective
-    legal_mask: npt.NDArray[np.bool_]        # (ACTION_SPACE_SIZE,) True on legal actions
+    legal_mask: npt.NDArray[np.bool_]        # (action_space_size,) True on legal actions
 
 
-def _augment_sample(sample: SampleRecord) -> list[SampleRecord]:
-    """Return the 7 non-identity symmetric variants of a sample."""
+def _morris_augment_sample(sample: SampleRecord) -> list[SampleRecord]:
+    """Return the 7 non-identity Morris D4 symmetric variants of a sample."""
     return [
         SampleRecord(
-            encoded_state=transform_encoded_state(sample.encoded_state, perm),
-            policy_target=transform_policy(sample.policy_target, perm),
+            encoded_state=_morris_transform_encoded_state(sample.encoded_state, perm),
+            policy_target=_morris_transform_policy(sample.policy_target, perm),
             value_target=sample.value_target,
-            legal_mask=transform_policy(sample.legal_mask, perm),
+            legal_mask=_morris_transform_policy(sample.legal_mask, perm),
         )
-        for perm in SYMMETRY_PERMUTATIONS[1:]
+        for perm in _MORRIS_SYMMETRY_PERMUTATIONS[1:]
     ]
 
 
@@ -61,21 +64,32 @@ class ReplayBuffer:
             enabled, each raw position counts as 8 samples.
         use_symmetry_augmentation: If True, each added sample is stored
             alongside its 7 dihedral-symmetric variants.
+        num_planes: Number of input planes in the encoded state tensor.
+        num_positions: Number of board positions (game-specific).
+        action_space_size: Total number of actions (game-specific).
+        augment_fn: Custom augmentation function. Defaults to Morris D4
+            symmetry when None and ``use_symmetry_augmentation`` is True.
     """
 
     def __init__(
         self,
         capacity: int,
         use_symmetry_augmentation: bool = True,
+        num_planes: int = _DEFAULT_NUM_PLANES,
+        num_positions: int = _MORRIS_NUM_POSITIONS,
+        action_space_size: int = _MORRIS_ACTION_SPACE_SIZE,
+        augment_fn: "Callable[[SampleRecord], list[SampleRecord]] | None" = None,
     ) -> None:
         self._capacity = capacity
         self._use_augmentation = use_symmetry_augmentation
+        self._num_planes = num_planes
+        self._augment_fn = augment_fn if augment_fn is not None else _morris_augment_sample
         self._lock = threading.Lock()
 
-        self._states = np.zeros((capacity, _NUM_PLANES, NUM_POSITIONS), dtype=np.float32)
-        self._policies = np.zeros((capacity, ACTION_SPACE_SIZE), dtype=np.float32)
+        self._states = np.zeros((capacity, self._num_planes, num_positions), dtype=np.float32)
+        self._policies = np.zeros((capacity, action_space_size), dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
-        self._masks = np.zeros((capacity, ACTION_SPACE_SIZE), dtype=np.bool_)
+        self._masks = np.zeros((capacity, action_space_size), dtype=np.bool_)
 
         self._write_ptr = 0
         self._size = 0
@@ -86,7 +100,7 @@ class ReplayBuffer:
 
     def add(self, sample: SampleRecord) -> None:
         """Add one sample (and its symmetric variants if augmentation is on)."""
-        samples = [sample] + (_augment_sample(sample) if self._use_augmentation else [])
+        samples = [sample] + (self._augment_fn(sample) if self._use_augmentation else [])
         with self._lock:
             for s in samples:
                 self._write(s)
@@ -97,7 +111,7 @@ class ReplayBuffer:
         for s in samples:
             to_write.append(s)
             if self._use_augmentation:
-                to_write.extend(_augment_sample(s))
+                to_write.extend(self._augment_fn(s))
         with self._lock:
             for s in to_write:
                 self._write(s)

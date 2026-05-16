@@ -17,9 +17,8 @@ from typing import Final
 
 import numpy as np
 
-from morris_rl.env.board import (
+from morris_rl.env.morris.board import (
     ADJACENCY,
-    MILLS,
     MILLS_BY_POSITION,
     NUM_PIECES_PER_PLAYER,
     NUM_PLACE_CAPTURE_ACTIONS,
@@ -30,8 +29,7 @@ PLAYER_1: Final[int] = 1
 PLAYER_2: Final[int] = 2
 EMPTY: Final[int] = 0
 
-MAX_HALFMOVES: Final[int] = 300       # no-progress clock (dead-code when total cap active)
-MAX_TOTAL_HALFMOVES: Final[int] = 100  # absolute game length cap — piece count breaks ties
+MAX_HALFMOVES: Final[int] = 300
 THREEFOLD_LIMIT: Final[int] = 10
 
 
@@ -56,8 +54,7 @@ class GameState:
     current_player: int  # 1 or 2
     pieces_in_hand: tuple[int, int]  # (p1_hand, p2_hand)
     must_capture: bool  # True when the current player just formed a mill
-    halfmove_clock: int  # resets on placement or capture; kept for legacy metrics
-    total_halfmoves: int = 0  # absolute game length — never reset; cap at MAX_TOTAL_HALFMOVES
+    halfmove_clock: int  # resets on placement or capture; draw at MAX_HALFMOVES
     position_counts: dict[tuple[int, ...], int] = field(default_factory=dict)
 
     def copy(self) -> GameState:
@@ -68,7 +65,6 @@ class GameState:
             pieces_in_hand=self.pieces_in_hand,
             must_capture=self.must_capture,
             halfmove_clock=self.halfmove_clock,
-            total_halfmoves=self.total_halfmoves,
             position_counts=dict(self.position_counts),
         )
 
@@ -203,24 +199,17 @@ def apply_action(state: GameState, action: int) -> GameState:
 
 
 def is_terminal(state: GameState) -> tuple[bool, Outcome | None]:
-    """Return (done, outcome). outcome is None when not done.
-
-    No draws are possible: the 100-halfmove total cap and threefold repetition
-    both resolve via _piece_count_winner (pieces → mills → P1 fallback).
-    """
+    """Return (done, outcome). outcome is None when not done."""
     # The must_capture sub-turn is not a terminal check point.
     if state.must_capture:
         return False, None
 
-    if state.total_halfmoves >= MAX_TOTAL_HALFMOVES:
-        return True, _piece_count_winner(state)
-
     key = _position_key(state)
     if state.position_counts.get(key, 0) >= THREEFOLD_LIMIT:
-        return True, _piece_count_winner(state)
+        return True, Outcome.DRAW
 
     if state.halfmove_clock >= MAX_HALFMOVES:
-        return True, _piece_count_winner(state)
+        return True, Outcome.DRAW
 
     player = state.current_player
     if state.pieces_in_hand[player - 1] == 0:
@@ -231,24 +220,6 @@ def is_terminal(state: GameState) -> tuple[bool, Outcome | None]:
         return True, Outcome(opponent(player))
 
     return False, None
-
-
-def _piece_count_winner(state: GameState) -> Outcome:
-    """Decisive outcome at game cap — never returns DRAW.
-
-    Priority: 1) board pieces  2) active mills  3) P1 wins.
-    At the 100-halfmove cap both hands are always empty (movement phase),
-    so total pieces == board pieces.
-    """
-    b1 = pieces_on_board(state.board, PLAYER_1)
-    b2 = pieces_on_board(state.board, PLAYER_2)
-    if b1 != b2:
-        return Outcome.PLAYER_1_WINS if b1 > b2 else Outcome.PLAYER_2_WINS
-    m1 = sum(1 for m in MILLS if all(state.board[p] == PLAYER_1 for p in m))
-    m2 = sum(1 for m in MILLS if all(state.board[p] == PLAYER_2 for p in m))
-    if m1 != m2:
-        return Outcome.PLAYER_1_WINS if m1 > m2 else Outcome.PLAYER_2_WINS
-    return Outcome.PLAYER_1_WINS  # tie-break of last resort (statistically negligible)
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +271,6 @@ def _apply_placement(state: GameState, position: int) -> None:
     hand[player - 1] -= 1
     state.pieces_in_hand = (hand[0], hand[1])
     state.halfmove_clock = 0  # placement always resets the no-progress clock
-    state.total_halfmoves += 1
 
     if forms_mill(state.board, position, player):
         state.must_capture = True
@@ -316,7 +286,6 @@ def _apply_move(state: GameState, action: int) -> None:
     state.board[src] = EMPTY
     state.board[dst] = player
     state.halfmove_clock += 1
-    state.total_halfmoves += 1
 
     if forms_mill(state.board, dst, player):
         state.must_capture = True
@@ -329,7 +298,6 @@ def _apply_capture(state: GameState, position: int) -> None:
     state.board[position] = EMPTY
     state.must_capture = False
     state.halfmove_clock = 0  # capture resets the no-progress clock
-    state.total_halfmoves += 1
     state.current_player = opponent(state.current_player)
     _register_position(state)
 

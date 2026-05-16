@@ -1,0 +1,90 @@
+# Reversi/Othello training configuration.
+# Inherits structure from default.yaml but overrides all game-specific values.
+# Reversi almost always produces decisive outcomes (draw rate < 2%), making
+# it a clean validation that the AlphaZero infrastructure works before
+# debugging the Nine Men's Morris draw attractor.
+
+seed: 42
+
+algorithm: alphazero
+
+game: reversi  # selects morris_rl.env.reversi as the game environment
+
+network:
+  type: resnet
+  # Smaller network than Morris: Reversi is combinatorially simpler.
+  # 6 blocks × 64 channels ≈ 300k params — fast to converge in ~50k steps.
+  num_blocks: 6
+  num_channels: 64
+  policy_head_hidden: 64
+  value_head_hidden: 64
+  # scalar is fine for Reversi — decisive outcomes mean value signal is clear.
+  value_head_type: scalar
+  lora_rank: 0
+  lora_alpha: 16.0
+  freeze_trunk: false
+
+input_encoding:
+  # Reversi encoding: 3 planes (own pieces, opponent pieces, pass urgency).
+  # Defined in src/morris_rl/env/reversi/encoding.py.
+  num_planes: 3
+
+mcts:
+  num_simulations_train: 200
+  num_simulations_eval: 800
+  num_simulations_demo: 2000
+  c_puct: 1.5
+  dirichlet_alpha: 0.5     # higher than Morris: Reversi is more tactical
+  dirichlet_epsilon: 0.25
+
+self_play:
+  num_workers: 6
+  inference_mode: per_worker_cpu   # simple mode for validation; switch to
+                                   # shared_gpu if throughput becomes a bottleneck
+  inference_device: cpu
+  max_batch_size: 32
+  max_wait_ms: 5.0
+  inference_batch_size: 32
+  worker_max_rss_mb: 800
+  worker_recycle_games: 0
+  resign:
+    enabled: false
+  playout_cap:
+    enabled: false
+  curriculum:
+    # No curriculum for Reversi: the game is naturally decisive from the
+    # standard starting position and doesn't drift to the draw attractor.
+    enabled: false
+  discard_timeout_games: false
+  temperature_schedule:
+    moves_0_to_10: 1.0
+    moves_10_plus: 0.0
+  tree_reuse: false
+
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  replay_buffer_size: 100000
+  min_buffer_size: 1000
+  total_steps: 200000
+  updates_per_collected_game: 4
+  lr_decay_steps: 100000
+  checkpoint_interval: 1000
+  symmetry_augmentation: true   # D4 symmetry implemented in reversi/symmetries.py
+  mixed_precision: true
+  resume: null
+
+device: auto
+
+mlflow:
+  enabled: true
+  tracking_uri: file:./mlruns
+  experiment_name: reversi-az
+  run_name: null
+
+promotion:
+  mode: arena
+  eval_games: 100
+  win_rate_threshold: 0.55

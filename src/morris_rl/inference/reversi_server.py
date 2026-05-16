@@ -132,7 +132,7 @@ def _describe_action(action: int) -> str:
 
 def _find_latest_checkpoint() -> str | None:
     """Scan outputs/**/checkpoints/ for checkpoint_*.pt, return the latest by name."""
-    root = Path(__file__).parent.parent.parent.parent.parent / "outputs"
+    root = Path(__file__).parents[3] / "outputs"
     if not root.exists():
         return None
     candidates = sorted(root.glob("**/checkpoints/checkpoint_*.pt"))

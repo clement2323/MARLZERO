@@ -34,6 +34,7 @@ import torch.nn as nn
 
 from morris_rl.env.rules import (
     MAX_HALFMOVES,
+    MAX_TOTAL_HALFMOVES,
     THREEFOLD_LIMIT,
     Outcome,
     apply_action,
@@ -44,7 +45,7 @@ from morris_rl.env.rules import (
     pieces_on_board,
     random_late_game_state,
 )
-from morris_rl.env.board import ACTION_SPACE_SIZE, MILLS
+from morris_rl.env.board import ACTION_SPACE_SIZE, MILLS, NUM_POSITIONS
 from morris_rl.network.resnet import MorrisResNet
 from morris_rl.training.replay_buffer import SampleRecord
 
@@ -248,6 +249,7 @@ def _play_game(
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
     discard_timeout_games: bool = False,
+    game_fns: dict | None = None,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data.
 
@@ -258,8 +260,21 @@ def _play_game(
 
     When ``curriculum_config.enabled``, the game starts from a random
     late-game position with probability ``random_start_fraction``.
+
+    ``game_fns`` overrides the Morris-specific functions for alternate games.
+    Recognised keys: ``initial_state``, ``is_terminal``, ``get_legal_actions``,
+    ``apply_action``, ``encode_state``, ``random_late_game_state``.
     """
-    from morris_rl.mcts.search import encode_state  # cached after worker import
+    _fns = game_fns or {}
+    _initial_state = _fns.get("initial_state", initial_state)
+    _is_terminal = _fns.get("is_terminal", is_terminal)
+    _get_legal_actions = _fns.get("get_legal_actions", get_legal_actions)
+    _apply_action = _fns.get("apply_action", apply_action)
+    if "encode_state" in _fns and _fns["encode_state"] is not None:
+        _encode_state = _fns["encode_state"]
+    else:
+        from morris_rl.mcts.search import encode_state as _encode_state  # Morris default
+    _random_late_game = _fns.get("random_late_game_state", random_late_game_state)
 
     if rng is None:
         rng = np.random.default_rng()
@@ -270,20 +285,21 @@ def _play_game(
     if (
         curriculum_config is not None
         and curriculum_config.enabled
+        and _random_late_game is not None
         and rng.random() < curriculum_config.random_start_fraction
     ):
-        state = random_late_game_state(
+        state = _random_late_game(
             rng, pieces_per_player=curriculum_config.pieces_per_player
         )
         # If the helper exhausted retries it falls back to initial_state()
         # — detect that to avoid mis-attributing those games to curriculum.
-        if state.pieces_in_hand == (0, 0):
+        if getattr(state, "pieces_in_hand", None) == (0, 0):
             curriculum_start = True
             curriculum_pieces = curriculum_config.pieces_per_player
         else:
-            state = initial_state()
+            state = _initial_state()
     else:
-        state = initial_state()
+        state = _initial_state()
     steps: list[
         tuple[
             npt.NDArray[np.float32],
@@ -329,22 +345,27 @@ def _play_game(
     full_sim_moves = 0
     fast_sim_moves = 0
 
+    # Action-space size for the legal mask — taken from game_fns if provided,
+    # else falls back to the Morris constant from board.py.
+    _action_space_n = _fns.get("action_space_size", ACTION_SPACE_SIZE)
+
     while True:
-        done, _ = is_terminal(state)
+        done, _ = _is_terminal(state)
         if done:
             break
 
         temp = _temperature_for_move(move_count, temperature_threshold)
-        encoded = encode_state(state).squeeze(0).numpy().copy()
+        encoded = _encode_state(state).squeeze(0).numpy().copy()
         # Snapshot the legal mask BEFORE applying the chosen action — we want
         # the mask of the state the policy_target was computed for.
-        legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
-        legal_mask[get_legal_actions(state)] = True
+        legal_mask = np.zeros(_action_space_n, dtype=np.bool_)
+        legal_mask[_get_legal_actions(state)] = True
 
         # Resign signal: query the network's value estimate for the current
         # player at the root, BEFORE running MCTS. Cheap (one extra forward
         # per move) and avoids patching ctree to expose the post-search Q.
-        if resign_active and not state.must_capture:
+        # must_capture is Morris-specific; other games never trigger this branch.
+        if resign_active and not getattr(state, "must_capture", False):
             root_v = search.root_value(state)
             actor_now = state.current_player
             if root_v < resign_config.threshold:
@@ -368,11 +389,10 @@ def _play_game(
                     resigned_by_player = actor_now
                     break  # game ends here, value targets handled below
 
-        # Pick search instance for this ply. Forced captures use the full
-        # search regardless: there's typically only one legal action so the
-        # cost is trivial, and skipping these from the buffer would lose
-        # cheap-but-real training signal.
-        if cap_active and not state.must_capture:
+        # Pick search instance for this ply. Forced captures (Morris-only) use
+        # the full search regardless; for other games must_capture is always
+        # False so the cap logic applies normally.
+        if cap_active and not getattr(state, "must_capture", False):
             is_full = rng.random() < playout_cap_config.full_sim_fraction
         else:
             is_full = True
@@ -387,15 +407,16 @@ def _play_game(
         )
 
         # Capture stats around the action: state.must_capture flips are the
-        # cleanest signal of mill / capture events.
-        was_must_capture = state.must_capture
+        # cleanest signal of mill / capture events (Morris-specific; zero-impact
+        # for other games since the attribute is absent).
+        was_must_capture = getattr(state, "must_capture", False)
         actor = state.current_player
-        state = apply_action(state, action)
-        was_capture = was_must_capture and not state.must_capture
+        state = _apply_action(state, action)
+        was_capture = was_must_capture and not getattr(state, "must_capture", False)
 
         steps.append((encoded, visit_probs, actor, legal_mask, is_full))
 
-        if not was_must_capture and state.must_capture:
+        if not was_must_capture and getattr(state, "must_capture", False):
             # The just-played placement/move formed a mill (forced capture next).
             if actor == 1:
                 mills_p1 += 1
@@ -413,8 +434,8 @@ def _play_game(
         outcome = Outcome(opponent(resigned_by_player))
         term_reason = "resign"
     else:
-        _, outcome = is_terminal(state)
-        term_reason = _detect_term_reason(state, outcome)
+        _, outcome = _is_terminal(state)
+        term_reason = _detect_term_reason(state, outcome, get_legal_actions_fn=_get_legal_actions)
     final_pieces_p1 = pieces_on_board(state.board, 1)
     final_pieces_p2 = pieces_on_board(state.board, 2)
     final_pieces_diff = final_pieces_p1 - final_pieces_p2
@@ -450,18 +471,40 @@ def _play_game(
     )
 
 
-def _detect_term_reason(state: Any, outcome: Outcome | None) -> str:
-    """Identify why the game just terminated, mirroring is_terminal()'s order."""
-    # Threefold has highest priority in is_terminal(), so check it first.
-    if state.position_counts and max(state.position_counts.values()) >= THREEFOLD_LIMIT:
-        return "threefold"
-    if state.halfmove_clock >= MAX_HALFMOVES:
-        return "halfmove_cap"
-    player = state.current_player
-    if state.pieces_in_hand[player - 1] == 0:
-        if pieces_on_board(state.board, player) < 3:
+def _detect_term_reason(
+    state: Any,
+    outcome: Outcome | None,
+    get_legal_actions_fn=None,
+) -> str:
+    """Identify why the game just terminated, mirroring is_terminal()'s order.
+
+    ``get_legal_actions_fn`` allows callers to pass a game-specific function;
+    defaults to the Morris ``get_legal_actions`` import when omitted.
+    """
+    _legal = get_legal_actions_fn or get_legal_actions
+    # Reversi: detected by presence of pass_count attribute (not Morris).
+    pass_count = getattr(state, "pass_count", None)
+    if pass_count is not None:
+        import numpy as np
+        empty = int(np.sum(state.board == 0))
+        return "board_full" if empty == 0 else "double_pass"
+    # Morris: total halfmove cap → piece-count tiebreak (checked before threefold).
+    total = getattr(state, "total_halfmoves", 0)
+    if total >= MAX_TOTAL_HALFMOVES:
+        return "piece_count_tiebreak"
+    # Threefold repetition also resolved by piece-count tiebreak.
+    pos_counts = getattr(state, "position_counts", {})
+    if pos_counts and max(pos_counts.values()) >= THREEFOLD_LIMIT:
+        return "piece_count_tiebreak"
+    halfmove = getattr(state, "halfmove_clock", 0)
+    if halfmove >= MAX_HALFMOVES:
+        return "piece_count_tiebreak"
+    hand = getattr(state, "pieces_in_hand", None)
+    if hand is not None:
+        player = state.current_player
+        if hand[player - 1] == 0 and pieces_on_board(state.board, player) < 3:
             return "pieces_below_3"
-    if not get_legal_actions(state):
+    if not _legal(state):
         return "no_legal_moves"
     return "unknown"
 
@@ -479,6 +522,8 @@ def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
         policy_head_hidden=cfg["policy_head_hidden"],
         value_head_hidden=cfg["value_head_hidden"],
         value_head_type=cfg.get("value_head_type", "scalar"),
+        num_positions=cfg.get("num_positions", NUM_POSITIONS),
+        action_space_size=cfg.get("action_space_size", ACTION_SPACE_SIZE),
     )
 
 
@@ -530,6 +575,7 @@ def _worker_fn(
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
     discard_timeout_games: bool = False,
+    game_name: str = "morris",
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -555,6 +601,28 @@ def _worker_fn(
     finally:
         sys.stderr = _old_stderr
         _devnull.close()
+
+    # Build game-specific function table for the selected game.
+    if game_name == "reversi":
+        from morris_rl.env.reversi.rules import (
+            initial_state as _r_initial_state,
+            get_legal_actions as _r_get_legal_actions,
+            apply_action as _r_apply_action,
+            is_terminal as _r_is_terminal,
+        )
+        from morris_rl.env.reversi.encoding import encode_state as _r_encode_state
+        from morris_rl.env.reversi.board import ACTION_SPACE_SIZE as _r_action_space_size
+        _game_fns: dict = {
+            "initial_state": _r_initial_state,
+            "get_legal_actions": _r_get_legal_actions,
+            "apply_action": _r_apply_action,
+            "is_terminal": _r_is_terminal,
+            "encode_state": _r_encode_state,
+            "action_space_size": _r_action_space_size,
+            "random_late_game_state": None,
+        }
+    else:  # morris (default)
+        _game_fns = {}  # MorrisSearch and _play_game will use their Morris defaults
 
     # Each worker is one MCTS pipeline; using torch's default (= all CPU cores)
     # means N workers fight over N×cores threads. One thread per worker keeps the
@@ -585,6 +653,7 @@ def _worker_fn(
         num_simulations=num_simulations,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
+        game_fns=_game_fns,
     )
     # Build the fast-sim companion search only when the feature is on.
     # Two ctree instances cohabit fine; the second adds ~30 MB RSS.
@@ -596,6 +665,7 @@ def _worker_fn(
             num_simulations=playout_cap_config.fast_sim_count,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
+            game_fns=_game_fns,
         )
 
     import psutil
@@ -624,6 +694,7 @@ def _worker_fn(
                 playout_cap_config=playout_cap_config,
                 curriculum_config=curriculum_config,
                 discard_timeout_games=discard_timeout_games,
+                game_fns=_game_fns,
             )
             results_queue.put(game)
             games_played += 1
@@ -806,6 +877,7 @@ class SelfPlayManager:
         playout_cap_config: PlayoutCapConfig | None = None,
         curriculum_config: CurriculumConfig | None = None,
         discard_timeout_games: bool = False,
+        game_name: str = "morris",
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -829,6 +901,7 @@ class SelfPlayManager:
         self._playout_cap_config = playout_cap_config
         self._curriculum_config = curriculum_config
         self._discard_timeout_games = discard_timeout_games
+        self._game_name = game_name
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -932,6 +1005,7 @@ class SelfPlayManager:
                     self._playout_cap_config,
                     self._curriculum_config,
                     self._discard_timeout_games,
+                    self._game_name,
                 ),
                 daemon=True,
             )

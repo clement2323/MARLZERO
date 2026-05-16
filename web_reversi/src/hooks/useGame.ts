@@ -6,6 +6,30 @@ const PASS_ACTION = 64;
 
 const COL_LABELS = "abcdefgh";
 
+const DIRECTIONS: [number, number][] = [
+  [-1, -1], [-1, 0], [-1, 1],
+  [ 0, -1],          [ 0, 1],
+  [ 1, -1], [ 1, 0], [ 1, 1],
+];
+
+function computeFlips(board: number[], pos: number, player: number): number[] {
+  const opp = player === 1 ? 2 : 1;
+  const row = Math.floor(pos / 8);
+  const col = pos % 8;
+  const flips: number[] = [];
+  for (const [dr, dc] of DIRECTIONS) {
+    const line: number[] = [];
+    let r = row + dr, c = col + dc;
+    while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+      const p = r * 8 + c;
+      if (board[p] === opp) { line.push(p); r += dr; c += dc; }
+      else if (board[p] === player) { flips.push(...line); break; }
+      else break;
+    }
+  }
+  return flips;
+}
+
 function posLabel(pos: number): string {
   const row = Math.floor(pos / 8);
   const col = pos % 8;
@@ -98,12 +122,20 @@ export function useGame() {
           !resp.board_after.game_over &&
           resp.board_after.current_player === agentPlayer;
 
+        // Human has no legal moves after agent plays → auto-pass and let agent continue.
+        const humanMustPass =
+          !resp.board_after.game_over &&
+          !agentMustContinue &&
+          resp.board_after.legal_actions.length === 1 &&
+          resp.board_after.legal_actions[0] === PASS_ACTION;
+
         setGs((prev) => ({
           ...applyBoardState(prev, resp.board_after),
           actions: newActions,
           moveHistory: [
             ...prev.moveHistory,
             { player: agentPlayer, desc: resp.description },
+            ...(humanMustPass ? [{ player: humanPlayer, desc: "pass" }] : []),
           ],
           topMoves: resp.top_moves,
           valueEstimate: resp.value_estimate,
@@ -111,7 +143,7 @@ export function useGame() {
           agentName: resp.agent_name,
           status: resp.board_after.game_over
             ? "game_over"
-            : agentMustContinue
+            : agentMustContinue || humanMustPass
               ? "thinking"
               : "waiting_human",
           errorMsg: "",
@@ -119,6 +151,8 @@ export function useGame() {
         }));
         if (agentMustContinue) {
           setTimeout(() => callAgent(newActions, humanPlayer), 400);
+        } else if (humanMustPass) {
+          setTimeout(() => callAgent([...newActions, PASS_ACTION], humanPlayer), 400);
         }
       })
       .catch((err: unknown) => {
@@ -222,6 +256,27 @@ export function useGame() {
       });
   }, []);
 
+  // When it's the human's turn but they have no legal moves, auto-pass and hand
+  // control to the agent. This covers every entry point (after agent move,
+  // after human move, after game start) without duplicating logic in each path.
+  useEffect(() => {
+    if (
+      gs.status === "waiting_human" &&
+      !gs.gameOver &&
+      gs.legalActions.length === 1 &&
+      gs.legalActions[0] === PASS_ACTION
+    ) {
+      const passActions = [...gs.actions, PASS_ACTION];
+      setGs((prev) => ({
+        ...prev,
+        actions: passActions,
+        moveHistory: [...prev.moveHistory, { player: prev.humanPlayer, desc: "pass" }],
+        status: "thinking",
+      }));
+      setTimeout(() => callAgent(passActions, gs.humanPlayer), 300);
+    }
+  }, [gs.status, gs.legalActions, gs.actions, gs.humanPlayer, gs.gameOver, callAgent]);
+
   const setSelectedAgent = useCallback((agent: string) => {
     selectedAgentRef.current = agent;
     setGs((prev) => ({ ...prev, selectedAgent: agent }));
@@ -246,6 +301,9 @@ export function useGame() {
       const newActions = [...actions, pos];
       const newBoard = [...gs.board];
       newBoard[pos] = gs.currentPlayer;
+      for (const f of computeFlips(gs.board, pos, gs.currentPlayer)) {
+        newBoard[f] = gs.currentPlayer;
+      }
 
       setGs((prev) => ({
         ...prev,

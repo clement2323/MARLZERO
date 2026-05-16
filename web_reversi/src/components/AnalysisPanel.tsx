@@ -140,7 +140,7 @@ export default function AnalysisPanel({
       </div>
 
       {/* Eval bar */}
-      <div style={{ marginBottom: 20, display: "flex", justifyContent: "center" }}>
+      <div style={{ marginBottom: 20 }}>
         <EvalBar valueEstimate={valueEstimate} />
       </div>
 

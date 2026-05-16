@@ -144,6 +144,19 @@ METRIC_GLOSSARY: dict[str, str] = {
     "game/timeout_discard_rate":
         "Cumulative fraction of games discarded from the replay buffer (halfmove_cap, discard_timeout_games=true). "
         "Shows how much draw-attractor fuel is removed per game.",
+    "game/term_double_pass_rate":
+        "[Reversi] Fraction of games ending by double-pass (neither player can flip before board fills). "
+        "Target: < 15%. Above 50% = both sides playing poorly and passing.",
+    "game/term_board_full_rate":
+        "[Reversi] Fraction of games ending when all 64 squares are occupied — natural full-game completion. "
+        "Complement of double_pass_rate for decisive Reversi games.",
+    "game/final_pieces_diff_mean":
+        "Mean signed piece difference at game end (P1 − P2). "
+        "Positive = Black (P1) advantage. Negative = White (P2) advantage. Near 0 = balanced self-play.",
+    "game/term_piece_count_tiebreak_rate":
+        "[Morris] Fraction of games decided by piece-count tiebreak (100-halfmove total cap reached). "
+        "Should fall as the network learns to close games early. "
+        "Winner = player with more board pieces → more active mills → P1 fallback.",
 }
 
 _COLORS = {
@@ -687,11 +700,14 @@ _note(
 
 fig_term = go.Figure()
 tags_term = [
-    ("game/term_resign_rate",         "Resign",          _COLORS["resign"]),
-    ("game/term_pieces_below_3_rate", "Pieces < 3",      _COLORS["pieces"]),
-    ("game/term_no_legal_moves_rate", "Blockade",        _COLORS["no_legal"]),
-    ("game/term_halfmove_cap_rate",   "Timeout (300hm)", _COLORS["halfmove"]),
-    ("game/term_threefold_rate",      "Threefold",       _COLORS["threefold"]),
+    ("game/term_resign_rate",         "Resign",               _COLORS["resign"]),
+    ("game/term_pieces_below_3_rate", "Pieces < 3",           _COLORS["pieces"]),
+    ("game/term_no_legal_moves_rate", "Blockade",             _COLORS["no_legal"]),
+    ("game/term_halfmove_cap_rate",   "Timeout (300hm)",      _COLORS["halfmove"]),
+    ("game/term_threefold_rate",      "Threefold",            _COLORS["threefold"]),
+    ("game/term_double_pass_rate",         "Double-pass (Reversi)", "#4fc3f7"),
+    ("game/term_board_full_rate",          "Board full (Reversi)",  "#80cbc4"),
+    ("game/term_piece_count_tiebreak_rate","Piece-count tiebreak",  "#9c27b0"),
 ]
 for tag, name, color in tags_term:
     series = data.get(tag, [])
@@ -719,6 +735,65 @@ fig_term.update_layout(yaxis=dict(range=[0, 1]))
 st.plotly_chart(fig_term, use_container_width=True)
 
 st.markdown("---")
+
+# ---------------------------------------------------------------------------
+# Section 6b — Reversi / Othello breakdown (only rendered for Reversi runs)
+# ---------------------------------------------------------------------------
+
+_has_reversi = bool(data.get("game/term_double_pass_rate") or data.get("game/term_board_full_rate"))
+
+if _has_reversi:
+    st.markdown("### ♟ Reversi — Game Endings")
+    _note(
+        "Reversi games end either when the board is completely full (all 64 squares occupied) "
+        "or via a double-pass (neither player has a legal flip available before the board fills). "
+        "Double-pass rate ≈ 5–15% is typical. Above 50% signals poor play (both sides passing too early)."
+    )
+
+    col_rv1, col_rv2, col_rv3 = st.columns(3)
+
+    with col_rv1:
+        fig_dp = go.Figure()
+        _line(fig_dp, data, "game/term_double_pass_rate", "Double-pass (early end)", "#4fc3f7")
+        _line(fig_dp, data, "game/term_board_full_rate",  "Board full (natural end)", "#80cbc4")
+        _hline(fig_dp, 0.15, "#f0a030", "double-pass warn > 15%")
+        _layout(fig_dp, "Game ending reason", ylabel="fraction")
+        st.plotly_chart(fig_dp, use_container_width=True)
+
+    with col_rv2:
+        fig_pdiff = go.Figure()
+        _line(fig_pdiff, data, "game/final_pieces_diff_mean", "P1 − P2 pieces", "#f2c94c")
+        _hline(fig_pdiff, 0.0, "#888888", "balanced")
+        _layout(fig_pdiff, "Mean final piece difference (P1 − P2)", ylabel="pieces")
+        _note("Positive = Black wins by more pieces. Negative = White advantage. Near 0 = balanced.")
+        st.plotly_chart(fig_pdiff, use_container_width=True)
+
+    with col_rv3:
+        # KPI bar: current values
+        dp_now = _last(data, "game/term_double_pass_rate", float("nan"))
+        bf_now = _last(data, "game/term_board_full_rate",  float("nan"))
+        pd_now = _last(data, "game/final_pieces_diff_mean", float("nan"))
+        len_now = _last(data, "game/length_mean_window", float("nan"))
+
+        dp_color = "#52c07a" if dp_now < 0.15 else "#f0a030"
+        pd_color = "#4f8ef7" if abs(pd_now) < 3 else "#f0a030"
+
+        st.markdown(
+            f"<div style='background:#1a1f2e;padding:14px;border-radius:8px;margin-top:8px'>"
+            f"<p style='color:#888;font-size:0.8em;margin-bottom:8px'>CURRENT VALUES</p>"
+            f"<p style='color:{dp_color};font-size:1.3em;font-weight:bold'>{dp_now:.1%}</p>"
+            f"<p style='color:#aaa;font-size:0.8em;margin-top:-8px'>double-pass rate (target &lt; 15%)</p>"
+            f"<p style='color:#80cbc4;font-size:1.3em;font-weight:bold'>{bf_now:.1%}</p>"
+            f"<p style='color:#aaa;font-size:0.8em;margin-top:-8px'>board-full rate</p>"
+            f"<p style='color:{pd_color};font-size:1.3em;font-weight:bold'>{pd_now:+.2f}</p>"
+            f"<p style='color:#aaa;font-size:0.8em;margin-top:-8px'>mean final piece diff (P1 − P2)</p>"
+            f"<p style='color:#e0e0e0;font-size:1.3em;font-weight:bold'>{len_now:.1f}</p>"
+            f"<p style='color:#aaa;font-size:0.8em;margin-top:-8px'>mean game length (moves)</p>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
 
 # ---------------------------------------------------------------------------
 # Section 7 — Playout cap

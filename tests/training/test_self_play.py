@@ -168,8 +168,7 @@ def test_play_game_observability_fields_set(search: MorrisSearch) -> None:
     assert result.term_reason in {
         "pieces_below_3",
         "no_legal_moves",
-        "halfmove_cap",
-        "threefold",
+        "piece_count_tiebreak",
         "resign",
     }
 
@@ -327,7 +326,7 @@ def test_play_game_term_reason_threefold_under_repetition() -> None:
     )
     state.board[0] = state.board[1] = state.board[2] = 1
     state.board[5] = state.board[6] = state.board[7] = 2
-    assert _detect_term_reason(state, Outcome.DRAW) == "threefold"
+    assert _detect_term_reason(state, Outcome.DRAW) == "piece_count_tiebreak"
 
 
 # ---------------------------------------------------------------------------

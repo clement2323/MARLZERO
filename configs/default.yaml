@@ -23,6 +23,14 @@ network:
   # (KataGo-style). Categorical avoids lazy-mean collapse in draw-heavy games.
   # Incompatible across types: a checkpoint trained with one cannot load the other.
   value_head_type: scalar
+  # LoRA (Low-Rank Adaptation) for two-phase fine-tuning (placement → movement).
+  # Workflow: train trunk on placement, checkpoint, then:
+  #   python scripts/train.py network.lora_rank=8 training.resume=<ckpt>
+  # lora_rank=0 disables LoRA entirely. Set lora_rank>0 alongside
+  # freeze_trunk=true to train only the low-rank adapters.
+  lora_rank: 0        # 0 = disabled. Set to 8 for two-phase fine-tuning.
+  lora_alpha: 16.0    # Scaling factor: scale = lora_alpha / lora_rank.
+  freeze_trunk: false # Set true with lora_rank>0 to freeze base weights.
 
 input_encoding:
   num_planes: 7

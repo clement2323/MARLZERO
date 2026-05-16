@@ -50,6 +50,13 @@ def _resolve_device(device_str: str) -> torch.device:
 
 def _network_cfg_dict(cfg: DictConfig) -> dict:
     """Plain dict passed to worker processes (must be picklable)."""
+    game_name = cfg.get("game", "morris")
+    if game_name == "reversi":
+        from morris_rl.env.reversi.board import ACTION_SPACE_SIZE as _acs, NUM_POSITIONS as _np
+        num_positions, action_space_size = _np, _acs
+    else:
+        from morris_rl.env.board import ACTION_SPACE_SIZE as _acs, NUM_POSITIONS as _np
+        num_positions, action_space_size = _np, _acs
     return {
         "num_blocks": cfg.network.num_blocks,
         "num_channels": cfg.network.num_channels,
@@ -57,6 +64,8 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
         "policy_head_hidden": cfg.network.policy_head_hidden,
         "value_head_hidden": cfg.network.value_head_hidden,
         "value_head_type": cfg.network.get("value_head_type", "scalar"),
+        "num_positions": num_positions,
+        "action_space_size": action_space_size,
     }
 
 
@@ -85,7 +94,13 @@ def main(cfg: DictConfig) -> None:
     log_dir = run_dir / "tensorboard"
 
     # ---- Network ----
-    network = build_network(cfg)
+    _net_cfg = _network_cfg_dict(cfg)
+    network = build_network(
+        cfg,
+        num_planes=_net_cfg["num_planes"],
+        num_positions=_net_cfg["num_positions"],
+        action_space_size=_net_cfg["action_space_size"],
+    )
     network.to(device)
     logger.info(
         f"Network: ResNet{cfg.network.num_blocks}×{cfg.network.num_channels}, "
@@ -122,9 +137,32 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---- Replay buffer ----
+    _game_name = cfg.get("game", "morris")
+    _augment_fn = None
+    if _game_name == "reversi":
+        from morris_rl.env.reversi.symmetries import (
+            SYMMETRY_PERMUTATIONS as _R_PERMS,
+            transform_encoded_state as _r_enc,
+            transform_policy as _r_pol,
+        )
+        from morris_rl.training.replay_buffer import SampleRecord as _SR
+        def _augment_fn(sample: "_SR") -> "list[_SR]":  # type: ignore[misc]
+            return [
+                _SR(
+                    encoded_state=_r_enc(sample.encoded_state, p),
+                    policy_target=_r_pol(sample.policy_target, p),
+                    value_target=sample.value_target,
+                    legal_mask=_r_pol(sample.legal_mask, p),
+                )
+                for p in _R_PERMS[1:]
+            ]
     buffer = ReplayBuffer(
         capacity=cfg.training.replay_buffer_size,
         use_symmetry_augmentation=cfg.training.symmetry_augmentation,
+        num_planes=_net_cfg["num_planes"],
+        num_positions=_net_cfg["num_positions"],
+        action_space_size=_net_cfg["action_space_size"],
+        augment_fn=_augment_fn,
     )
 
     # Resume from checkpoint if requested. Pass the buffer so a sibling
@@ -132,6 +170,23 @@ def main(cfg: DictConfig) -> None:
     resume_path = cfg.training.get("resume", None)
     if resume_path:
         trainer.load(resume_path, buffer=buffer)
+
+    # LoRA adapters are applied AFTER loading the checkpoint so the base weights
+    # load cleanly (strict=True, no adapter keys in the saved state_dict).
+    # If freeze_trunk=true the optimizer is rebuilt so only lora_A / lora_B
+    # receive gradients.
+    lora_rank = int(cfg.network.get("lora_rank", 0))
+    if lora_rank > 0:
+        network.add_lora_adapters(
+            rank=lora_rank,
+            alpha=float(cfg.network.get("lora_alpha", 16.0)),
+        )
+        logger.info(f"LoRA adapters added (rank={lora_rank})")
+    if cfg.network.get("freeze_trunk", False):
+        network.freeze_trunk()
+        trainable = sum(p.numel() for p in network.parameters() if p.requires_grad)
+        logger.info(f"Trunk frozen — {trainable:,} trainable params (LoRA only)")
+        trainer.rebuild_optimizer()
 
     # ---- Self-play workers ----
     inference_mode = cfg.self_play.get("inference_mode", "per_worker_cpu")
@@ -194,6 +249,7 @@ def main(cfg: DictConfig) -> None:
         playout_cap_config=playout_cap_config,
         curriculum_config=curriculum_config,
         discard_timeout_games=bool(cfg.self_play.get("discard_timeout_games", False)),
+        game_name=cfg.get("game", "morris"),
     )
 
     logger.info(

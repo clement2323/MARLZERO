@@ -10,6 +10,7 @@ from morris_rl.env.board import NUM_PIECES_PER_PLAYER, NUM_PLACE_CAPTURE_ACTIONS
 from morris_rl.env.rules import (
     EMPTY,
     MAX_HALFMOVES,
+    MAX_TOTAL_HALFMOVES,
     PLAYER_1,
     PLAYER_2,
     GameState,
@@ -41,6 +42,7 @@ def _make_state(
     p2_hand: int = 0,
     must_capture: bool = False,
     halfmove_clock: int = 0,
+    total_halfmoves: int = 0,
 ) -> GameState:
     """Construct a GameState directly for testing edge cases."""
     arr = np.array(board, dtype=np.int8)
@@ -50,6 +52,7 @@ def _make_state(
         pieces_in_hand=(p1_hand, p2_hand),
         must_capture=must_capture,
         halfmove_clock=halfmove_clock,
+        total_halfmoves=total_halfmoves,
     )
     return state
 
@@ -364,7 +367,9 @@ def test_game_continues_with_legal_moves() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_draw_halfmove_clock_at_limit() -> None:
+def test_halfmove_clock_at_limit_decisive() -> None:
+    # Reaching MAX_HALFMOVES no-progress clock now returns a decisive outcome
+    # (piece-count tiebreak), never DRAW.
     board = [0] * NUM_POSITIONS
     board[0] = board[2] = board[4] = PLAYER_1
     board[8] = board[10] = board[12] = PLAYER_2
@@ -373,13 +378,13 @@ def test_draw_halfmove_clock_at_limit() -> None:
     )
     done, outcome = is_terminal(state)
     assert done
-    assert outcome == Outcome.DRAW
+    assert outcome != Outcome.DRAW
+    assert outcome in (Outcome.PLAYER_1_WINS, Outcome.PLAYER_2_WINS)
 
 
-def test_draw_threefold_repetition() -> None:
-    # P1 bounces 0↔1, P2 bounces 10↔11.  One full round-trip restores the
-    # same (board, player) position.  The starting position is NOT pre-registered
-    # in _make_state, so we need THREEFOLD_LIMIT full round-trips to trigger draw.
+def test_threefold_repetition_decisive() -> None:
+    # Threefold repetition now resolves via piece-count tiebreak, not DRAW.
+    # Use total_halfmoves < MAX_TOTAL_HALFMOVES so the total cap doesn't fire first.
     from morris_rl.env.rules import THREEFOLD_LIMIT
 
     board = [0] * NUM_POSITIONS
@@ -387,13 +392,75 @@ def test_draw_threefold_repetition() -> None:
     board[8] = board[10] = board[12] = PLAYER_2
     s = _make_state(board, current_player=PLAYER_1, p1_hand=0, p2_hand=0)
     for _ in range(THREEFOLD_LIMIT):
-        s = apply_action(s, _encode_move(0, 1))   # P1: 0→1
+        s = apply_action(s, _encode_move(0, 1))    # P1: 0→1
         s = apply_action(s, _encode_move(10, 11))  # P2: 10→11
         s = apply_action(s, _encode_move(1, 0))    # P1: 1→0
         s = apply_action(s, _encode_move(11, 10))  # P2: 11→10  ← original pos
     done, outcome = is_terminal(s)
     assert done
-    assert outcome == Outcome.DRAW
+    assert outcome != Outcome.DRAW
+    assert outcome in (Outcome.PLAYER_1_WINS, Outcome.PLAYER_2_WINS)
+
+
+def test_total_halfmoves_counter_increments() -> None:
+    """total_halfmoves increments on every apply_action call."""
+    state = initial_state()
+    assert state.total_halfmoves == 0
+    # Placement action
+    state2 = apply_action(state, 0)
+    assert state2.total_halfmoves == 1
+    # Another placement
+    state3 = apply_action(state2, 1)
+    assert state3.total_halfmoves == 2
+
+
+def test_piece_count_tiebreak_at_cap() -> None:
+    """At total_halfmoves == MAX_TOTAL_HALFMOVES, winner is determined by board pieces."""
+    board = [0] * NUM_POSITIONS
+    board[0] = board[2] = board[4] = board[6] = PLAYER_1   # 4 pieces
+    board[8] = board[10] = board[12] = PLAYER_2              # 3 pieces
+    state = _make_state(
+        board, p1_hand=0, p2_hand=0, total_halfmoves=MAX_TOTAL_HALFMOVES
+    )
+    done, outcome = is_terminal(state)
+    assert done
+    assert outcome == Outcome.PLAYER_1_WINS   # P1 has more board pieces
+
+
+def test_piece_count_tiebreak_p2_wins() -> None:
+    """Piece-count tiebreak gives win to P2 when P2 has more pieces."""
+    board = [0] * NUM_POSITIONS
+    board[0] = board[2] = PLAYER_1                           # 2 pieces
+    board[8] = board[10] = board[12] = board[14] = PLAYER_2  # 4 pieces
+    state = _make_state(
+        board, p1_hand=0, p2_hand=0, total_halfmoves=MAX_TOTAL_HALFMOVES
+    )
+    done, outcome = is_terminal(state)
+    assert done
+    assert outcome == Outcome.PLAYER_2_WINS
+
+
+def test_piece_count_tiebreak_mill_fallback() -> None:
+    """Equal board pieces → player with more active mills wins."""
+    from morris_rl.env.board import MILLS
+    # Use first mill for P1, leave P2 with no mills but same piece count.
+    mill = MILLS[0]  # e.g. (0, 1, 2)
+    board = [0] * NUM_POSITIONS
+    for pos in mill:
+        board[pos] = PLAYER_1  # P1 has a mill
+    # P2 gets same count of pieces but no mill
+    occupied = set(mill)
+    p2_count = 0
+    for pos in range(NUM_POSITIONS):
+        if pos not in occupied and p2_count < len(mill):
+            board[pos] = PLAYER_2
+            p2_count += 1
+    state = _make_state(
+        board, p1_hand=0, p2_hand=0, total_halfmoves=MAX_TOTAL_HALFMOVES
+    )
+    done, outcome = is_terminal(state)
+    assert done
+    assert outcome == Outcome.PLAYER_1_WINS  # same pieces, P1 has a mill
 
 
 # ---------------------------------------------------------------------------
@@ -419,17 +486,15 @@ def test_apply_action_does_not_mutate_input() -> None:
 def _play_random_game(seed: int) -> None:
     rng = random.Random(seed)
     state = initial_state()
-    # Safety cap must clear MAX_HALFMOVES + room for the threefold-repetition
-    # detector to fire (THREEFOLD_LIMIT × cycle length). At 300/10 a random
-    # game of dozens of replays can stretch past 1000 plies before terminating.
-    for _ in range(3000):
+    # With MAX_TOTAL_HALFMOVES=100, no game can last longer than 100 halfmoves.
+    for _ in range(200):
         done, _ = is_terminal(state)
         if done:
             return
         actions = get_legal_actions(state)
         assert actions, "Non-terminal state has no legal actions"
         state = apply_action(state, rng.choice(actions))
-    raise AssertionError("Game did not terminate within 3000 moves")
+    raise AssertionError("Game did not terminate within 200 moves")
 
 
 def test_random_games_1000() -> None:

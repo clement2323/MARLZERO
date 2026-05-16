@@ -107,12 +107,17 @@ class MorrisSimEnv:
 
     battle_mode_in_simulation_env: str = "self_play_mode"
 
-    def __init__(self) -> None:
-        self._state: GameState = initial_state()
-        self._root_state: GameState | None = None  # set by MorrisSearch.run before each search
+    def __init__(self, game_fns: dict | None = None) -> None:
+        _fns = game_fns or {}
+        self._game_initial_state = _fns.get("initial_state", initial_state)
+        self._game_apply_action = _fns.get("apply_action", apply_action)
+        self._game_legal_actions = _fns.get("get_legal_actions", get_legal_actions)
+        self._game_is_terminal = _fns.get("is_terminal", is_terminal)
+        self._state = self._game_initial_state()
+        self._root_state = None  # set by MorrisSearch.run before each search
         self.battle_mode: str = "self_play_mode"
         self.render_mode: str | None = None
-        self.action_space = SimpleNamespace(n=ACTION_SPACE_SIZE)
+        self.action_space = SimpleNamespace(n=_fns.get("action_space_size", ACTION_SPACE_SIZE))
 
     def reset(
         self,
@@ -121,27 +126,26 @@ class MorrisSimEnv:
         katago_policy_init: bool = False,
         katago_game_state: object = None,
     ) -> None:
-        """Reset to the stored root state.
+        """Reset to init_state, _root_state, or initial_state() — first non-None wins.
 
-        The ctree backend converts init_state to bytes and passes 4 positional
-        args (including katago_* args used by LightZero's Go integration).
-        We ignore those extras and always restore from _root_state, which is
-        set by MorrisSearch.run before each search.
+        The ctree backend calls reset with init_state as bytes (LightZero Go
+        integration artifact) — those are ignored and _root_state takes over.
+        Direct callers (e.g. tests) pass a real GameState object.
         """
-        if self._root_state is not None:
-            self._state = self._root_state.copy()
-        elif isinstance(init_state, GameState):
+        if init_state is not None and not isinstance(init_state, bytes):
             self._state = init_state.copy()
+        elif self._root_state is not None:
+            self._state = self._root_state.copy()
         else:
-            self._state = initial_state()
+            self._state = self._game_initial_state()
 
     def step(self, action: int) -> None:
         """Advance the state by one action."""
-        self._state = apply_action(self._state, action)
+        self._state = self._game_apply_action(self._state, action)
 
     @property
     def legal_actions(self) -> list[int]:
-        return get_legal_actions(self._state)
+        return self._game_legal_actions(self._state)
 
     @property
     def current_player(self) -> int:
@@ -150,7 +154,7 @@ class MorrisSimEnv:
 
     def get_done_winner(self) -> tuple[bool, int]:
         """Return (done, winner) where winner is 1, 2, or -1 (draw/ongoing)."""
-        done, outcome = is_terminal(self._state)
+        done, outcome = self._game_is_terminal(self._state)
         if not done:
             return False, -1
         if outcome == Outcome.DRAW or outcome is None:
@@ -179,13 +183,27 @@ flavour from ``(network, device)``.
 """
 
 
-def _make_local_eval_fn(network: nn.Module, device: torch.device) -> EvalFn:
-    """Build an EvalFn that runs the given network in-process on *device*."""
+def _make_local_eval_fn(
+    network: nn.Module,
+    device: torch.device,
+    encode_fn=None,
+    get_legal_fn=None,
+    action_space_size: int | None = None,
+) -> EvalFn:
+    """Build an EvalFn that runs the given network in-process on *device*.
+
+    Optional overrides allow the same factory to serve non-Morris games without
+    touching the Morris defaults: pass encode_fn, get_legal_fn, and
+    action_space_size from the game's own module; omit them for Morris.
+    """
+    _encode = encode_fn or encode_state
+    _legal = get_legal_fn or get_legal_actions
+    _n = action_space_size or ACTION_SPACE_SIZE
 
     def evaluate(state: GameState) -> tuple[dict[int, float], float]:
-        legal = get_legal_actions(state)
-        x = encode_state(state).to(device)
-        mask = torch.zeros(1, ACTION_SPACE_SIZE, dtype=torch.bool, device=device)
+        legal = _legal(state)
+        x = _encode(state).to(device)
+        mask = torch.zeros(1, _n, dtype=torch.bool, device=device)
         for a in legal:
             mask[0, a] = True
 
@@ -233,20 +251,34 @@ class MorrisSearch:
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         eval_fn: EvalFn | None = None,
+        game_fns: dict | None = None,
     ) -> None:
         """Construct an MCTS search.
 
         Either provide ``(network, device)`` to run inference locally in-process,
         or provide ``eval_fn`` to delegate evaluation (e.g. to a centralized GPU
         inference server). Exactly one of the two must be supplied.
+
+        ``game_fns`` is an optional dict that overrides the Morris defaults for
+        any alternate game (e.g. Reversi). Recognised keys: ``initial_state``,
+        ``apply_action``, ``get_legal_actions``, ``is_terminal``,
+        ``encode_state``, ``action_space_size``.  Omit the dict (or pass None)
+        to keep the Morris defaults.
         """
         if eval_fn is None:
             if network is None or device is None:
                 raise ValueError(
                     "Provide either eval_fn, or both network and device."
                 )
-            eval_fn = _make_local_eval_fn(network, device)
-        self._sim_env = MorrisSimEnv()
+            _fns = game_fns or {}
+            eval_fn = _make_local_eval_fn(
+                network,
+                device,
+                encode_fn=_fns.get("encode_state"),
+                get_legal_fn=_fns.get("get_legal_actions"),
+                action_space_size=_fns.get("action_space_size"),
+            )
+        self._sim_env = MorrisSimEnv(game_fns)
         self._network = network
         self._device = device
         # Keep a direct reference to the raw eval_fn so callers can query the

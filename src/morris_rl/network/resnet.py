@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_POSITIONS
+from morris_rl.env.board import ACTION_SPACE_SIZE as _DEFAULT_ACTION_SPACE_SIZE
+from morris_rl.env.board import NUM_POSITIONS as _DEFAULT_NUM_POSITIONS
 from morris_rl.network.heads import CategoricalValueHead, PolicyHead, ValueHead
 
 
@@ -52,21 +53,60 @@ class MorrisResNet(nn.Module):
         policy_head_hidden: int,
         value_head_hidden: int,
         value_head_type: str = "scalar",
+        num_positions: int = _DEFAULT_NUM_POSITIONS,
+        action_space_size: int = _DEFAULT_ACTION_SPACE_SIZE,
     ) -> None:
         super().__init__()
         self.input_conv = nn.Conv1d(num_planes, num_channels, kernel_size=3, padding=1)
         self.input_bn = nn.BatchNorm1d(num_channels)
         self.trunk = nn.Sequential(*[ResidualBlock(num_channels) for _ in range(num_blocks)])
         self.policy_head = PolicyHead(
-            num_channels, NUM_POSITIONS, ACTION_SPACE_SIZE, policy_head_hidden
+            num_channels, num_positions, action_space_size, policy_head_hidden
         )
         self._value_head_type = value_head_type
         if value_head_type == "categorical":
             self.value_head: ValueHead | CategoricalValueHead = CategoricalValueHead(
-                num_channels, NUM_POSITIONS, value_head_hidden
+                num_channels, num_positions, value_head_hidden
             )
         else:
-            self.value_head = ValueHead(num_channels, NUM_POSITIONS, value_head_hidden)
+            self.value_head = ValueHead(num_channels, num_positions, value_head_hidden)
+
+    def add_lora_adapters(self, rank: int = 8, alpha: float = 16.0) -> None:
+        """Replace all Linear layers with LoRALinear adapters.
+
+        Call this AFTER loading a checkpoint and BEFORE freeze_trunk().
+        The base network weights are preserved and frozen inside each
+        LoRALinear; only the low-rank A and B matrices will be trained.
+
+        Args:
+            rank:  Bottleneck dimension of each low-rank update.
+            alpha: LoRA scaling factor (scale = alpha / rank).
+        """
+        from morris_rl.network.lora import LoRALinear
+
+        for name, module in list(self.named_modules()):
+            if not isinstance(module, nn.Linear):
+                continue
+            # Navigate to the parent module so we can replace the attribute.
+            parts = name.split(".")
+            parent = self
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            attr = parts[-1]
+            setattr(parent, attr, LoRALinear(module, rank=rank, alpha=alpha))
+
+    def freeze_trunk(self) -> None:
+        """Freeze all parameters that are not LoRA adapter weights.
+
+        After this call, only lora_A and lora_B parameters will have
+        requires_grad=True. The Trainer's optimizer must be (re-)created
+        afterward so it only iterates over the trainable parameters —
+        passing ``filter(lambda p: p.requires_grad, network.parameters())``
+        is sufficient (already the default in Trainer.__init__).
+        """
+        for name, param in self.named_parameters():
+            if "lora_A" not in name and "lora_B" not in name:
+                param.requires_grad_(False)
 
     def forward(
         self,

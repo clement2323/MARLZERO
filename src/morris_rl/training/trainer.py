@@ -175,11 +175,18 @@ class Trainer:
         self._config: dict[str, Any] = config or {}
         self._value_head_type = value_head_type
         self._step = 0
+        self._learning_rate = learning_rate
+        self._weight_decay = weight_decay
+        self._lr_decay_steps = lr_decay_steps
         # Optional buffer ref so _auto_checkpoint can persist it alongside weights.
         self._buffer: ReplayBuffer | None = None
 
+        # Filter to requires_grad=True params so the optimizer is automatically
+        # limited to LoRA adapters when freeze_trunk() has been called before
+        # creating the Trainer. When the trunk is not frozen this is equivalent
+        # to network.parameters() — fully backward-compatible.
         self._optimizer = torch.optim.Adam(
-            network.parameters(),
+            filter(lambda p: p.requires_grad, network.parameters()),
             lr=learning_rate,
             weight_decay=weight_decay,
         )
@@ -219,6 +226,25 @@ class Trainer:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"MLflow disabled: {type(exc).__name__}: {exc}")
                 self._mlflow_active = False
+
+    def rebuild_optimizer(self) -> None:
+        """Rebuild the Adam optimizer to cover only currently-trainable parameters.
+
+        Call this after ``network.freeze_trunk()`` so that LoRA adapters (and
+        only those) appear in the parameter group. The current learning rate is
+        carried over from the previous optimizer; scheduler resets to step 0.
+        """
+        lr = self._optimizer.param_groups[0]["lr"]
+        self._optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self._network.parameters()),
+            lr=lr,
+            weight_decay=self._weight_decay,
+        )
+        self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self._optimizer,
+            T_max=self._lr_decay_steps,
+            eta_min=lr * 1e-2,
+        )
 
     # ------------------------------------------------------------------
     # Core training step
@@ -538,6 +564,17 @@ class Trainer:
         self._network.load_state_dict(payload["state_dict"])
         self._step = payload["step"]
         logger.info(f"Resumed from {path} at step {self._step}")
+        if "optimizer" in payload:
+            try:
+                self._optimizer.load_state_dict(payload["optimizer"])
+            except (ValueError, KeyError):
+                # Optimizer state is incompatible with current parameter set
+                # — most likely because LoRA adapters were added after the
+                # checkpoint was created. Start with a fresh optimizer state.
+                logger.warning(
+                    "Optimizer state incompatible with current parameters "
+                    "(LoRA adapters added?). Starting with fresh optimizer state."
+                )
         if buffer is not None:
             checkpoint_path = Path(path)
             buffer_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".buffer.npz")
@@ -644,6 +681,9 @@ class Trainer:
             ),
             "game/term_threefold_rate": term_window.count("threefold") / n_recent,
             "game/term_resign_rate": term_window.count("resign") / n_recent,
+            "game/term_double_pass_rate": term_window.count("double_pass") / n_recent,
+            "game/term_board_full_rate": term_window.count("board_full") / n_recent,
+            "game/term_piece_count_tiebreak_rate": term_window.count("piece_count_tiebreak") / n_recent,
         }
         for tag, value in stats.items():
             if self._writer is not None:
