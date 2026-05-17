@@ -140,8 +140,12 @@ def compute_loss(
     contrib = torch.where(policy_target > 0, contrib, torch.zeros_like(contrib))
     policy_loss = -contrib.sum(dim=1).mean()
     if value_logits is not None:
-        # Map {+1→0 (win), 0→1 (draw), -1→2 (loss)} to class indices.
-        value_loss = F.cross_entropy(value_logits, (1.0 - value_target).long())
+        # Map continuous target ∈ [-1, +1] → 3-class index {0=win, 1=draw, 2=loss}.
+        # round() (not truncation) is critical when targets come from the hybrid
+        # value blend: a loss with margin tanh blends to ~-0.97, and (1-(-0.97))
+        # = 1.97 truncates to 1 (draw) but rounds to 2 (loss).
+        target_class = torch.round(1.0 - value_target).long().clamp(0, 2)
+        value_loss = F.cross_entropy(value_logits, target_class)
     else:
         value_loss = F.mse_loss(value, value_target)
 

@@ -740,8 +740,14 @@ def _worker_fn(
         # Aux head targets are Morris-specific (mill_diff, pieces_diff). Wire
         # the helper here so _play_game can compute them per ply. For other
         # games this stays unset → NaN aux targets → aux loss masked out.
-        from morris_rl.env.rules import compute_aux_features as _morris_aux
-        _game_fns = {"compute_aux_features": _morris_aux}
+        from morris_rl.env.rules import (
+            compute_aux_features as _morris_aux,
+            get_legal_actions_no_rep as _morris_legal_no_rep,
+        )
+        _game_fns = {
+            "compute_aux_features": _morris_aux,
+            "get_legal_actions_no_rep": _morris_legal_no_rep,
+        }
 
     # Each worker is one MCTS pipeline; using torch's default (= all CPU cores)
     # means N workers fight over N×cores threads. One thread per worker keeps the
@@ -873,7 +879,7 @@ def _worker_fn_remote(
     _devnull = open(os.devnull, "w")
     sys.stderr = _devnull
     try:
-        from morris_rl.env.rules import get_legal_actions
+        from morris_rl.env.rules import get_legal_actions, get_legal_actions_no_rep
         from morris_rl.mcts.search import MorrisSearch, encode_state
         from morris_rl.training.inference_server import make_remote_eval_fn
     finally:
@@ -902,6 +908,7 @@ def _worker_fn_remote(
         num_workers=num_workers,
         encode_state=encode_state,
         get_legal_actions=get_legal_actions,
+        get_legal_actions_no_rep=get_legal_actions_no_rep,
     )
     search = MorrisSearch(
         eval_fn=eval_fn,

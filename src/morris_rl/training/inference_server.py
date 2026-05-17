@@ -297,6 +297,13 @@ class GraphedForward:
         for i, legal in enumerate(legal_actions_per_req):
             if legal:
                 host_mask_view[i, list(legal)] = True
+            else:
+                # Terminal state slipped past MCTS: an all-False mask makes
+                # masked log_softmax NaN. Release the constraint — the worker
+                # iterates only over its own (empty) legal list, so the bogus
+                # probs are never read; we just need the row to stay finite
+                # to avoid poisoning the rest of the batch.
+                host_mask_view[i, :] = True
 
         static_s = self._static_states[bucket]
         static_m = self._static_mask[bucket]
@@ -460,6 +467,10 @@ def _server_loop(
                     for i, req in enumerate(batch):
                         if req.legal_actions:
                             mask[i, list(req.legal_actions)] = True
+                        else:
+                            # Same defensive fallback as the CUDA-graph path:
+                            # all-False rows make masked log_softmax NaN.
+                            mask[i, :] = True
                     with torch.no_grad():
                         log_policy, value = network(states_t, mask)
                     probs = log_policy.exp().cpu().numpy()
@@ -521,6 +532,7 @@ def make_remote_eval_fn(
     num_workers: int,
     encode_state: Any,
     get_legal_actions: Any,
+    get_legal_actions_no_rep: Any = None,
     request_timeout_s: float = 60.0,
 ) -> Any:
     """Build an EvalFn that round-trips through the inference server.
@@ -540,6 +552,13 @@ def make_remote_eval_fn(
         # points to freed memory (silent SIGSEGV in daemon worker).
         _ = handles
         legal = get_legal_actions(state)
+        if not legal and get_legal_actions_no_rep is not None:
+            # Empty set means every movement candidate matched a recent position
+            # (no-rep window). Fall back to rule-legal moves only — i.e. release
+            # the repetition filter, not the rule-level legality. The state is
+            # still terminal per is_terminal (piece-count tie-break) but MCTS
+            # may visit it transiently and needs a non-empty prior support.
+            legal = get_legal_actions_no_rep(state)
         encoded = encode_state(state).squeeze(0).numpy()
         np.copyto(request_states[worker_id], encoded.astype(np.float32, copy=False))
         counter["n"] += 1

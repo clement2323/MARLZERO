@@ -215,6 +215,24 @@ def random_late_game_state(
     return initial_state()
 
 
+def get_legal_actions_no_rep(state: GameState) -> list[int]:
+    """Like ``get_legal_actions`` but WITHOUT the no-repetition filter.
+
+    Used as a fallback by the MCTS leaf evaluator when ``get_legal_actions``
+    returns an empty list purely because every movement candidate matches a
+    recent position in the sliding window. The state is still terminal per
+    ``is_terminal`` (resolved via piece-count tie-break), but MCTS may visit
+    it during simulation and we need a non-empty action set so the masked
+    log-softmax stays finite. Rule-level illegal moves remain excluded.
+    """
+    if state.must_capture:
+        return _legal_capture_actions(state)
+    phase = get_phase(state, state.current_player)
+    if phase == Phase.PLACING:
+        return [p for p in range(NUM_POSITIONS) if state.board[p] == EMPTY]
+    return _legal_move_actions(state)
+
+
 def get_legal_actions(state: GameState) -> list[int]:
     """Return all legal action indices for the current state.
 
@@ -267,7 +285,12 @@ def get_legal_actions(state: GameState) -> list[int]:
         board[dst] = original_dst
         if key_bytes not in recent_bytes:
             legal.append(a)
-    return legal
+    # Rep-filter saturation: every rule-legal move would repeat a recent
+    # position. Fall back to the unfiltered set so the action space is never
+    # empty on a non-rule-terminal state. is_terminal already resolves the
+    # actual draw-by-repetition path via piece_count_winner; MCTS visiting
+    # such a state transiently needs a non-empty prior support.
+    return legal if legal else candidates
 
 
 def apply_action(state: GameState, action: int) -> GameState:
