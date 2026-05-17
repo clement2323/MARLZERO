@@ -95,25 +95,45 @@ _GAME_LENGTH_WINDOW = 200
 # ---------------------------------------------------------------------------
 
 
+def _masked_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """MSE that ignores NaN entries in target. Returns 0 when no valid samples."""
+    valid = ~torch.isnan(target)
+    if not valid.any():
+        return pred.sum() * 0.0  # preserves device/dtype with zero grad
+    diff = (pred[valid] - target[valid]) ** 2
+    return diff.mean()
+
+
 def compute_loss(
     log_policy: torch.Tensor,
     value: torch.Tensor,
     policy_target: torch.Tensor,
     value_target: torch.Tensor,
     value_logits: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute AlphaZero combined loss.
+    mill_diff_pred: torch.Tensor | None = None,
+    pieces_diff_pred: torch.Tensor | None = None,
+    mill_diff_target: torch.Tensor | None = None,
+    pieces_diff_target: torch.Tensor | None = None,
+    aux_weight_mill: float = 0.0,
+    aux_weight_pieces: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute AlphaZero combined loss with optional KataGo-style aux heads.
 
     Args:
         log_policy:    (batch, ACTION_SPACE_SIZE) log-probabilities from network.
-        value:         (batch,) scalar value predictions (used for logging).
+        value:         (batch,) scalar value predictions.
         policy_target: (batch, ACTION_SPACE_SIZE) MCTS visit distribution.
         value_target:  (batch,) game outcomes in {-1, 0, +1}.
-        value_logits:  (batch, 3) raw logits from categorical value head, or None.
-                       When provided, cross-entropy replaces MSE for value loss.
+        value_logits:  (batch, 3) categorical logits, or None for scalar head.
+        mill_diff_pred, pieces_diff_pred: (batch,) aux head outputs, or None.
+        mill_diff_target, pieces_diff_target: (batch,) signed targets; NaN
+            entries are masked out so samples lacking aux supervision still
+            contribute to policy/value losses.
+        aux_weight_mill, aux_weight_pieces: scalar λ weights. 0 disables.
 
     Returns:
-        Tuple of (total_loss, policy_loss, value_loss).
+        (total_loss, policy_loss, value_loss, mill_loss, pieces_loss).
+        Aux losses are 0 tensors when the respective head/target is missing.
     """
     # 0 × -inf = NaN when policy_target=0 on masked actions — zero out explicitly.
     contrib = policy_target * log_policy
@@ -124,7 +144,19 @@ def compute_loss(
         value_loss = F.cross_entropy(value_logits, (1.0 - value_target).long())
     else:
         value_loss = F.mse_loss(value, value_target)
-    return policy_loss + value_loss, policy_loss, value_loss
+
+    zero = value_loss.detach() * 0.0  # device/dtype-correct zero
+    if mill_diff_pred is not None and mill_diff_target is not None and aux_weight_mill > 0:
+        mill_loss = _masked_mse(mill_diff_pred, mill_diff_target)
+    else:
+        mill_loss = zero
+    if pieces_diff_pred is not None and pieces_diff_target is not None and aux_weight_pieces > 0:
+        pieces_loss = _masked_mse(pieces_diff_pred, pieces_diff_target)
+    else:
+        pieces_loss = zero
+
+    total = policy_loss + value_loss + aux_weight_mill * mill_loss + aux_weight_pieces * pieces_loss
+    return total, policy_loss, value_loss, mill_loss, pieces_loss
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +198,9 @@ class Trainer:
         mlflow_uri: str | None = None,
         mlflow_experiment: str = "morris-az",
         mlflow_run_name: str | None = None,
+        aux_heads_enabled: bool = False,
+        aux_weight_mill: float = 0.0,
+        aux_weight_pieces: float = 0.0,
     ) -> None:
         self._network = network.to(device)
         self._device = device
@@ -174,6 +209,9 @@ class Trainer:
         self._checkpoint_interval = checkpoint_interval
         self._config: dict[str, Any] = config or {}
         self._value_head_type = value_head_type
+        self._aux_heads_enabled = aux_heads_enabled
+        self._aux_weight_mill = float(aux_weight_mill)
+        self._aux_weight_pieces = float(aux_weight_pieces)
         self._step = 0
         self._learning_rate = learning_rate
         self._weight_decay = weight_decay
@@ -261,24 +299,46 @@ class Trainer:
             Dict with keys ``total_loss``, ``policy_loss``, ``value_loss``,
             ``learning_rate``, ``grad_norm``, ``value_mean``, ``value_std``.
         """
-        states, policy_targets, value_targets, legal_masks = (
+        states, policy_targets, value_targets, legal_masks, mill_targets, pieces_targets = (
             buffer.sample(batch_size, device=self._device)
         )
 
         self._optimizer.zero_grad()
         categorical = self._value_head_type == "categorical"
+        aux = self._aux_heads_enabled
 
         with torch.autocast(device_type=self._device.type, enabled=self._amp_enabled):
-            if categorical:
+            if categorical and aux:
+                log_policy, value, value_logits, mill_pred, pieces_pred = self._network(
+                    states, legal_masks, return_value_logits=True, return_aux=True
+                )
+            elif categorical:
                 log_policy, value, value_logits = self._network(
                     states, legal_masks, return_value_logits=True
                 )
+                mill_pred = pieces_pred = None
+            elif aux:
+                log_policy, value, mill_pred, pieces_pred = self._network(
+                    states, legal_masks, return_aux=True
+                )
+                value_logits = None
             else:
                 log_policy, value = self._network(states, legal_masks)
                 value_logits = None
+                mill_pred = pieces_pred = None
 
-            total_loss, policy_loss, value_loss = compute_loss(
-                log_policy, value, policy_targets, value_targets, value_logits
+            total_loss, policy_loss, value_loss, mill_loss, pieces_loss = compute_loss(
+                log_policy,
+                value,
+                policy_targets,
+                value_targets,
+                value_logits,
+                mill_diff_pred=mill_pred,
+                pieces_diff_pred=pieces_pred,
+                mill_diff_target=mill_targets if aux else None,
+                pieces_diff_target=pieces_targets if aux else None,
+                aux_weight_mill=self._aux_weight_mill,
+                aux_weight_pieces=self._aux_weight_pieces,
             )
 
         value_mean = float(value.detach().float().mean().item())
@@ -296,6 +356,8 @@ class Trainer:
             "total_loss": float(total_loss.item()),
             "policy_loss": float(policy_loss.item()),
             "value_loss": float(value_loss.item()),
+            "mill_loss": float(mill_loss.item()),
+            "pieces_loss": float(pieces_loss.item()),
             "learning_rate": float(self._scheduler.get_last_lr()[0]),
             "grad_norm": float(grad_norm),
             "value_mean": value_mean,
@@ -561,7 +623,16 @@ class Trainer:
         without re-warming up.
         """
         payload = load_checkpoint(path)
-        self._network.load_state_dict(payload["state_dict"])
+        # strict=False so a checkpoint without aux heads can be loaded when
+        # aux heads are now enabled — the new aux heads start randomly
+        # initialised and learn from scratch over the next few thousand steps.
+        missing, unexpected = self._network.load_state_dict(
+            payload["state_dict"], strict=False
+        )
+        if missing:
+            logger.info(f"Checkpoint missing {len(missing)} params (e.g. {missing[:2]}) — random init.")
+        if unexpected:
+            logger.warning(f"Checkpoint has {len(unexpected)} unexpected params (e.g. {unexpected[:2]}).")
         self._step = payload["step"]
         logger.info(f"Resumed from {path} at step {self._step}")
         if "optimizer" in payload:

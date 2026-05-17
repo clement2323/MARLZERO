@@ -141,6 +141,8 @@ def _build_server_network(network_cfg: dict[str, Any]) -> MorrisResNet:
         policy_head_hidden=network_cfg["policy_head_hidden"],
         value_head_hidden=network_cfg["value_head_hidden"],
         value_head_type=network_cfg.get("value_head_type", "scalar"),
+        aux_heads_enabled=bool(network_cfg.get("aux_heads_enabled", False)),
+        aux_head_hidden=int(network_cfg.get("aux_head_hidden", 64)),
     )
 
 

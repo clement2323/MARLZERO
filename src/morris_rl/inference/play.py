@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_PLACE_CAPTURE_ACTIONS, NUM_POSITIONS
+from morris_rl.env.board import ACTION_SPACE_SIZE, MOVE_EDGES, NUM_PLACE_CAPTURE_ACTIONS
 from morris_rl.env.rules import (
     GameState,
     apply_action,
@@ -55,7 +55,7 @@ def describe_action(action: int, must_capture: bool) -> str:
         if must_capture:
             return f"Capture {label}"
         return f"Place at {label}"
-    src, dst = divmod(action - NUM_PLACE_CAPTURE_ACTIONS, NUM_POSITIONS)
+    src, dst = MOVE_EDGES[action - NUM_PLACE_CAPTURE_ACTIONS]
     return f"Move {POSITION_LABELS[src]} → {POSITION_LABELS[dst]}"
 
 

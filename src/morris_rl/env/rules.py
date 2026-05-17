@@ -19,8 +19,10 @@ import numpy as np
 
 from morris_rl.env.board import (
     ADJACENCY,
+    EDGE_INDEX,
     MILLS,
     MILLS_BY_POSITION,
+    MOVE_EDGES,
     NUM_PIECES_PER_PLAYER,
     NUM_PLACE_CAPTURE_ACTIONS,
     NUM_POSITIONS,
@@ -30,9 +32,19 @@ PLAYER_1: Final[int] = 1
 PLAYER_2: Final[int] = 2
 EMPTY: Final[int] = 0
 
-MAX_HALFMOVES: Final[int] = 300       # no-progress clock (dead-code when total cap active)
-MAX_TOTAL_HALFMOVES: Final[int] = 100  # absolute game length cap — piece count breaks ties
-THREEFOLD_LIMIT: Final[int] = 10
+MAX_HALFMOVES: Final[int] = 300        # no-progress clock (dead-code when total cap active)
+MAX_TOTAL_HALFMOVES: Final[int] = 200  # absolute game length cap — piece count breaks ties
+# Raised from 60 → 200 so more games reach natural termination (≤2 pieces or
+# no_legal_moves) instead of being decided by an artificial piece-count tiebreak.
+# Cleaner value targets at the cost of longer self-play games.
+THREEFOLD_LIMIT: Final[int] = 3
+# Sliding window for the no-repetition rule. A candidate action is illegal if
+# its resulting position_key matches any position visited within the last
+# REPETITION_WINDOW halfmoves. Eliminates ping-pong A↔B↔A cycles (period 2
+# halfmoves) and longer tactical loops up to ~half the window depth.
+# Game-changing relative to standard Morris: a player with no non-repeating
+# move loses by no_legal_moves rather than drawing by repetition.
+REPETITION_WINDOW: Final[int] = 8
 
 
 class Phase(IntEnum):
@@ -59,6 +71,11 @@ class GameState:
     halfmove_clock: int  # resets on placement or capture; kept for legacy metrics
     total_halfmoves: int = 0  # absolute game length — never reset; cap at MAX_TOTAL_HALFMOVES
     position_counts: dict[tuple[int, ...], int] = field(default_factory=dict)
+    # Sliding window of the last REPETITION_WINDOW position keys. Used by
+    # get_legal_actions to forbid candidates whose resulting position matches
+    # any recent one — prevents short tactical cycles (ping-pong moves).
+    # Tuple (not deque) so GameState stays trivially picklable for mp workers.
+    recent_position_keys: tuple[tuple[int, ...], ...] = ()
 
     def copy(self) -> GameState:
         """Deep copy — board array and position_counts dict are duplicated."""
@@ -70,6 +87,7 @@ class GameState:
             halfmove_clock=self.halfmove_clock,
             total_halfmoves=self.total_halfmoves,
             position_counts=dict(self.position_counts),
+            recent_position_keys=self.recent_position_keys,  # tuple is immutable, share safely
         )
 
 
@@ -93,6 +111,23 @@ def get_phase(state: GameState, player: int) -> Phase:
     if state.pieces_in_hand[player - 1] > 0:
         return Phase.PLACING
     return Phase.MOVING
+
+
+def compute_aux_features(state: GameState) -> tuple[float, float]:
+    """Return (mill_diff, pieces_diff) from the current player's perspective.
+
+    Both quantities are signed (own - opp) and deterministic given the state.
+    Used as targets for the auxiliary heads (KataGo-style multi-task learning)
+    to give the trunk a dense, noise-free training signal alongside the noisy
+    end-of-game value target.
+    """
+    me = state.current_player
+    opp_ = opponent(me)
+    own_mills = sum(1 for m in MILLS if all(state.board[p] == me for p in m))
+    opp_mills = sum(1 for m in MILLS if all(state.board[p] == opp_ for p in m))
+    own_pieces = pieces_on_board(state.board, me)
+    opp_pieces = pieces_on_board(state.board, opp_)
+    return float(own_mills - opp_mills), float(own_pieces - opp_pieces)
 
 
 def forms_mill(board: np.ndarray, position: int, player: int) -> bool:
@@ -181,13 +216,60 @@ def random_late_game_state(
 
 
 def get_legal_actions(state: GameState) -> list[int]:
-    """Return all legal action indices for the current state."""
+    """Return all legal action indices for the current state.
+
+    Filters out movement candidates whose resulting position matches any of
+    the last REPETITION_WINDOW visited positions. This prevents short cycles
+    (ping-pong A↔B↔A) without ending the game — the network simply never
+    sees these moves as options. Placement and capture actions are never
+    filtered (placements strictly grow piece count, so cycles are impossible;
+    captures strictly shrink it).
+    """
     if state.must_capture:
         return _legal_capture_actions(state)
     phase = get_phase(state, state.current_player)
     if phase == Phase.PLACING:
         return [p for p in range(NUM_POSITIONS) if state.board[p] == EMPTY]
-    return _legal_move_actions(state)
+    candidates = _legal_move_actions(state)
+    if not state.recent_position_keys:
+        return candidates
+    recent = set(state.recent_position_keys)
+    # Inline the key computation for each candidate: a move only changes
+    # board[src]→EMPTY and board[dst]→player, never affects pieces_in_hand
+    # or must_capture (mill-forming moves go through must_capture flag flip
+    # which IS reflected in the key, see below). Avoids the cost of a full
+    # apply_action (dict copy + tuple append) per candidate × O(15 candidates)
+    # × O(800 MCTS sims) per move.
+    legal = []
+    board = state.board
+    opp = opponent(state.current_player)
+    for a in candidates:
+        src, dst = MOVE_EDGES[a - NUM_PLACE_CAPTURE_ACTIONS]
+        # Simulate board update
+        original_src = int(board[src])
+        original_dst = int(board[dst])
+        board[src] = EMPTY
+        board[dst] = state.current_player
+        # Mill formation flips must_capture and the current player stays.
+        forms = forms_mill(board, dst, state.current_player)
+        if forms:
+            next_player = state.current_player
+            next_must_capture = True
+        else:
+            next_player = opp
+            next_must_capture = False
+        key = (
+            *board.tolist(),
+            next_player,
+            int(next_must_capture),
+            *state.pieces_in_hand,
+        )
+        # Restore board immediately
+        board[src] = original_src
+        board[dst] = original_dst
+        if key not in recent:
+            legal.append(a)
+    return legal
 
 
 def apply_action(state: GameState, action: int) -> GameState:
@@ -289,7 +371,7 @@ def _legal_move_actions(state: GameState) -> list[int]:
             continue
         for dst in ADJACENCY[src]:
             if state.board[dst] == EMPTY:
-                actions.append(NUM_PLACE_CAPTURE_ACTIONS + src * NUM_POSITIONS + dst)
+                actions.append(int(EDGE_INDEX[src, dst]))
     return actions
 
 
@@ -311,8 +393,7 @@ def _apply_placement(state: GameState, position: int) -> None:
 
 def _apply_move(state: GameState, action: int) -> None:
     player = state.current_player
-    idx = action - NUM_PLACE_CAPTURE_ACTIONS
-    src, dst = divmod(idx, NUM_POSITIONS)
+    src, dst = MOVE_EDGES[action - NUM_PLACE_CAPTURE_ACTIONS]
     state.board[src] = EMPTY
     state.board[dst] = player
     state.halfmove_clock += 1
@@ -347,3 +428,9 @@ def _position_key(state: GameState) -> tuple[int, ...]:
 def _register_position(state: GameState) -> None:
     key = _position_key(state)
     state.position_counts[key] = state.position_counts.get(key, 0) + 1
+    # Append to sliding window, capped at REPETITION_WINDOW. Tuple ops are
+    # O(K) but K is small (8) so cost is negligible vs the rest of apply.
+    window = state.recent_position_keys + (key,)
+    if len(window) > REPETITION_WINDOW:
+        window = window[-REPETITION_WINDOW:]
+    state.recent_position_keys = window

@@ -99,43 +99,43 @@ def test_sample_requires_enough_data() -> None:
 def test_sample_state_shape() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
-    states, _, _, _ = buf.sample(4)
+    states, _, _, _, _, _ = buf.sample(4)
     assert states.shape == (4, _NUM_PLANES, NUM_POSITIONS)
 
 
 def test_sample_policy_shape() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
-    _, policies, _, _ = buf.sample(4)
+    _, policies, _, _, _, _ = buf.sample(4)
     assert policies.shape == (4, ACTION_SPACE_SIZE)
 
 
 def test_sample_values_shape() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
-    _, _, values, _ = buf.sample(4)
+    _, _, values, _, _, _ = buf.sample(4)
     assert values.shape == (4,)
 
 
 def test_sample_mask_shape_and_dtype() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
-    _, _, _, masks = buf.sample(4)
+    _, _, _, masks, _, _ = buf.sample(4)
     assert masks.shape == (4, ACTION_SPACE_SIZE)
     assert masks.dtype == torch.bool
 
 
-def test_sample_returns_four_tensors() -> None:
+def test_sample_returns_six_tensors() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
     result = buf.sample(4)
-    assert len(result) == 4
+    assert len(result) == 6
 
 
 def test_sample_dtypes_are_float32() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
-    states, policies, values, _ = buf.sample(4)
+    states, policies, values, _, _, _ = buf.sample(4)
     assert states.dtype == torch.float32
     assert policies.dtype == torch.float32
     assert values.dtype == torch.float32
@@ -144,7 +144,7 @@ def test_sample_dtypes_are_float32() -> None:
 def test_sample_to_device() -> None:
     buf = ReplayBuffer(capacity=100, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(10)])
-    states, _, _, _ = buf.sample(4, device=torch.device("cpu"))
+    states, _, _, _, _, _ = buf.sample(4, device=torch.device("cpu"))
     assert states.device.type == "cpu"
 
 
@@ -153,8 +153,8 @@ def test_sample_is_random() -> None:
     np.random.seed(0)
     buf = ReplayBuffer(capacity=1000, use_symmetry_augmentation=False)
     buf.add_samples([_make_sample(i) for i in range(100)])
-    _, policies_a, _, _ = buf.sample(8)
-    _, policies_b, _, _ = buf.sample(8)
+    _, policies_a, _, _, _, _ = buf.sample(8)
+    _, policies_b, _, _, _, _ = buf.sample(8)
     # Very unlikely to be identical with 100 distinct samples.
     assert not torch.allclose(policies_a, policies_b)
 
@@ -183,5 +183,5 @@ def test_value_in_buffer_matches_added_sample() -> None:
         legal_mask=np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
     )
     buf.add(sample)
-    _, _, values, _ = buf.sample(1)
+    _, _, values, _, _, _ = buf.sample(1)
     assert values[0].item() == pytest.approx(1.0)

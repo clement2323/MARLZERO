@@ -7,7 +7,8 @@ of the 24 board positions.
 Transforms apply to:
   - board arrays (shape (24,)): permute position indices
   - encoded states (shape (7, 24)): permute only the position-dependent planes
-  - policy vectors (shape (600,)): permute place/capture and move/fly indices
+  - policy vectors (shape (88,)): permute place/capture indices and remap
+    movement actions by applying perm to both endpoints of each edge
   - value targets: unchanged (outcome is orientation-independent)
 
 The permutation convention: perm[i] = j means the piece at position i moves
@@ -21,7 +22,18 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_PLACE_CAPTURE_ACTIONS, NUM_POSITIONS
+from morris_rl.env.board import (
+    ACTION_SPACE_SIZE,
+    EDGE_INDEX,
+    MOVE_EDGES,
+    NUM_PLACE_CAPTURE_ACTIONS,
+    NUM_POSITIONS,
+)
+
+# Source/destination of each movement edge — pulled here for the vectorised
+# symmetry remap in transform_policy. Computed at module load (negligible cost).
+_EDGE_SRC = np.array([e[0] for e in MOVE_EDGES], dtype=np.intp)
+_EDGE_DST = np.array([e[1] for e in MOVE_EDGES], dtype=np.intp)
 
 # ---------------------------------------------------------------------------
 # Permutation tables
@@ -100,20 +112,19 @@ def transform_policy(
     """Apply a board symmetry to a policy distribution of shape (ACTION_SPACE_SIZE,).
 
     Place/capture actions (indices 0-23) are remapped by perm.
-    Move/fly actions (indices 24-599, encoded as 24 + src*24 + dst) are remapped
-    by applying perm to both src and dst.
+    Movement actions (indices 24-87, one per directed edge) are remapped by
+    applying perm to both endpoints of each edge: edge (src, dst) → (perm[src],
+    perm[dst]). D4 preserves adjacency on the Morris board, so the remapped
+    pair is always a valid edge — EDGE_INDEX never returns -1 here.
     """
-    n = NUM_POSITIONS
     new_policy = np.zeros(ACTION_SPACE_SIZE, dtype=policy.dtype)
 
     # Place/capture: action at position i goes to action at perm[i].
     new_policy[perm] = policy[:NUM_PLACE_CAPTURE_ACTIONS]
 
-    # Move/fly: action (src→dst) maps to (perm[src]→perm[dst]).
-    # Reshaping to (24, 24) lets us permute rows and columns simultaneously.
-    # new[perm[s], perm[d]] = old[s, d]  ⟺  new[i, j] = old[inv[i], inv[j]]
-    perm_inv = np.argsort(perm)
-    move_matrix = policy[NUM_PLACE_CAPTURE_ACTIONS:].reshape(n, n)
-    new_policy[NUM_PLACE_CAPTURE_ACTIONS:] = move_matrix[np.ix_(perm_inv, perm_inv)].flatten()
+    # Movement: vectorised remap. For each edge k = (src, dst), find its new
+    # index after applying perm and copy the probability mass there.
+    new_edge_idx = EDGE_INDEX[perm[_EDGE_SRC], perm[_EDGE_DST]]
+    new_policy[new_edge_idx] = policy[NUM_PLACE_CAPTURE_ACTIONS:]
 
     return new_policy

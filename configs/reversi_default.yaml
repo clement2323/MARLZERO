@@ -29,6 +29,10 @@ input_encoding:
   # Defined in src/morris_rl/env/reversi/encoding.py.
   num_planes: 3
 
+# Aux heads are Morris-specific (mill_diff). Disable for Reversi.
+aux_heads:
+  enabled: false
+
 mcts:
   num_simulations_train: 200
   num_simulations_eval: 800

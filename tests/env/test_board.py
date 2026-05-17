@@ -49,4 +49,5 @@ def test_mills_are_unique() -> None:
 
 
 def test_action_space_size() -> None:
-    assert ACTION_SPACE_SIZE == 600
+    # 24 place/capture + 64 movement edges (directed adjacency).
+    assert ACTION_SPACE_SIZE == 88

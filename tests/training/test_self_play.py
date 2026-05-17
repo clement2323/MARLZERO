@@ -75,6 +75,8 @@ def _make_step(player: int, is_full: bool = True) -> tuple:
         player,
         np.ones(ACTION_SPACE_SIZE, dtype=np.bool_),
         is_full,
+        float("nan"),   # mill_diff_target (test doesn't exercise aux)
+        float("nan"),   # pieces_diff_target
     )
 
 

@@ -57,6 +57,7 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
     else:
         from morris_rl.env.board import ACTION_SPACE_SIZE as _acs, NUM_POSITIONS as _np
         num_positions, action_space_size = _np, _acs
+    aux_cfg = cfg.get("aux_heads", {}) or {}
     return {
         "num_blocks": cfg.network.num_blocks,
         "num_channels": cfg.network.num_channels,
@@ -66,6 +67,8 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
         "value_head_type": cfg.network.get("value_head_type", "scalar"),
         "num_positions": num_positions,
         "action_space_size": action_space_size,
+        "aux_heads_enabled": bool(aux_cfg.get("enabled", False)),
+        "aux_head_hidden": int(aux_cfg.get("hidden_size", 64)),
     }
 
 
@@ -118,6 +121,7 @@ def main(cfg: DictConfig) -> None:
         mlflow_experiment = "morris-az"
         mlflow_run_name = None
 
+    _aux_cfg = cfg.get("aux_heads", {}) or {}
     trainer = Trainer(
         network=network,
         device=device,
@@ -134,6 +138,9 @@ def main(cfg: DictConfig) -> None:
         mlflow_uri=mlflow_uri,
         mlflow_experiment=mlflow_experiment,
         mlflow_run_name=mlflow_run_name,
+        aux_heads_enabled=bool(_aux_cfg.get("enabled", False)),
+        aux_weight_mill=float(_aux_cfg.get("mill_diff_weight", 0.0)),
+        aux_weight_pieces=float(_aux_cfg.get("pieces_diff_weight", 0.0)),
     )
 
     # ---- Replay buffer ----

@@ -20,9 +20,14 @@ Dirichlet exploration noise is always added at the MCTS root during training.
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
+import os
+import random
 import threading
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from morris_rl.utils.logging import logger
@@ -109,6 +114,60 @@ class GameRecord:
     # halfmove_cap. The trainer counts discards for the timeout_discard_rate
     # metric but does NOT push these samples to the buffer.
     timeout_discarded: bool = False
+    # Full action history (every applied action index in order). Used by the
+    # optional trace logger (MORRIS_TRACE_DIR env var) so games can be
+    # replayed offline with scripts/replay_game.py. Empty when tracing off.
+    actions_history: list[int] = field(default_factory=list)
+
+
+def _maybe_log_trace(record: "GameRecord", worker_id: int, game: str = "morris") -> None:
+    """Append a JSONL trace of *record* to MORRIS_TRACE_DIR when enabled.
+
+    Activation : set env var ``MORRIS_TRACE_DIR=/some/path`` before launching
+    training. Each worker writes to its own file ``worker_{id}.jsonl`` (no
+    inter-worker contention, no file lock needed).
+
+    Sampling : every game with ``term_reason=='halfmove_cap'`` is logged
+    unconditionally (these are the ones the user wants to inspect — long
+    games hitting the cap). Other games are logged at the rate set by
+    ``MORRIS_TRACE_SAMPLE_RATE`` (default 0.02 = 2%).
+
+    Schema (one JSON object per line) :
+        { "ts": float, "worker": int, "game": str, "outcome": int,
+          "length": int, "term_reason": str, "actions": list[int] }
+    """
+    trace_dir = os.environ.get("MORRIS_TRACE_DIR")
+    if not trace_dir:
+        return
+    always_log = record.term_reason == "halfmove_cap"
+    if not always_log:
+        try:
+            sample_rate = float(os.environ.get("MORRIS_TRACE_SAMPLE_RATE", "0.02"))
+        except ValueError:
+            sample_rate = 0.02
+        if random.random() >= sample_rate:
+            return
+
+    path = Path(trace_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    target = path / f"worker_{worker_id}.jsonl"
+    payload = {
+        "ts": time.time(),
+        "worker": worker_id,
+        "game": game,
+        "outcome": record.outcome,
+        "length": record.game_length,
+        "term_reason": record.term_reason,
+        "actions": list(record.actions_history),
+    }
+    # Best-effort: never crash a training run because the trace dir is full
+    # or read-only. Log to logger on first failure per worker would be ideal,
+    # but we keep it silent for now to avoid polluting the main log.
+    try:
+        with target.open("a") as fh:
+            fh.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass
 
 
 @dataclass
@@ -209,10 +268,13 @@ def _assign_value_targets(
             npt.NDArray[np.float32],  # policy_target
             int,                       # current player
             npt.NDArray[np.bool_],    # legal_mask
-            bool,                      # was this ply a full-sim move (kept for buffer)?
+            bool,                      # was this ply a full-sim move?
+            float,                     # mill_diff_target (NaN if unavailable)
+            float,                     # pieces_diff_target (NaN if unavailable)
         ]
     ],
     outcome: Outcome | None,
+    term_reason: str = "unknown",
 ) -> list[SampleRecord]:
     """Convert per-step tuples into SampleRecords.
 
@@ -220,7 +282,7 @@ def _assign_value_targets(
     don't pollute the buffer.
     """
     records: list[SampleRecord] = []
-    for encoded, policy, player, mask, was_full_sim in steps:
+    for encoded, policy, player, mask, was_full_sim, mill_diff, pieces_diff in steps:
         if not was_full_sim:
             continue
         if outcome is None or outcome == Outcome.DRAW:
@@ -235,6 +297,8 @@ def _assign_value_targets(
                 policy_target=policy,
                 value_target=v,
                 legal_mask=mask,
+                mill_diff_target=mill_diff,
+                pieces_diff_target=pieces_diff,
             )
         )
     return records
@@ -275,6 +339,10 @@ def _play_game(
     else:
         from morris_rl.mcts.search import encode_state as _encode_state  # Morris default
     _random_late_game = _fns.get("random_late_game_state", random_late_game_state)
+    # Optional aux-target function (mill_diff, pieces_diff). When absent (e.g.
+    # Reversi or other games without mills), we record NaN and the trainer
+    # masks the aux loss for those samples.
+    _compute_aux = _fns.get("compute_aux_features")
 
     if rng is None:
         rng = np.random.default_rng()
@@ -302,16 +370,19 @@ def _play_game(
         state = _initial_state()
     steps: list[
         tuple[
-            npt.NDArray[np.float32],
-            npt.NDArray[np.float32],
-            int,
-            npt.NDArray[np.bool_],
-            int,    # aux: mill_count for current_player at this state
-            bool,   # aux: did this action turn out to be a capture?
-            bool,   # full-sim ply? (False = fast, skipped at buffer write)
+            npt.NDArray[np.float32],   # encoded state
+            npt.NDArray[np.float32],   # policy_target (visit_probs)
+            int,                        # actor (current player)
+            npt.NDArray[np.bool_],     # legal_mask
+            bool,                       # full-sim ply? (False = skipped at buffer write)
+            float,                      # mill_diff_target (NaN if unavailable)
+            float,                      # pieces_diff_target (NaN if unavailable)
         ]
     ] = []
     move_count = 0
+    # Full action history for optional trace logging (replayable later via
+    # scripts/replay_game.py). Negligible cost (~100 ints per game).
+    actions_history: list[int] = []
     # Per-game observability counters. Mills are detected via the
     # not-must_capture → must_capture transition (forming a mill enables a
     # capture); captures are the reverse transition (must_capture → not).
@@ -411,10 +482,17 @@ def _play_game(
         # for other games since the attribute is absent).
         was_must_capture = getattr(state, "must_capture", False)
         actor = state.current_player
+        # Compute aux targets BEFORE applying the action — they describe the
+        # state from which the policy_target was derived.
+        if _compute_aux is not None:
+            mill_diff_t, pieces_diff_t = _compute_aux(state)
+        else:
+            mill_diff_t, pieces_diff_t = float("nan"), float("nan")
         state = _apply_action(state, action)
         was_capture = was_must_capture and not getattr(state, "must_capture", False)
+        actions_history.append(int(action))
 
-        steps.append((encoded, visit_probs, actor, legal_mask, is_full))
+        steps.append((encoded, visit_probs, actor, legal_mask, is_full, mill_diff_t, pieces_diff_t))
 
         if not was_must_capture and getattr(state, "must_capture", False):
             # The just-played placement/move formed a mill (forced capture next).
@@ -446,7 +524,7 @@ def _play_game(
     samples = (
         []
         if timeout_discarded
-        else _assign_value_targets(steps, outcome)
+        else _assign_value_targets(steps, outcome, term_reason)
     )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(
@@ -468,6 +546,7 @@ def _play_game(
         curriculum_start=curriculum_start,
         curriculum_pieces=curriculum_pieces,
         timeout_discarded=timeout_discarded,
+        actions_history=actions_history,
     )
 
 
@@ -524,6 +603,8 @@ def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
         value_head_type=cfg.get("value_head_type", "scalar"),
         num_positions=cfg.get("num_positions", NUM_POSITIONS),
         action_space_size=cfg.get("action_space_size", ACTION_SPACE_SIZE),
+        aux_heads_enabled=bool(cfg.get("aux_heads_enabled", False)),
+        aux_head_hidden=int(cfg.get("aux_head_hidden", 64)),
     )
 
 
@@ -622,7 +703,11 @@ def _worker_fn(
             "random_late_game_state": None,
         }
     else:  # morris (default)
-        _game_fns = {}  # MorrisSearch and _play_game will use their Morris defaults
+        # Aux head targets are Morris-specific (mill_diff, pieces_diff). Wire
+        # the helper here so _play_game can compute them per ply. For other
+        # games this stays unset → NaN aux targets → aux loss masked out.
+        from morris_rl.env.rules import compute_aux_features as _morris_aux
+        _game_fns = {"compute_aux_features": _morris_aux}
 
     # Each worker is one MCTS pipeline; using torch's default (= all CPU cores)
     # means N workers fight over N×cores threads. One thread per worker keeps the
@@ -696,6 +781,7 @@ def _worker_fn(
                 discard_timeout_games=discard_timeout_games,
                 game_fns=_game_fns,
             )
+            _maybe_log_trace(game, worker_id, game=game_name)
             results_queue.put(game)
             games_played += 1
         except Exception as exc:
@@ -817,6 +903,7 @@ def _worker_fn_remote(
                 curriculum_config=curriculum_config,
                 discard_timeout_games=discard_timeout_games,
             )
+            _maybe_log_trace(game, worker_id)
             results_queue.put(game)
             games_played += 1
         except Exception as exc:

@@ -33,22 +33,37 @@ AugmentFn = "Callable[[SampleRecord], list[SampleRecord]]"
 
 @dataclass
 class SampleRecord:
-    """One training sample from a self-play position."""
+    """One training sample from a self-play position.
+
+    Auxiliary targets (mill_diff_target, pieces_diff_target) are signed and
+    measured from the *current player's* perspective at sample creation time.
+    Default NaN means "no aux supervision for this sample" — the trainer
+    masks it out of the aux loss so the sample still contributes to policy
+    and value losses.
+    """
 
     encoded_state: npt.NDArray[np.float32]   # (num_planes, num_positions)
     policy_target: npt.NDArray[np.float32]   # (action_space_size,)
     value_target: float                      # in {-1.0, 0.0, 1.0}, current-player perspective
     legal_mask: npt.NDArray[np.bool_]        # (action_space_size,) True on legal actions
+    mill_diff_target: float = float("nan")   # own_mills - opp_mills (current-player view)
+    pieces_diff_target: float = float("nan") # own_pieces - opp_pieces (current-player view)
 
 
 def _morris_augment_sample(sample: SampleRecord) -> list[SampleRecord]:
-    """Return the 7 non-identity Morris D4 symmetric variants of a sample."""
+    """Return the 7 non-identity Morris D4 symmetric variants of a sample.
+
+    mill_diff and pieces_diff are scalar invariants of the D4 group on the
+    board layout, so we copy them unchanged across all symmetric variants.
+    """
     return [
         SampleRecord(
             encoded_state=_morris_transform_encoded_state(sample.encoded_state, perm),
             policy_target=_morris_transform_policy(sample.policy_target, perm),
             value_target=sample.value_target,
             legal_mask=_morris_transform_policy(sample.legal_mask, perm),
+            mill_diff_target=sample.mill_diff_target,
+            pieces_diff_target=sample.pieces_diff_target,
         )
         for perm in _MORRIS_SYMMETRY_PERMUTATIONS[1:]
     ]
@@ -90,6 +105,10 @@ class ReplayBuffer:
         self._policies = np.zeros((capacity, action_space_size), dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
         self._masks = np.zeros((capacity, action_space_size), dtype=np.bool_)
+        # NaN-initialised so any old buffer loaded without aux fields is
+        # correctly treated as "no aux supervision" by the trainer.
+        self._mill_diff = np.full(capacity, np.nan, dtype=np.float32)
+        self._pieces_diff = np.full(capacity, np.nan, dtype=np.float32)
 
         self._write_ptr = 0
         self._size = 0
@@ -124,17 +143,23 @@ class ReplayBuffer:
         self,
         batch_size: int,
         device: torch.device | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """Return a random minibatch.
 
         Returns:
-            ``(states, policies, values, masks)``
+            ``(states, policies, values, masks, mill_diff, pieces_diff)``.
+            The last two are NaN-padded when aux targets are absent; the
+            trainer masks NaN entries out of the aux loss.
 
         Shapes:
-            states:   (batch_size, 7, 24)
-            policies: (batch_size, ACTION_SPACE_SIZE)
-            values:   (batch_size,)
-            masks:    (batch_size, ACTION_SPACE_SIZE)  bool
+            states:      (batch_size, num_planes, num_positions)
+            policies:    (batch_size, ACTION_SPACE_SIZE)
+            values:      (batch_size,)
+            masks:       (batch_size, ACTION_SPACE_SIZE)  bool
+            mill_diff:   (batch_size,)  float32, may contain NaN
+            pieces_diff: (batch_size,)  float32, may contain NaN
 
         Raises:
             ValueError: if the buffer contains fewer than batch_size samples.
@@ -149,19 +174,25 @@ class ReplayBuffer:
             policies_np = self._policies[indices].copy()
             values_np = self._values[indices].copy()
             masks_np = self._masks[indices].copy()
+            mill_np = self._mill_diff[indices].copy()
+            pieces_np = self._pieces_diff[indices].copy()
 
         states = torch.from_numpy(states_np)
         policies = torch.from_numpy(policies_np)
         values = torch.from_numpy(values_np)
         masks = torch.from_numpy(masks_np)
+        mill_diff = torch.from_numpy(mill_np)
+        pieces_diff = torch.from_numpy(pieces_np)
 
         if device is not None:
             states = states.to(device)
             policies = policies.to(device)
             values = values.to(device)
             masks = masks.to(device)
+            mill_diff = mill_diff.to(device)
+            pieces_diff = pieces_diff.to(device)
 
-        return states, policies, values, masks
+        return states, policies, values, masks, mill_diff, pieces_diff
 
     # ------------------------------------------------------------------
     # Introspection
@@ -189,6 +220,8 @@ class ReplayBuffer:
                 policies=self._policies[: self._size],
                 values=self._values[: self._size],
                 masks=self._masks[: self._size],
+                mill_diff=self._mill_diff[: self._size],
+                pieces_diff=self._pieces_diff[: self._size],
                 write_ptr=np.array([self._write_ptr], dtype=np.int64),
                 size=np.array([self._size], dtype=np.int64),
                 capacity=np.array([self._capacity], dtype=np.int64),
@@ -198,7 +231,8 @@ class ReplayBuffer:
         """Restore buffer contents from a file written by :meth:`save`.
 
         Capacity must match. Backward compat: files saved before the legal_mask
-        field existed fall back to all-True masks.
+        field existed fall back to all-True masks; files saved before aux
+        targets existed fall back to NaN (excluded from aux loss).
         """
         from pathlib import Path
         data = np.load(Path(path))
@@ -217,6 +251,14 @@ class ReplayBuffer:
                 self._masks[:size] = data["masks"]
             else:
                 self._masks[:size] = True
+            if "mill_diff" in data.files:
+                self._mill_diff[:size] = data["mill_diff"]
+            else:
+                self._mill_diff[:size] = np.nan
+            if "pieces_diff" in data.files:
+                self._pieces_diff[:size] = data["pieces_diff"]
+            else:
+                self._pieces_diff[:size] = np.nan
             self._size = size
             self._write_ptr = int(data["write_ptr"][0])
 
@@ -230,6 +272,8 @@ class ReplayBuffer:
         self._policies[self._write_ptr] = sample.policy_target
         self._values[self._write_ptr] = sample.value_target
         self._masks[self._write_ptr] = sample.legal_mask
+        self._mill_diff[self._write_ptr] = sample.mill_diff_target
+        self._pieces_diff[self._write_ptr] = sample.pieces_diff_target
         self._write_ptr = (self._write_ptr + 1) % self._capacity
         if self._size < self._capacity:
             self._size += 1

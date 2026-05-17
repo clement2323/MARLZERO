@@ -6,7 +6,13 @@ import random
 
 import numpy as np
 
-from morris_rl.env.board import NUM_PIECES_PER_PLAYER, NUM_PLACE_CAPTURE_ACTIONS, NUM_POSITIONS
+from morris_rl.env.board import (
+    EDGE_INDEX,
+    MOVE_EDGES,
+    NUM_PIECES_PER_PLAYER,
+    NUM_PLACE_CAPTURE_ACTIONS,
+    NUM_POSITIONS,
+)
 from morris_rl.env.rules import (
     EMPTY,
     MAX_HALFMOVES,
@@ -32,7 +38,7 @@ from morris_rl.env.rules import (
 
 
 def _encode_move(src: int, dst: int) -> int:
-    return NUM_PLACE_CAPTURE_ACTIONS + src * NUM_POSITIONS + dst
+    return int(EDGE_INDEX[src, dst])
 
 
 def _make_state(
@@ -268,8 +274,7 @@ def test_movement_only_adjacent_positions() -> None:
     # No non-adjacent move should appear
     for act in legal:
         assert act >= NUM_PLACE_CAPTURE_ACTIONS
-        idx = act - NUM_PLACE_CAPTURE_ACTIONS
-        src, dst = divmod(idx, NUM_POSITIONS)
+        src, dst = MOVE_EDGES[act - NUM_PLACE_CAPTURE_ACTIONS]
         assert src == 0
 
 
@@ -486,15 +491,16 @@ def test_apply_action_does_not_mutate_input() -> None:
 def _play_random_game(seed: int) -> None:
     rng = random.Random(seed)
     state = initial_state()
-    # With MAX_TOTAL_HALFMOVES=100, no game can last longer than 100 halfmoves.
-    for _ in range(200):
+    # Loop bound = MAX_TOTAL_HALFMOVES + small slack so the cap fires before us.
+    bound = MAX_TOTAL_HALFMOVES + 10
+    for _ in range(bound):
         done, _ = is_terminal(state)
         if done:
             return
         actions = get_legal_actions(state)
         assert actions, "Non-terminal state has no legal actions"
         state = apply_action(state, rng.choice(actions))
-    raise AssertionError("Game did not terminate within 200 moves")
+    raise AssertionError(f"Game did not terminate within {bound} moves")
 
 
 def test_random_games_1000() -> None:

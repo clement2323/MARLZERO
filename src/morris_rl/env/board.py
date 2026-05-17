@@ -26,11 +26,13 @@ from __future__ import annotations
 
 from typing import Final
 
+import numpy as np
+import numpy.typing as npt
+
 NUM_POSITIONS: Final[int] = 24
 NUM_PIECES_PER_PLAYER: Final[int] = 9
 
 NUM_PLACE_CAPTURE_ACTIONS: Final[int] = NUM_POSITIONS
-ACTION_SPACE_SIZE: Final[int] = NUM_PLACE_CAPTURE_ACTIONS + NUM_POSITIONS * NUM_POSITIONS  # 600
 
 # Outer-ring midpoints (1,3,5,7) have 3 neighbours.
 # Middle-ring midpoints (9,11,13,15) have 4 neighbours (connected to both outer and inner).
@@ -62,6 +64,39 @@ ADJACENCY: Final[list[list[int]]] = [
     [21, 23],  # 22 inner BL
     [22, 16, 15],  # 23 inner ML
 ]
+
+# Directed adjacency edges for movement actions. Each entry is (src, dst)
+# where dst ∈ ADJACENCY[src]. We use this list to index movement actions
+# compactly: action_index = NUM_PLACE_CAPTURE_ACTIONS + edge_position.
+# Only 56 (src, dst) pairs are legal moves on the Morris board, vs 576 if
+# we encoded all 24×24 pairs — so this reduces ACTION_SPACE_SIZE from 600
+# to 80 and lets the policy head avoid 520 systematically-masked logits.
+# Order is stable (src ascending, then dst ascending within each src) so
+# the encoding is fully deterministic and reproducible across runs.
+MOVE_EDGES: Final[list[tuple[int, int]]] = [
+    (src, dst) for src in range(NUM_POSITIONS) for dst in sorted(ADJACENCY[src])
+]
+NUM_MOVE_ACTIONS: Final[int] = len(MOVE_EDGES)  # 56
+ACTION_SPACE_SIZE: Final[int] = NUM_PLACE_CAPTURE_ACTIONS + NUM_MOVE_ACTIONS  # 80
+
+# Reverse lookup (src, dst) → action index. -1 marks non-adjacent pairs
+# (illegal moves) and triggers a clean failure if any caller decodes
+# action_index from a malformed (src, dst). The 24×24 layout keeps lookups
+# branch-free and vectorisable for the symmetry transform.
+EDGE_INDEX: Final[npt.NDArray[np.int32]] = np.full(
+    (NUM_POSITIONS, NUM_POSITIONS), -1, dtype=np.int32
+)
+for _k, (_src, _dst) in enumerate(MOVE_EDGES):
+    EDGE_INDEX[_src, _dst] = NUM_PLACE_CAPTURE_ACTIONS + _k
+EDGE_INDEX.setflags(write=False)
+
+# Source / destination arrays for vectorised symmetry remapping.
+_EDGE_SRC: Final[npt.NDArray[np.intp]] = np.array(
+    [e[0] for e in MOVE_EDGES], dtype=np.intp
+)
+_EDGE_DST: Final[npt.NDArray[np.intp]] = np.array(
+    [e[1] for e in MOVE_EDGES], dtype=np.intp
+)
 
 MILLS: Final[list[tuple[int, int, int]]] = [
     # Outer ring sides

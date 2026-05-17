@@ -1,4 +1,4 @@
-.PHONY: help train train-tmux train-tmux-kill serve web tensorboard mlflow-ui play dev dashboard clean
+.PHONY: help train train-tmux train-tmux-kill serve web tensorboard mlflow-ui play play-reversi serve-reversi web-reversi dev dashboard clean
 .DEFAULT_GOAL := help
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,14 @@ MODEL_CHECKPOINT ?= $(shell ls -1t outputs/*/*/checkpoints/checkpoint_*.pt 2>/de
 MINIMAX_DEPTH ?= 3
 
 play:  ## Launch backend + frontend (uses latest checkpoint, falls back to minimax depth N)
+	@if lsof -ti :8000 >/dev/null 2>&1; then \
+	  echo "Port 8000 already in use (PID $$(lsof -ti :8000)). Kill with: lsof -ti :8000 | xargs kill"; \
+	  exit 1; \
+	fi
+	@if lsof -ti :5173 >/dev/null 2>&1; then \
+	  echo "Port 5173 already in use (PID $$(lsof -ti :5173)). Kill with: lsof -ti :5173 | xargs kill"; \
+	  exit 1; \
+	fi
 	@if [ -z "$(MODEL_CHECKPOINT)" ]; then \
 	  echo "No checkpoint found — backend will fall back to MinimaxAgent(depth=$(MINIMAX_DEPTH))"; \
 	else \
@@ -71,6 +79,44 @@ serve:  ## Run the FastAPI inference backend alone (uses MODEL_CHECKPOINT env)
 
 web:  ## Run the React/Vite frontend alone (expects backend on :8000)
 	cd web && npm run dev
+
+# Auto-detect the most recent Reversi checkpoint by scanning each run's
+# hydra config for num_planes=3 (Morris uses 7). Falls back to empty if none.
+MODEL_CHECKPOINT_REVERSI ?= $(shell \
+  for ckpt in $$(ls -1t outputs/*/*/checkpoints/checkpoint_*.pt 2>/dev/null); do \
+    run_dir=$$(dirname $$(dirname $$ckpt)); \
+    if grep -q "num_planes: 3" "$$run_dir/.hydra/config.yaml" 2>/dev/null; then \
+      echo $$ckpt; break; \
+    fi; \
+  done)
+
+play-reversi:  ## Launch Reversi backend (:8001) + frontend (:5174) with latest Reversi checkpoint
+	@if lsof -ti :8001 >/dev/null 2>&1; then \
+	  echo "Port 8001 already in use (PID $$(lsof -ti :8001)). Kill with: lsof -ti :8001 | xargs kill"; \
+	  exit 1; \
+	fi
+	@if lsof -ti :5174 >/dev/null 2>&1; then \
+	  echo "Port 5174 already in use (PID $$(lsof -ti :5174)). Kill with: lsof -ti :5174 | xargs kill"; \
+	  exit 1; \
+	fi
+	@if [ -z "$(MODEL_CHECKPOINT_REVERSI)" ]; then \
+	  echo "No Reversi checkpoint found (none of outputs/*/*/.hydra/config.yaml has num_planes: 3)."; \
+	  exit 1; \
+	fi
+	@echo "Checkpoint: $(MODEL_CHECKPOINT_REVERSI)"
+	@echo "Backend:    http://127.0.0.1:8001"
+	@echo "Frontend:   http://127.0.0.1:5174"
+	@echo "Ctrl-C to stop both."
+	@trap 'kill 0' INT; \
+	  MODEL_CHECKPOINT="$(MODEL_CHECKPOINT_REVERSI)" $(MAKE) serve-reversi & \
+	  $(MAKE) web-reversi & \
+	  wait
+
+serve-reversi:  ## Run the Reversi FastAPI backend alone on :8001 (uses MODEL_CHECKPOINT env)
+	uv run uvicorn morris_rl.inference.reversi_server:app --reload --port 8001
+
+web-reversi:  ## Run the Reversi React/Vite frontend alone (port 5174)
+	cd web_reversi && npm run dev
 
 ##@ Analysis
 

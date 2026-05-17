@@ -41,6 +41,20 @@ input_encoding:
   # Planes 4-5: phase one-hot (placing, moving) — no FLYING in this variant
   # Plane 6: must-capture flag (set after forming a mill)
 
+# Auxiliary heads (KataGo-style multi-task learning).
+# The trunk gains two extra regression heads predicting dense, noise-free
+# targets derived from the current state. Their gradients shape the shared
+# representation alongside the noisy end-of-game value target, accelerating
+# learning and avoiding value-head collapse caused by ambiguous outcomes.
+# Reference: Wu (2019), "Accelerating Self-Play Learning in Go".
+aux_heads:
+  enabled: true
+  hidden_size: 64
+  # λ weights on top of the base (policy + value) loss. KataGo uses ~0.15;
+  # too high distorts the main objective, too low has no effect.
+  mill_diff_weight: 0.15      # MSE on (own_mills - opp_mills), current-player view
+  pieces_diff_weight: 0.15    # MSE on (own_pieces - opp_pieces), current-player view
+
 mcts:
   num_simulations_train: 150
   num_simulations_eval: 800

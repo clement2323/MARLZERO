@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from morris_rl.env.board import ACTION_SPACE_SIZE as _DEFAULT_ACTION_SPACE_SIZE
 from morris_rl.env.board import NUM_POSITIONS as _DEFAULT_NUM_POSITIONS
-from morris_rl.network.heads import CategoricalValueHead, PolicyHead, ValueHead
+from morris_rl.network.heads import AuxScalarHead, CategoricalValueHead, PolicyHead, ValueHead
 
 
 class ResidualBlock(nn.Module):
@@ -55,6 +55,8 @@ class MorrisResNet(nn.Module):
         value_head_type: str = "scalar",
         num_positions: int = _DEFAULT_NUM_POSITIONS,
         action_space_size: int = _DEFAULT_ACTION_SPACE_SIZE,
+        aux_heads_enabled: bool = False,
+        aux_head_hidden: int = 64,
     ) -> None:
         super().__init__()
         self.input_conv = nn.Conv1d(num_planes, num_channels, kernel_size=3, padding=1)
@@ -70,6 +72,18 @@ class MorrisResNet(nn.Module):
             )
         else:
             self.value_head = ValueHead(num_channels, num_positions, value_head_hidden)
+
+        self._aux_heads_enabled = aux_heads_enabled
+        if aux_heads_enabled:
+            self.mill_diff_head: AuxScalarHead | None = AuxScalarHead(
+                num_channels, num_positions, aux_head_hidden
+            )
+            self.pieces_diff_head: AuxScalarHead | None = AuxScalarHead(
+                num_channels, num_positions, aux_head_hidden
+            )
+        else:
+            self.mill_diff_head = None
+            self.pieces_diff_head = None
 
     def add_lora_adapters(self, rank: int = 8, alpha: float = 16.0) -> None:
         """Replace all Linear layers with LoRALinear adapters.
@@ -113,6 +127,7 @@ class MorrisResNet(nn.Module):
         x: torch.Tensor,
         legal_mask: torch.Tensor,
         return_value_logits: bool = False,
+        return_aux: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Run a forward pass.
 
@@ -121,10 +136,14 @@ class MorrisResNet(nn.Module):
             legal_mask: Boolean mask of shape (batch, ACTION_SPACE_SIZE).
             return_value_logits: If True, also return raw value logits (batch, 3).
                                  Only meaningful when value_head_type="categorical".
+            return_aux: If True, also return aux head predictions
+                        (mill_diff_pred, pieces_diff_pred), each of shape (batch,).
+                        Both are None when aux heads are disabled.
 
         Returns:
-            ``(log_policy, scalar)`` by default.
-            ``(log_policy, scalar, logits)`` when ``return_value_logits=True``.
+            By default ``(log_policy, scalar)``. With ``return_value_logits=True``,
+            ``(log_policy, scalar, value_logits)``. With ``return_aux=True``,
+            ``(log_policy, scalar, [value_logits,] mill_diff, pieces_diff)``.
         """
         x = F.relu(self.input_bn(self.input_conv(x)))
         x = self.trunk(x)
@@ -135,6 +154,17 @@ class MorrisResNet(nn.Module):
         else:
             scalar = self.value_head(x)
             logits = None
+
+        if return_aux:
+            if self._aux_heads_enabled:
+                mill_pred = self.mill_diff_head(x)        # type: ignore[misc]
+                pieces_pred = self.pieces_diff_head(x)    # type: ignore[misc]
+            else:
+                mill_pred = None
+                pieces_pred = None
+            if return_value_logits:
+                return log_policy, scalar, logits, mill_pred, pieces_pred  # type: ignore[return-value]
+            return log_policy, scalar, mill_pred, pieces_pred  # type: ignore[return-value]
 
         if return_value_logits:
             return log_policy, scalar, logits  # type: ignore[return-value]

@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from morris_rl.env.board import ACTION_SPACE_SIZE, NUM_PLACE_CAPTURE_ACTIONS, NUM_POSITIONS
+from morris_rl.env.board import (
+    ACTION_SPACE_SIZE,
+    EDGE_INDEX,
+    NUM_PLACE_CAPTURE_ACTIONS,
+    NUM_POSITIONS,
+)
 from morris_rl.env.rules import apply_action, get_legal_actions, initial_state
 from morris_rl.env.symmetries import (
     SYMMETRY_INVERSE_PERMUTATIONS,
@@ -146,11 +151,10 @@ def test_place_action_remapped_correctly() -> None:
 def test_move_action_remapped_correctly() -> None:
     """Under R90, move 0→1 (TL→TM outer) → move 2→3 (TR→MR outer)."""
     policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
-    # Action for 0→1: 24 + 0*24 + 1 = 25
-    policy[NUM_PLACE_CAPTURE_ACTIONS + 0 * NUM_POSITIONS + 1] = 1.0
+    policy[EDGE_INDEX[0, 1]] = 1.0
     result = transform_policy(policy, _R90)
-    # After R90: src=0→2, dst=1→3.  New action: 24 + 2*24 + 3 = 75
-    expected_action = NUM_PLACE_CAPTURE_ACTIONS + 2 * NUM_POSITIONS + 3
+    # After R90: src=0→2, dst=1→3 → new edge (2, 3).
+    expected_action = int(EDGE_INDEX[2, 3])
     assert result[expected_action] == pytest.approx(1.0)
     assert result.sum() == pytest.approx(1.0)
 
