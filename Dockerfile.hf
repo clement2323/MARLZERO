@@ -1,26 +1,67 @@
-FROM python:3.11-slim
+FROM python:3.11
 
-RUN apt-get update && apt-get install -y \
-    build-essential cmake git \
-    && rm -rf /var/lib/apt/lists/*
+# python:3.11 (non-slim) ships libgomp1, libnuma1, recent libstdc++ — required
+# transitive deps of libtorch_cpu.so. Slim strips them and MKL's dlopen fails
+# with "Intel oneMKL FATAL ERROR: Cannot load libtorch_cpu.so".
+# No compile toolchain needed: lightzero is installed from a prebuilt CPU wheel.
 
 WORKDIR /app
 
 COPY pyproject.toml .
+ARG CACHEBUST=8
 COPY src/ src/
 
-# CPU-only torch — avoids the 3 GB CUDA wheel
+# Workaround PyTorch 2.5.x MKL FATAL ERROR: the bundled MKL has a buggy
+# service-layer init that crashes at dlopen(libtorch_cpu.so). Pre-installing
+# standalone mkl + Intel OpenMP wheels gives MKL working libs to find before
+# torch loads. See pytorch/pytorch#129401.
+RUN pip install --no-cache-dir mkl==2024.0.0 intel-openmp==2024.0.0
+
+# Force MKL to use GNU OpenMP (system libgomp) instead of the bundled Intel
+# one, sidestepping the broken service-layer code path entirely.
+ENV MKL_THREADING_LAYER=GNU
+
+# CPU-only torch — PyPI default is cu124; HF Spaces has no GPU.
 RUN pip install --no-cache-dir torch==2.5.1 \
     --index-url https://download.pytorch.org/whl/cpu
 
+# Fail fast if torch import is broken — surface MKL issues here, not later.
+RUN python -c "import torch; print('torch', torch.__version__, 'sum=', torch.zeros(2,2).sum().item())" \
+    || (echo "===== libtorch_cpu.so ldd dump =====" && \
+        ldd /usr/local/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so && \
+        exit 1)
+
+# LightZero CPU wheel prebuilt locally against torch 2.5.1+cpu / cp311 and hosted
+# on HF Hub. Installing it BEFORE `pip install -e .` satisfies the lightzero==0.2.0
+# requirement, so pip won't pull the CUDA-compiled PyPI wheel.
+RUN pip install --no-cache-dir \
+    https://huggingface.co/Clem2323/reversi-checkpoint/resolve/main/lightzero-0.2.0-cp311-cp311-linux_x86_64.whl
+
+# Install package + remaining deps.
 RUN pip install --no-cache-dir -e "."
+
+# ONNX Runtime (alternate inference backend)
+RUN pip install --no-cache-dir onnxruntime onnx
+
+# Re-verify torch after all installs — surface any dep-induced MKL regression.
+# Also verify ctree is importable. `import torch` first puts libtorch_cpu.so
+# symbols in the global symbol table, so ctree.so finds them without
+# LD_LIBRARY_PATH gymnastics (setting LD_LIBRARY_PATH=torch/lib re-triggers
+# the bundled-MKL bug).
+RUN python -c "import torch; print('post-deps torch:', torch.__version__, torch.zeros(2,2).sum().item())" && \
+    python -c "import torch; from lzero.mcts.ctree.ctree_alphazero import MCTS; print('ctree OK')"
 
 # Download checkpoint from HF Hub model repo (avoids binary in git)
 RUN pip install --no-cache-dir huggingface_hub && \
     python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='Clem2323/reversi-checkpoint', filename='checkpoint.pt', local_dir='/app', local_dir_use_symlinks=False)"
 
+# Download ONNX model (used when ctree unavailable)
+RUN python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='Clem2323/reversi-checkpoint', filename='model.onnx', local_dir='/app', local_dir_use_symlinks=False); print('ONNX model downloaded.')" || echo "ONNX model not in HF repo."
+
 ENV MODEL_CHECKPOINT=/app/checkpoint.pt
-ENV NUM_SIMULATIONS=200
+ENV ONNX_MODEL_PATH=/app/model.onnx
+ENV INFERENCE_BACKEND=onnx
+ENV NUM_SIMULATIONS=50
 ENV DEVICE=cpu
 
 EXPOSE 7860

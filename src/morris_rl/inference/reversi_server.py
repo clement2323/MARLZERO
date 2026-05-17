@@ -245,6 +245,15 @@ def _load_network() -> None:
     _device = torch.device(os.getenv("DEVICE", "cpu"))
     _num_simulations = int(os.getenv("NUM_SIMULATIONS", "200"))
 
+    # INFERENCE_BACKEND: "pytorch" (default) | "onnx"
+    # ONNX_MODEL_PATH: path to model.onnx (default: /app/model.onnx)
+    # TORCH_COMPILE: "1" to enable torch.compile (inductor, reduce-overhead)
+    # QUANTIZE_INT8: "1" to apply dynamic INT8 quantization
+    inference_backend = os.getenv("INFERENCE_BACKEND", "pytorch").lower()
+    onnx_model_path = os.getenv("ONNX_MODEL_PATH", "/app/model.onnx")
+    use_compile = os.getenv("TORCH_COMPILE", "0") == "1"
+    use_int8 = os.getenv("QUANTIZE_INT8", "0") == "1"
+
     checkpoint_path = os.getenv("MODEL_CHECKPOINT", "") or _find_latest_checkpoint() or ""
 
     if checkpoint_path and Path(checkpoint_path).exists():
@@ -278,6 +287,21 @@ def _load_network() -> None:
             ).to(_device)
             network.load_state_dict(state_dict)
             network.eval()
+
+            if use_int8 and inference_backend != "onnx":
+                import torch.quantization as tq
+                network = tq.quantize_dynamic(network, {nn.Linear}, dtype=torch.qint8)
+                logger.info("Applied INT8 dynamic quantization to network.")
+
+            if use_compile and inference_backend != "onnx":
+                network = torch.compile(network, backend="inductor", mode="reduce-overhead")
+                # Warmup: one dummy forward so the first real request is not penalised.
+                dummy_x = torch.zeros(1, num_planes, num_positions_ckpt)
+                dummy_mask = torch.ones(1, action_space_size, dtype=torch.bool)
+                with torch.no_grad():
+                    network(dummy_x, dummy_mask)
+                logger.info("torch.compile warmup complete.")
+
             _network = network
 
             reversi_fns = {
@@ -288,16 +312,39 @@ def _load_network() -> None:
                 "encode_state": encode_state,
                 "action_space_size": action_space_size,
             }
-            _search = MorrisSearch(
-                network,
-                _device,
-                num_simulations=_num_simulations,
-                game_fns=reversi_fns,
-            )
+
+            if inference_backend == "onnx" and Path(onnx_model_path).exists():
+                from morris_rl.inference.ort_eval import make_ort_eval_fn
+                logger.info(f"Using ONNX Runtime backend: {onnx_model_path}")
+                eval_fn = make_ort_eval_fn(
+                    onnx_model_path, encode_state, get_legal_actions, action_space_size,
+                    num_threads=2,
+                )
+                _search = MorrisSearch(
+                    eval_fn=eval_fn,
+                    num_simulations=_num_simulations,
+                    game_fns=reversi_fns,
+                )
+                backend_tag = "ORT"
+            elif inference_backend == "onnx":
+                logger.warning(
+                    f"ONNX backend requested but {onnx_model_path} not found — "
+                    "falling back to PyTorch."
+                )
+                _search = MorrisSearch(
+                    network, _device, num_simulations=_num_simulations, game_fns=reversi_fns
+                )
+                backend_tag = "PyTorch"
+            else:
+                _search = MorrisSearch(
+                    network, _device, num_simulations=_num_simulations, game_fns=reversi_fns
+                )
+                backend_tag = "PyTorch"
 
             step = payload.get("step", "?")
             _checkpoint_label = (
-                f"ResNet{num_blocks}×{num_channels} step={step} ({_num_simulations} sims)"
+                f"ResNet{num_blocks}×{num_channels} step={step} "
+                f"({_num_simulations} sims, {backend_tag})"
             )
             _default_agent_id = _AGENT_CHECKPOINT
             logger.info(f"Loaded Reversi checkpoint: {checkpoint_path} (step {step})")

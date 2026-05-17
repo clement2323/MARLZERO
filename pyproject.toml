@@ -24,6 +24,7 @@ dependencies = [
     "mlflow[auth]>=2.5",
     "streamlit>=1.35",
     "plotly>=5.22",
+    "huggingface-hub>=1.15.0",
 ]
 
 [tool.uv.sources]
@@ -33,6 +34,13 @@ torch = { index = "pytorch-cu124" }
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[project.optional-dependencies]
+# For CPU inference optimisation (ONNX export + ORT backend)
+onnx = [
+    "onnxruntime>=1.18",
+    "onnx>=1.16",
+]
 
 [dependency-groups]
 dev = [
