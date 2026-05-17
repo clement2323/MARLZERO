@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Draw Attractor — Diagnostic &amp; Solutions</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1c2128;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --orange: #d29922;
+      --yellow: #e3b341;
+      --purple: #bc8cff;
+      --cyan: #39d353;
+      --code-bg: #161b22;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.7;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--text);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+      margin-bottom: 8px;
+    }
+    h1 span { color: var(--red); }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 40px;
+    }
+
+    h2 {
+      font-size: 1.3rem;
+      font-weight: 600;
+      color: var(--accent);
+      margin: 48px 0 16px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--yellow);
+      margin: 24px 0 10px;
+    }
+
+    p { margin-bottom: 12px; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Callout boxes ── */
+    .callout {
+      border-left: 4px solid;
+      background: var(--surface);
+      padding: 14px 18px;
+      border-radius: 0 6px 6px 0;
+      margin: 20px 0;
+    }
+    .callout.red    { border-color: var(--red);    }
+    .callout.orange { border-color: var(--orange); }
+    .callout.green  { border-color: var(--green);  }
+    .callout.blue   { border-color: var(--accent); }
+    .callout.purple { border-color: var(--purple); }
+
+    .callout .label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 4px;
+    }
+    .callout.red    .label { color: var(--red);    }
+    .callout.orange .label { color: var(--orange); }
+    .callout.green  .label { color: var(--green);  }
+    .callout.blue   .label { color: var(--accent); }
+    .callout.purple .label { color: var(--purple); }
+
+    /* ── Metrics table ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      font-size: 0.88rem;
+    }
+    th {
+      background: var(--surface2);
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.05em;
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    tr:hover td { background: var(--surface); }
+
+    .bad  { color: var(--red);    font-weight: 600; }
+    .ok   { color: var(--orange); font-weight: 600; }
+    .good { color: var(--green);  font-weight: 600; }
+    .na   { color: var(--muted); }
+
+    /* ── Code blocks ── */
+    pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 20px;
+      overflow-x: auto;
+      font-size: 0.82rem;
+      line-height: 1.6;
+      margin: 16px 0;
+    }
+    code {
+      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+    }
+    pre code { color: #c9d1d9; }
+
+    .kw  { color: #ff7b72; }  /* keyword */
+    .fn  { color: #d2a8ff; }  /* function */
+    .st  { color: #a5d6ff; }  /* string */
+    .cm  { color: #8b949e; font-style: italic; }  /* comment */
+    .nu  { color: #79c0ff; }  /* number */
+    .cl  { color: #ffa657; }  /* class/type */
+
+    /* ── Loop diagram ── */
+    .loop {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0;
+      margin: 28px auto;
+      max-width: 560px;
+    }
+    .loop-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 20px;
+      text-align: center;
+      font-size: 0.88rem;
+      width: 100%;
+    }
+    .loop-box.bad { border-color: var(--red); }
+    .loop-arrow {
+      color: var(--red);
+      font-size: 1.4rem;
+      line-height: 1;
+      margin: 2px 0;
+    }
+
+    /* ── Solution cards ── */
+    .solution-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 22px;
+      margin: 18px 0;
+      position: relative;
+    }
+    .solution-card .badge {
+      position: absolute;
+      top: -10px;
+      left: 16px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .solution-card.recommended { border-color: var(--green); }
+    .solution-card.recommended .badge { color: var(--green); border-color: var(--green); }
+    .solution-card.secondary { border-color: var(--accent); }
+    .solution-card.secondary .badge { color: var(--accent); border-color: var(--accent); }
+    .solution-card.stretch { border-color: var(--purple); }
+    .solution-card.stretch .badge { color: var(--purple); border-color: var(--purple); }
+
+    .pros-cons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 14px;
+      font-size: 0.84rem;
+    }
+    .pros-cons div {
+      background: var(--surface2);
+      border-radius: 6px;
+      padding: 10px 14px;
+    }
+    .pros-cons .label-pc {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .pros-cons .pro .label-pc  { color: var(--green); }
+    .pros-cons .con .label-pc  { color: var(--red);   }
+    .pros-cons li { margin-left: 14px; margin-top: 4px; }
+
+    /* ── Implementation steps ── */
+    .steps { counter-reset: step; list-style: none; padding: 0; }
+    .steps li {
+      counter-increment: step;
+      display: flex;
+      gap: 16px;
+      margin-bottom: 18px;
+      align-items: flex-start;
+    }
+    .steps li::before {
+      content: counter(step);
+      flex-shrink: 0;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 700;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 2px;
+    }
+
+    /* ── Metrics gauges ── */
+    .gauge-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin: 20px 0;
+    }
+    .gauge {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      text-align: center;
+    }
+    .gauge .g-label { font-size: 0.72rem; color: var(--muted); margin-bottom: 6px; }
+    .gauge .g-value { font-size: 1.6rem; font-weight: 700; }
+    .gauge .g-trend { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+
+    hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+  </style>
+</head>
+<body>
+
+<h1>Draw <span>Attractor</span> — Diagnostic &amp; Solutions</h1>
+<div class="subtitle">Nine Men's Morris · AlphaZero Self-Play · Run analysis 2026-05-04 · step 27 500 → 42 052</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>1. Métriques observées sur le dernier run</h2>
+
+<div class="gauge-row">
+  <div class="gauge">
+    <div class="g-label">Halfmove cap rate</div>
+    <div class="g-value bad">76 %</div>
+    <div class="g-trend">63 % → 76 % ▲</div>
+  </div>
+  <div class="gauge">
+    <div class="g-label">Draw rate global</div>
+    <div class="g-value bad">73 %</div>
+    <div class="g-trend">63 % → 73 % ▲</div>
+  </div>
+  <div class="gauge">
+    <div class="g-label">value_std</div>
+    <div class="g-value bad">0.11</div>
+    <div class="g-trend">0.33 → 0.11 ▼ collapse</div>
+  </div>
+  <div class="gauge">
+    <div class="g-label">Curriculum draw rate</div>
+    <div class="g-value bad">80 %</div>
+    <div class="g-trend">56 % → 80 % ▲▲</div>
+  </div>
+  <div class="gauge">
+    <div class="g-label">Curriculum captures/game</div>
+    <div class="g-value bad">1.27</div>
+    <div class="g-trend">2.36 → 1.27 ▼ anti-feature</div>
+  </div>
+  <div class="gauge">
+    <div class="g-label">Longueur moyenne</div>
+    <div class="g-value bad">572</div>
+    <div class="g-trend">495 → 572 demi-coups ▲</div>
+  </div>
+</div>
+
+<div class="callout red">
+  <div class="label">Signal de danger critique</div>
+  <strong>curriculum/captures_per_game : 2.36 → 1.27</strong> — dans des positions à 4 pièces chacun, <em>une capture = fin de partie</em>. Le réseau a appris à fuir activement les captures dans les positions d'endgame. C'est l'attracteur draw en plein effet : le réseau a intériorisé "ne pas terminer = draw = valeur 0 = normal".
+</div>
+
+<table>
+  <thead>
+    <tr><th>Métrique</th><th>Début run</th><th>Fin run</th><th>Tendance</th><th>Interprétation</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>train/value_loss</code></td><td>0.85</td><td class="ok">0.46</td><td>▼</td><td>Améliore, mais plateau ≈ −log(0.73) = entropie de la distrib draw</td></tr>
+    <tr><td><code>train/value_std</code></td><td>0.33</td><td class="bad">0.11</td><td>▼▼</td><td>Collapse : réseau prédit la même valeur pour tous les états</td></tr>
+    <tr><td><code>train/value_mean</code></td><td>0.008</td><td class="bad">0.005</td><td>→ 0</td><td>Valeur moyenne ≈ 0 partout = "tout est nul"</td></tr>
+    <tr><td><code>train/policy_loss</code></td><td>1.87</td><td class="ok">1.77</td><td>▼</td><td>S'améliore légèrement — policy head apprend la structure du jeu</td></tr>
+    <tr><td><code>normal/win_rate</code></td><td>34 %</td><td class="bad">29 %</td><td>▼</td><td>Jeux normaux de moins en moins décisifs</td></tr>
+    <tr><td><code>game/term_no_legal_moves</code></td><td>9.1 %</td><td class="bad">1.5 %</td><td>▼▼</td><td>Victoires par blocage quasiment éliminées — réseau évite les positions tendues</td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>2. Pourquoi l'attracteur draw se forme</h2>
+
+<div class="loop">
+  <div class="loop-box bad">Réseau aléatoire → valeur ≈ 0 pour tout état</div>
+  <div class="loop-arrow">↓</div>
+  <div class="loop-box bad">MCTS guided par valeur ≈ 0 → exploration aléatoire → parties longues</div>
+  <div class="loop-arrow">↓</div>
+  <div class="loop-box bad">70 % des parties atteignent le plafond (300 coups) → outcome = DRAW = cible 0</div>
+  <div class="loop-arrow">↓</div>
+  <div class="loop-box bad">Buffer rempli de (état, cible=0) → réseau apprend "tout vaut 0"</div>
+  <div class="loop-arrow">↓</div>
+  <div class="loop-box bad">value_std → 0 → gradient de valeur → 0 → réseau figé sur "tout = draw"</div>
+  <div class="loop-arrow">↓ ↑ boucle fermée</div>
+</div>
+
+<p>
+  La clé : <strong>les positions de Nine Men's Morris sont théoriquement nulles avec un jeu parfait</strong> (Gasser 1993). Le réseau a raison d'apprendre que "tout est draw" — le problème est que ce plateau est stable <em>avant</em> que le réseau n'ait appris à jouer. Il s'y installe avant d'avoir vu assez de parties décisives pour discriminer les positions.
+</p>
+
+<div class="callout orange">
+  <div class="label">Asymétrie fondamentale</div>
+  Les draws fournissent un signal dense, stable et cohérent (cible = 0 toujours). Les wins/losses sont rares, bruités, et se contredisent souvent (position P jouée par A → +1, jouée par B → −1 selon qui gagne). Le réseau optimise naturellement en faveur du signal le plus stable = draws.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>3. Pourquoi la categorical head n'a pas suffi</h2>
+
+<p>La categorical head (KataGo-style) aide à éviter un problème spécifique : le <em>lazy-mean collapse</em> où une value head MSE prédit 0 pour tout car c'est le minimum de E[(z)²] quand z ∈ {−1, 0, +1}. La categorical cross-entropy force le réseau à prédire une <em>distribution</em>, pas juste une moyenne.</p>
+
+<p>Mais notre run montre que ça n'a pas suffi. Voici pourquoi :</p>
+
+<table>
+  <thead><tr><th>Problème</th><th>Ce que categorical head résout</th><th>Ce qu'elle ne résout pas</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Draw rate 73 % dans le buffer</td>
+      <td>Peut correctement modéliser P(draw)=0.73</td>
+      <td class="bad">P(win)−P(loss) ≈ 0 quand P(draw) domine → même signal MCTS nul</td>
+    </tr>
+    <tr>
+      <td>value_std collapse</td>
+      <td>Réduit le risque de tout prédire exactement 0</td>
+      <td class="bad">Si P(draw) ≈ 1 partout, scalar = P(win)−P(loss) ≈ 0 partout quand même</td>
+    </tr>
+    <tr>
+      <td>Distribution d'outcomes</td>
+      <td>Meilleure calibration win/draw/loss</td>
+      <td class="bad">Mais si le buffer ne contient que des draws, calibration = "tout vaut draw"</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout blue">
+  <div class="label">Insight clé</div>
+  La categorical head résout un problème d'architecture (lazy-mean collapse). L'attracteur draw est un problème de <strong>distribution de données</strong> — le buffer contient 73 % de draws donc le réseau apprend correctement que "tout est draw". Aucun changement de loss function ne peut corriger une mauvaise distribution de données d'entraînement.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>4. Solutions — du plus simple au plus complet</h2>
+
+<!-- ── Solution A ── -->
+<div class="solution-card recommended">
+  <div class="badge">✓ Recommandé · Immédiat</div>
+  <h3>A. Tiebreaker pièces/moulins à la limite de coups (ton idée)</h3>
+
+  <p>
+    Au lieu de déclarer DRAW quand la partie atteint 300 demi-coups, on déclare <strong>WINNER = le joueur avec le plus de pièces sur le plateau</strong>. En cas d'égalité stricte, on utilise le nombre de moulins comme second critère, et seulement sinon : DRAW.
+  </p>
+
+  <p><strong>Pourquoi c'est sound :</strong> dans Nine Men's Morris, les pièces sur le plateau <em>sont</em> l'objectif. Réduire l'adversaire à &lt; 3 pièces = victoire. Avoir plus de pièces à la limite = position matériellement supérieure = on aurait probablement gagné avec plus de temps. C'est un proxy exact de la qualité de jeu.</p>
+
+  <div class="pros-cons">
+    <div class="pro">
+      <div class="label-pc">✓ Avantages</div>
+      <ul>
+        <li>Élimine ~60 % des draws synthétiques dans le buffer</li>
+        <li>Signal de valeur binaire clair sur des positions auparavant bruitées</li>
+        <li>Proxy réaliste : plus de pièces = réellement en train de gagner</li>
+        <li>1 changement de code dans <code>_assign_value_targets</code></li>
+        <li>Compatible avec tous les checkpoints existants</li>
+      </ul>
+    </div>
+    <div class="con">
+      <div class="label-pc">✗ Limites</div>
+      <ul>
+        <li>Outcomes synthétiques ≠ vraies règles (mais OK pour l'entraînement)</li>
+        <li>Peut inciter à accumuler des pièces plutôt qu'à former des moulins tactiques</li>
+        <li>Agent entraîné joue différemment de la règle officielle en éval</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 style="margin-top: 20px;">Implémentation dans <code>self_play.py</code></h3>
+
+  <pre><code><span class="kw">def</span> <span class="fn">_tiebreak_outcome</span>(state: <span class="cl">GameState</span>) -> <span class="cl">Outcome</span> | <span class="cl">None</span>:
+    <span class="st">"""Déclare le winner par pièces à la limite de coups."""</span>
+    <span class="kw">from</span> morris_rl.env.rules <span class="kw">import</span> pieces_on_board
+    p1 = pieces_on_board(state.board, <span class="nu">1</span>) + state.pieces_in_hand[<span class="nu">0</span>]
+    p2 = pieces_on_board(state.board, <span class="nu">2</span>) + state.pieces_in_hand[<span class="nu">1</span>]
+    <span class="kw">if</span> p1 > p2: <span class="kw">return</span> <span class="cl">Outcome</span>.PLAYER_1_WINS
+    <span class="kw">if</span> p2 > p1: <span class="kw">return</span> <span class="cl">Outcome</span>.PLAYER_2_WINS
+    <span class="cm"># Égalité stricte : second critère = moulins</span>
+    mills1 = <span class="fn">count_mills</span>(state.board, <span class="nu">1</span>)
+    mills2 = <span class="fn">count_mills</span>(state.board, <span class="nu">2</span>)
+    <span class="kw">if</span> mills1 > mills2: <span class="kw">return</span> <span class="cl">Outcome</span>.PLAYER_1_WINS
+    <span class="kw">if</span> mills2 > mills1: <span class="kw">return</span> <span class="cl">Outcome</span>.PLAYER_2_WINS
+    <span class="kw">return None</span>  <span class="cm"># vrai draw</span>
+
+<span class="cm"># Dans _play_game(), remplacer :</span>
+<span class="cm"># _, outcome = is_terminal(state)</span>
+<span class="cm"># term_reason = _detect_term_reason(state, outcome)</span>
+<span class="cm"># Par :</span>
+_, outcome = <span class="fn">is_terminal</span>(state)
+term_reason = <span class="fn">_detect_term_reason</span>(state, outcome)
+<span class="kw">if</span> term_reason == <span class="st">"halfmove_cap"</span>:
+    tiebreak = <span class="fn">_tiebreak_outcome</span>(state)
+    <span class="kw">if</span> tiebreak <span class="kw">is not None</span>:
+        outcome = tiebreak
+        term_reason = <span class="st">"halfmove_cap_tiebreak"</span>  <span class="cm"># pour les métriques</span></code></pre>
+
+  <div class="callout green">
+    <div class="label">Impact attendu</div>
+    Sur les parties actuelles : 73 % sont des draws dont ~70 % atteignent le halfmove cap. Parmi celles-ci, la majorité auront un avantage matériel mesurable → ~50-60 % de ces games deviennent décisives → buffer : ~25-30 % de draws seulement au lieu de 73 %. Signal de gradient massivement amélioré.
+  </div>
+</div>
+
+<!-- ── Solution B ── -->
+<div class="solution-card recommended">
+  <div class="badge">✓ Recommandé · Complémentaire</div>
+  <h3>B. Curriculum pieces_per_player=3 (au lieu de 4)</h3>
+
+  <p>
+    Avec 3 pièces par joueur (0 en main), le plateau est quasi-terminal. Une capture immédiate = fin de partie. Le signal de valeur est binaire et non-ambigu : "est-ce que je peux capturer maintenant ?"
+  </p>
+
+  <table>
+    <thead><tr><th>pieces_per_player</th><th>Coups avant fin typique</th><th>Draw rate observé</th><th>Signal gradient</th></tr></thead>
+    <tbody>
+      <tr><td>6 (runs précédents)</td><td>>400</td><td>~80 %</td><td class="bad">Très faible</td></tr>
+      <tr><td>4 (run actuel)</td><td>~400-500</td><td class="bad">80 %</td><td class="bad">Faible (pire que 6 !)</td></tr>
+      <tr><td>3 (recommandé)</td><td>10-50</td><td class="ok">estimé ~30-40 %</td><td class="good">Fort</td></tr>
+    </tbody>
+  </table>
+
+  <p>Avec 4 pièces, il reste 3 captures avant la fin → les parties peuvent encore s'éterniser. Avec 3 pièces, <em>la première capture termine tout</em> → positions ultra-décisives même avec un réseau faible.</p>
+</div>
+
+<!-- ── Solution C ── -->
+<div class="solution-card secondary">
+  <div class="badge">◎ Complémentaire · Moyen terme</div>
+  <h3>C. Cible de valeur continue (pièce-diff normalisée)</h3>
+
+  <p>
+    Au lieu de cible ∈ {−1, 0, +1}, utiliser la différence de pièces normalisée à la fin de partie comme valeur cible. Cela transforme le problème de classification 3-classes en <strong>régression continue</strong>.
+  </p>
+
+  <pre><code><span class="cm"># Dans _assign_value_targets, au lieu de v = ±1 ou 0 :</span>
+<span class="kw">def</span> <span class="fn">_piece_diff_value</span>(final_state, player) -> <span class="cl">float</span>:
+    p_mine = pieces_on_board(final_state.board, player)
+    p_opp  = pieces_on_board(final_state.board, <span class="fn">opponent</span>(player))
+    <span class="cm"># Normalisé dans [-1, 1]. +1 = 9 pièces d'avance (max théorique).</span>
+    <span class="kw">return</span> (p_mine - p_opp) / <span class="nu">9.0</span>
+
+<span class="cm"># Pour les parties décisives, garder ±1 (c'est la vraie info)</span>
+<span class="cm"># Pour halfmove_cap (was draw) → utiliser piece_diff_value</span>
+<span class="kw">if</span> outcome <span class="kw">is None</span> <span class="kw">or</span> outcome == <span class="cl">Outcome</span>.DRAW:
+    <span class="kw">if</span> term_reason == <span class="st">"halfmove_cap"</span>:
+        v = <span class="fn">_piece_diff_value</span>(final_state, player)  <span class="cm"># signal continu</span>
+    <span class="kw">else</span>:
+        v = <span class="nu">0.0</span>  <span class="cm"># vrai draw (threefold, etc.)</span></code></pre>
+
+  <p>
+    <strong>Compatibilité :</strong> fonctionne avec la categorical head (clamp la cible à {-1, 0, +1}) <em>ou</em> avec une value head scalaire MSE classique. Pour la categorical, il faudrait adapter le label mapping pour accepter des valeurs continues.
+  </p>
+</div>
+
+<!-- ── Solution D ── -->
+<div class="solution-card secondary">
+  <div class="badge">◎ Efficace · Contempt MCTS</div>
+  <h3>D. MCTS Contempt — biaiser la recherche contre les draws</h3>
+
+  <p>
+    Inspiré de Stockfish et de travaux récents (<a href="https://arxiv.org/html/2504.07757" target="_blank">Search-Contempt arXiv:2504.07757</a>). Pendant le self-play, modifier le backup de valeur MCTS pour pénaliser les positions de draw : ajouter un petit biais vers les actions qui mènent à des positions décisives.
+  </p>
+
+  <pre><code><span class="cm"># Dans _make_local_eval_fn (search.py), appliquer un contempt :</span>
+CONTEMPT = <span class="nu">0.10</span>  <span class="cm"># ajustable, 0.0 = désactivé</span>
+
+<span class="kw">def</span> <span class="fn">evaluate</span>(state) -> <span class="cl">tuple</span>:
+    ...
+    v = <span class="fn">float</span>(value[<span class="nu">0</span>].item())
+    <span class="cm"># Pousser légèrement les valeurs vers ±1, jamais vers 0</span>
+    <span class="cm"># sign(v) * (|v| + CONTEMPT * (1 - |v|))</span>
+    <span class="kw">import</span> math
+    sign = <span class="nu">1.0</span> <span class="kw">if</span> v >= <span class="nu">0</span> <span class="kw">else</span> <span class="nu">-1.0</span>
+    v_contempt = sign * (<span class="fn">abs</span>(v) + CONTEMPT * (<span class="nu">1.0</span> - <span class="fn">abs</span>(v)))
+    <span class="kw">return</span> {a: <span class="fn">float</span>(probs[a]) <span class="kw">for</span> a <span class="kw">in</span> legal}, v_contempt</code></pre>
+
+  <p>Effet : dans les positions symétriques (v≈0), MCTS explore plus agressivement les branches décisives plutôt que de tourner en rond. Ne change pas les valeurs d'entraînement, seulement la distribution des parties générées.</p>
+</div>
+
+<!-- ── Solution E ── -->
+<div class="solution-card stretch">
+  <div class="badge">★ Stretch · Long terme</div>
+  <h3>E. Positions curriculum asymétriques (déséquilibre matériel)</h3>
+
+  <p>
+    Au lieu de générer des positions <em>symétriques</em> (N vs N pièces), générer des positions <strong>déséquilibrées</strong> : 3 vs 5 pièces, 2 vs 4, etc. Dans ces positions, l'avantage matériel est flagrant et le signal de valeur est clair même avec un réseau faible.
+  </p>
+
+  <pre><code><span class="cm"># Dans random_late_game_state (rules.py), ajouter un mode asymétrique :</span>
+<span class="kw">def</span> <span class="fn">random_asymmetric_state</span>(rng, min_pieces=<span class="nu">2</span>, max_pieces=<span class="nu">5</span>) -> <span class="cl">GameState</span>:
+    p1_pieces = rng.integers(min_pieces, max_pieces + <span class="nu">1</span>)
+    p2_pieces = rng.integers(min_pieces, max_pieces + <span class="nu">1</span>)
+    <span class="cm"># Garder une asymétrie minimale pour que la position soit décisive</span>
+    <span class="kw">while</span> <span class="fn">abs</span>(p1_pieces - p2_pieces) < <span class="nu">1</span>:
+        p2_pieces = rng.integers(min_pieces, max_pieces + <span class="nu">1</span>)
+    ...</code></pre>
+
+  <p>Ces positions ont un "answer" clair : le joueur avec plus de pièces <em>devrait</em> gagner. Le réseau peut apprendre ce signal directement, sans dépendre d'une résolution de longue partie.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>5. Plan d'implémentation recommandé</h2>
+
+<ul class="steps">
+  <li>
+    <div>
+      <strong>Arrêter le run actuel</strong> — le checkpoint 42 052 est contaminé (réseau apprend à fuir les captures). Reprendre depuis <code>checkpoint_00030000.pt</code>.
+    </div>
+  </li>
+  <li>
+    <div>
+      <strong>Implémenter le tiebreaker pièces/moulins</strong> dans <code>self_play.py/_play_game()</code> et ajouter la métrique <code>game/term_halfmove_cap_tiebreak_rate</code> dans le trainer. Environ 30 lignes de code.
+    </div>
+  </li>
+  <li>
+    <div>
+      <strong>Passer curriculum à pieces_per_player=3</strong> et <code>random_start_fraction=0.5</code> — simple override Hydra.
+    </div>
+  </li>
+  <li>
+    <div>
+      <strong>Relancer</strong> avec ces overrides :<br/>
+      <code>curriculum.pieces_per_player=3  curriculum.random_start_fraction=0.5  discard_timeout_games=false  training.resume=...checkpoint_00030000.pt</code>
+    </div>
+  </li>
+  <li>
+    <div>
+      <strong>Surveiller après 500 jeux</strong> : draw_rate doit descendre sous 50 %, curriculum/captures_per_game doit remonter au-dessus de 1.5, value_std doit remonter (signe que le réseau discrimine les positions).
+    </div>
+  </li>
+  <li>
+    <div>
+      <strong>Si draw_rate ne descend pas sous 55 % après 1000 jeux</strong> : ajouter le MCTS contempt (solution D) avec CONTEMPT=0.15.
+    </div>
+  </li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>6. Métriques à surveiller post-fix</h2>
+
+<table>
+  <thead>
+    <tr><th>Métrique</th><th>Valeur actuelle</th><th>Cible 500 jeux</th><th>Cible 2000 jeux</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>game/draw_rate</code></td>
+      <td class="bad">73 %</td>
+      <td class="ok">&lt; 50 %</td>
+      <td class="good">&lt; 35 %</td>
+    </tr>
+    <tr>
+      <td><code>train/value_std</code></td>
+      <td class="bad">0.11</td>
+      <td class="ok">&gt; 0.20</td>
+      <td class="good">&gt; 0.30</td>
+    </tr>
+    <tr>
+      <td><code>curriculum/captures_per_game</code></td>
+      <td class="bad">1.27</td>
+      <td class="ok">&gt; 2.0</td>
+      <td class="good">&gt; 3.0</td>
+    </tr>
+    <tr>
+      <td><code>curriculum/draw_rate</code></td>
+      <td class="bad">80 %</td>
+      <td class="ok">&lt; 40 %</td>
+      <td class="good">&lt; 25 %</td>
+    </tr>
+    <tr>
+      <td><code>game/term_halfmove_cap_rate</code></td>
+      <td class="bad">76 %</td>
+      <td class="ok">&lt; 45 %</td>
+      <td class="good">&lt; 30 %</td>
+    </tr>
+    <tr>
+      <td><code>game/length_mean_window</code></td>
+      <td class="bad">572</td>
+      <td class="ok">&lt; 400</td>
+      <td class="good">&lt; 250</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout green">
+  <div class="label">Critère de succès principal</div>
+  Quand <code>train/value_std</code> remonte au-dessus de 0.25, le réseau discrimine enfin les positions. À ce moment, MCTS commence à fournir un vrai signal directionnel et la policy head peut apprendre quelque chose d'utile. Tout le reste découle de là.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>7. Résumé des approches par efficacité</h2>
+
+<table>
+  <thead>
+    <tr><th>Solution</th><th>Effort</th><th>Impact</th><th>Risque</th><th>Statut</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>A. Tiebreaker pièces à halfmove_cap</strong></td>
+      <td>~30 lignes</td>
+      <td class="good">Élevé · −40 % draws</td>
+      <td class="ok">Faible · proxy raisonnable</td>
+      <td class="good">→ Implémenter maintenant</td>
+    </tr>
+    <tr>
+      <td><strong>B. Curriculum pieces_per_player=3</strong></td>
+      <td>Override Hydra</td>
+      <td class="good">Élevé · positions décisives</td>
+      <td class="good">Nul</td>
+      <td class="good">→ Implémenter maintenant</td>
+    </tr>
+    <tr>
+      <td><strong>C. Cible continue pièce-diff</strong></td>
+      <td>~50 lignes</td>
+      <td class="ok">Moyen · signal plus dense</td>
+      <td class="ok">Faible · heads compatibles</td>
+      <td class="ok">→ Si A+B insuffisants</td>
+    </tr>
+    <tr>
+      <td><strong>D. MCTS Contempt</strong></td>
+      <td>~15 lignes</td>
+      <td class="ok">Moyen · génère plus de décisifs</td>
+      <td class="ok">Faible · hyperparamètre à tuner</td>
+      <td class="ok">→ Si draw_rate &gt; 55 % à J+2</td>
+    </tr>
+    <tr>
+      <td><strong>E. Positions asymétriques</strong></td>
+      <td>~80 lignes</td>
+      <td class="good">Élevé · signal matériel clair</td>
+      <td class="ok">Moyen · distribution différente</td>
+      <td class="na">→ Long terme</td>
+    </tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<div class="callout blue">
+  <div class="label">Références</div>
+  <ul style="margin-left: 18px; font-size: 0.85rem;">
+    <li><a href="https://arxiv.org/abs/1902.10565">KataGo: Accelerating Self-Play Learning in Go — Wu 2019</a></li>
+    <li><a href="https://lczero.org/blog/2020/04/wdl-head/">Win-Draw-Loss Head in Leela Chess Zero</a></li>
+    <li><a href="https://arxiv.org/html/2504.07757">Search-Contempt: A Hybrid MCTS Algorithm — 2025</a></li>
+    <li><a href="https://arxiv.org/abs/1712.01815">AlphaZero: Mastering Chess and Shogi by Self-Play — Silver et al. 2017</a></li>
+    <li>Gasser R. (1993) — Nine Men's Morris is a draw with perfect play</li>
+  </ul>
+</div>
+
+<div style="text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 48px;">
+  Généré pour Nine Men's Morris RL — run 2026-05-04/19-30-45 — step 42 052
+</div>
+
+</body>
+</html>

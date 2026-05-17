@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Hydra / experiments
+outputs/
+multirun/
+.hydra/
+
+# MLflow / training artifacts
+mlflow.db
+mlruns/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Node (frontends ont leur propre .gitignore mais belt & suspenders)
+node_modules/
+dist/
+.parcel-cache/
