@@ -196,8 +196,21 @@ def render_board(
 # ---------------------------------------------------------------------------
 
 
-def load_traces(path: Path, term_filter: str | None = None) -> list[dict[str, Any]]:
-    """Load one or many JSONL files. *path* may be a file or directory."""
+def load_traces(
+    path: Path,
+    term_filter: str | None = None,
+    worker_filter: int | None = None,
+    ts_filter: float | None = None,
+) -> list[dict[str, Any]]:
+    """Load one or many JSONL files. *path* may be a file or directory.
+
+    Filtering (applied in order):
+      term_filter   — match exact term_reason ("piece_count_tiebreak", etc.)
+      worker_filter — keep only games from this worker_id
+      ts_filter     — keep only the trace with the closest ts (single match)
+
+    Output is sorted by ts ascending so --list shows chronological order.
+    """
     files: list[Path]
     if not path.exists():
         raise FileNotFoundError(
@@ -228,9 +241,25 @@ def load_traces(path: Path, term_filter: str | None = None) -> list[dict[str, An
                     continue
                 if term_filter and trace.get("term_reason") != term_filter:
                     continue
+                if worker_filter is not None and int(trace.get("worker", -1)) != worker_filter:
+                    continue
                 traces.append(trace)
+
+    if ts_filter is not None and traces:
+        closest = min(traces, key=lambda t: abs(float(t.get("ts", 0.0)) - ts_filter))
+        traces = [closest]
+
+    traces.sort(key=lambda t: float(t.get("ts", 0.0)))
+
     if not traces:
-        raise ValueError(f"No traces matched (filter={term_filter!r})")
+        msg = "No traces matched ("
+        msg += ", ".join(
+            f"{k}={v!r}" for k, v in [
+                ("term", term_filter), ("worker", worker_filter), ("ts", ts_filter)
+            ] if v is not None
+        ) or "no filters"
+        msg += ")"
+        raise ValueError(msg)
     return traces
 
 
@@ -362,26 +391,53 @@ def interactive_replay(trace: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    import time as _time
+
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("path", type=Path, help="Trace .jsonl file or directory containing worker_*.jsonl")
-    p.add_argument("-i", "--index", type=int, default=0, help="Game index inside the trace (default 0)")
-    p.add_argument("--filter", default=None, help="Only load games with this term_reason (e.g. halfmove_cap)")
-    p.add_argument("--list", action="store_true", help="Print a summary of matching games and exit")
+    p.add_argument("-i", "--index", type=int, default=None,
+                   help="Game index in the filtered+sorted list (default: 0, or -1 with --latest)")
+    p.add_argument("--filter", default=None,
+                   help="Only load games with this term_reason (e.g. piece_count_tiebreak)")
+    p.add_argument("--worker", type=int, default=None,
+                   help="Only load games produced by this worker_id")
+    p.add_argument("--ts", type=float, default=None,
+                   help="Pick the single game with ts closest to this Unix timestamp")
+    p.add_argument("--latest", action="store_true",
+                   help="Pick the most recently produced game (highest ts in filtered list)")
+    p.add_argument("--list", action="store_true",
+                   help="Print a summary of matching games (with timestamps) and exit")
     args = p.parse_args()
 
-    traces = load_traces(args.path, term_filter=args.filter)
+    traces = load_traces(
+        args.path,
+        term_filter=args.filter,
+        worker_filter=args.worker,
+        ts_filter=args.ts,
+    )
 
     if args.list:
-        print(f"{len(traces)} game(s) loaded" + (f" (filter={args.filter})" if args.filter else "") + ":")
+        filters = []
+        if args.filter: filters.append(f"term={args.filter}")
+        if args.worker is not None: filters.append(f"worker={args.worker}")
+        if args.ts is not None: filters.append(f"ts≈{args.ts}")
+        filter_str = f" ({', '.join(filters)})" if filters else ""
+        print(f"{len(traces)} game(s) loaded{filter_str}:")
         for i, t in enumerate(traces):
-            print(f"  [{i:>4}] worker={t.get('worker')}  len={t['length']:>3}  "
-                  f"term={t['term_reason']:<18}  outcome={t['outcome']}")
+            ts_str = _time.strftime("%H:%M:%S", _time.localtime(float(t.get("ts", 0))))
+            print(f"  [{i:>4}] {ts_str}  worker={t.get('worker'):>2}  "
+                  f"len={t['length']:>3}  term={t['term_reason']:<22}  outcome={t['outcome']}")
         return
 
-    if not (0 <= args.index < len(traces)):
-        sys.exit(f"--index {args.index} out of range (0..{len(traces)-1})")
+    # Default selection: --latest → last (most recent), else --index, else 0.
+    if args.index is None:
+        index = len(traces) - 1 if args.latest else 0
+    else:
+        index = args.index
+    if not (0 <= index < len(traces)):
+        sys.exit(f"index {index} out of range (0..{len(traces)-1})")
 
-    interactive_replay(traces[args.index])
+    interactive_replay(traces[index])
 
 
 if __name__ == "__main__":
