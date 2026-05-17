@@ -110,9 +110,14 @@ self_play:
   # No external winning-side label is injected; the network plays the
   # game from this start as usual.
   curriculum:
-    enabled: false
-    random_start_fraction: 0.5    # fraction of games started from random mid-game
-    pieces_per_player: 6          # per-side piece count at the random start
+    # Enabled by default: 30% of games start from a 5v5 random mid-game
+    # position, which dramatically shortens self-play (~20-30 moves instead
+    # of 100-200) and feeds the buffer with decisive endgame outcomes —
+    # giving the value head clean win/loss signals at every step, instead
+    # of the noisy tiebreak it would get from many full-length games.
+    enabled: true
+    random_start_fraction: 0.3
+    pieces_per_player: 5
   # Discard halfmove-cap games from the replay buffer entirely. Their value=0
   # targets on non-draw positions reinforce the draw attractor. Enabled = fewer
   # samples but cleaner signal; the curriculum compensates with more decisive games.

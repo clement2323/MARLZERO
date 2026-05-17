@@ -80,25 +80,55 @@ def _make_step(player: int, is_full: bool = True) -> tuple:
     )
 
 
-def test_value_target_winner_gets_plus_one() -> None:
-    from morris_rl.env.rules import Outcome
-
-    records = _assign_value_targets([_make_step(1)], Outcome.PLAYER_1_WINS)
-    assert records[0].value_target == pytest.approx(1.0)
-
-
-def test_value_target_loser_gets_minus_one() -> None:
-    from morris_rl.env.rules import Outcome
-
-    records = _assign_value_targets([_make_step(2)], Outcome.PLAYER_1_WINS)
-    assert records[0].value_target == pytest.approx(-1.0)
-
-
 def test_value_target_draw_is_zero() -> None:
     from morris_rl.env.rules import Outcome
 
     records = _assign_value_targets([_make_step(1)], Outcome.DRAW)
     assert records[0].value_target == pytest.approx(0.0)
+
+
+def test_hybrid_value_winner_with_zero_margin() -> None:
+    """Sign-only signal (no piece margin) → 0.7 * (+1) = 0.7."""
+    from morris_rl.env.rules import Outcome
+
+    records = _assign_value_targets(
+        [_make_step(1)], Outcome.PLAYER_1_WINS, final_pieces_diff=0
+    )
+    assert records[0].value_target == pytest.approx(0.7)
+
+
+def test_hybrid_value_loser_with_zero_margin() -> None:
+    from morris_rl.env.rules import Outcome
+
+    records = _assign_value_targets(
+        [_make_step(2)], Outcome.PLAYER_1_WINS, final_pieces_diff=0
+    )
+    assert records[0].value_target == pytest.approx(-0.7)
+
+
+def test_hybrid_value_decisive_win_close_to_one() -> None:
+    """Win by elimination (8v2 → +6 pieces) should push value near +1."""
+    import math
+    from morris_rl.env.rules import Outcome
+
+    records = _assign_value_targets(
+        [_make_step(1)], Outcome.PLAYER_1_WINS, final_pieces_diff=6
+    )
+    expected = 0.7 + 0.3 * math.tanh(6 / 4.0)  # ~0.972
+    assert records[0].value_target == pytest.approx(expected)
+
+
+def test_hybrid_value_flips_sign_for_player2_perspective() -> None:
+    """final_pieces_diff is P1-perspective; P2 sees it negated."""
+    import math
+    from morris_rl.env.rules import Outcome
+
+    # P2 wins, +3 pieces (P2 has 3 more) → final_pieces_diff = -3 (P1's view)
+    records = _assign_value_targets(
+        [_make_step(2)], Outcome.PLAYER_2_WINS, final_pieces_diff=-3
+    )
+    expected = 0.7 + 0.3 * math.tanh(3 / 4.0)  # P2 perspective: +3
+    assert records[0].value_target == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +168,13 @@ def test_play_game_policy_sums_to_one(search: MorrisSearch) -> None:
         assert abs(sample.policy_target.sum() - 1.0) < 1e-4
 
 
-def test_play_game_value_targets_in_valid_set(search: MorrisSearch) -> None:
+def test_play_game_value_targets_in_valid_range(search: MorrisSearch) -> None:
+    """Hybrid value targets live in [-1, +1]; non-draw outcomes have |v| >= 0.4
+    (the sign weight 0.7 minus the maximum opposing margin contribution 0.3)."""
     result = _play_game(search, temperature_threshold=2)
     for sample in result.samples:
-        assert sample.value_target in {-1.0, 0.0, 1.0}
+        v = sample.value_target
+        assert -1.0 <= v <= 1.0, f"value_target {v} out of range"
 
 
 def test_play_game_policy_nonnegative(search: MorrisSearch) -> None:
@@ -219,8 +252,11 @@ def test_play_game_resigns_when_threshold_crossed(monkeypatch) -> None:
         # Reconstructing the player from the encoded state isn't trivial,
         # but the resign forfeit means at least one v=-1 and one v=+1.
         pass
-    sign_set = {sample.value_target for sample in result.samples}
-    assert sign_set <= {-1.0, 1.0}
+    # Hybrid targets: |v| is bounded by 0.4 (sign 0.7 minus max margin 0.3)
+    # and 1.0. Sign should be either positive or negative — no draws.
+    for sample in result.samples:
+        v = sample.value_target
+        assert 0.4 <= abs(v) <= 1.0, f"value_target {v} outside hybrid range"
 
 
 def test_play_game_playout_cap_fast_moves_skipped_from_buffer() -> None:

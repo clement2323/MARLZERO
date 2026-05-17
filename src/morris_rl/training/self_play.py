@@ -127,10 +127,10 @@ def _maybe_log_trace(record: "GameRecord", worker_id: int, game: str = "morris")
     training. Each worker writes to its own file ``worker_{id}.jsonl`` (no
     inter-worker contention, no file lock needed).
 
-    Sampling : every game with ``term_reason=='halfmove_cap'`` is logged
-    unconditionally (these are the ones the user wants to inspect — long
-    games hitting the cap). Other games are logged at the rate set by
-    ``MORRIS_TRACE_SAMPLE_RATE`` (default 0.02 = 2%).
+    Sampling : every game with ``term_reason=='piece_count_tiebreak'`` is
+    logged unconditionally (these are the long ones decided by the move-200
+    cap — the ones the user wants to inspect). Other games are logged at
+    the rate set by ``MORRIS_TRACE_SAMPLE_RATE`` (default 0.02 = 2%).
 
     Schema (one JSON object per line) :
         { "ts": float, "worker": int, "game": str, "outcome": int,
@@ -139,7 +139,7 @@ def _maybe_log_trace(record: "GameRecord", worker_id: int, game: str = "morris")
     trace_dir = os.environ.get("MORRIS_TRACE_DIR")
     if not trace_dir:
         return
-    always_log = record.term_reason == "halfmove_cap"
+    always_log = record.term_reason == "piece_count_tiebreak"
     if not always_log:
         try:
             sample_rate = float(os.environ.get("MORRIS_TRACE_SAMPLE_RATE", "0.02"))
@@ -261,6 +261,43 @@ def _temperature_for_move(move_number: int, threshold: int) -> float:
     return 1.0 if move_number < threshold else _ARGMAX_TEMPERATURE
 
 
+_HYBRID_OUTCOME_WEIGHT: float = 0.7
+_HYBRID_MARGIN_WEIGHT: float = 0.3
+_HYBRID_MARGIN_SCALE: float = 4.0   # tanh(piece_diff / scale) — controls saturation
+
+
+def _hybrid_value_target(
+    outcome: Outcome | None, perspective_player: int, final_pieces_diff: int
+) -> float:
+    """Continuous value target in [-1, +1] blending outcome sign with margin.
+
+    Pure binary {-1, 0, +1} targets force the network to assign the same
+    value to a marginal win (1-piece tiebreak) and a decisive elimination
+    (opponent reduced to 2). That ambiguity caps the MSE plancher because
+    visually-similar positions have outcomes that differ in magnitude.
+
+    Hybrid = 0.7 * sign(outcome) + 0.3 * tanh(margin / 4)
+      win by elimination 8v2 → ~+0.97  (decisive)
+      win by tiebreak  5v4   → ~+0.77  (marginal)
+      draw                   →   0.00
+      loss by tiebreak       → ~-0.77
+      loss by elimination    → ~-0.97
+
+    Sign is preserved → optimal policy unchanged (the network still prefers
+    winning to losing). Only the magnitude is calibrated to reflect how
+    decisively the game was won.
+    """
+    import math
+
+    if outcome is None or outcome == Outcome.DRAW:
+        return 0.0
+    sign = 1.0 if int(outcome) == perspective_player else -1.0
+    # final_pieces_diff is stored from P1's perspective; flip for P2.
+    own_minus_opp = final_pieces_diff if perspective_player == 1 else -final_pieces_diff
+    margin = math.tanh(own_minus_opp / _HYBRID_MARGIN_SCALE)
+    return _HYBRID_OUTCOME_WEIGHT * sign + _HYBRID_MARGIN_WEIGHT * margin
+
+
 def _assign_value_targets(
     steps: list[
         tuple[
@@ -275,9 +312,11 @@ def _assign_value_targets(
     ],
     outcome: Outcome | None,
     term_reason: str = "unknown",
+    final_pieces_diff: int = 0,
 ) -> list[SampleRecord]:
-    """Convert per-step tuples into SampleRecords.
+    """Convert per-step tuples into SampleRecords with hybrid value targets.
 
+    See :func:`_hybrid_value_target` for the value-blending rationale.
     Fast-sim plies (was_full_sim=False, playout cap) are skipped so they
     don't pollute the buffer.
     """
@@ -285,12 +324,7 @@ def _assign_value_targets(
     for encoded, policy, player, mask, was_full_sim, mill_diff, pieces_diff in steps:
         if not was_full_sim:
             continue
-        if outcome is None or outcome == Outcome.DRAW:
-            v = 0.0
-        elif int(outcome) == player:
-            v = 1.0
-        else:
-            v = -1.0
+        v = _hybrid_value_target(outcome, player, final_pieces_diff)
         records.append(
             SampleRecord(
                 encoded_state=encoded,
@@ -524,7 +558,7 @@ def _play_game(
     samples = (
         []
         if timeout_discarded
-        else _assign_value_targets(steps, outcome, term_reason)
+        else _assign_value_targets(steps, outcome, term_reason, final_pieces_diff)
     )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(

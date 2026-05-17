@@ -233,41 +233,39 @@ def get_legal_actions(state: GameState) -> list[int]:
     candidates = _legal_move_actions(state)
     if not state.recent_position_keys:
         return candidates
-    recent = set(state.recent_position_keys)
-    # Inline the key computation for each candidate: a move only changes
-    # board[src]→EMPTY and board[dst]→player, never affects pieces_in_hand
-    # or must_capture (mill-forming moves go through must_capture flag flip
-    # which IS reflected in the key, see below). Avoids the cost of a full
-    # apply_action (dict copy + tuple append) per candidate × O(15 candidates)
-    # × O(800 MCTS sims) per move.
+    # Convert the recent tuple-keys to bytes once so per-candidate lookups
+    # are O(1) hash on a flat bytes buffer instead of O(28) tuple hashing.
+    # tuple-keys come from _position_key: (b0..b23, current_player,
+    # must_capture, p1_hand, p2_hand) — 28 ints, all small enough for bytes.
+    recent_bytes: set[bytes] = {
+        bytes(t[:NUM_POSITIONS]) + bytes(t[NUM_POSITIONS:])
+        for t in state.recent_position_keys
+    }
     legal = []
     board = state.board
     opp = opponent(state.current_player)
+    p1h, p2h = state.pieces_in_hand
+    cur = state.current_player
     for a in candidates:
         src, dst = MOVE_EDGES[a - NUM_PLACE_CAPTURE_ACTIONS]
-        # Simulate board update
         original_src = int(board[src])
         original_dst = int(board[dst])
         board[src] = EMPTY
-        board[dst] = state.current_player
-        # Mill formation flips must_capture and the current player stays.
-        forms = forms_mill(board, dst, state.current_player)
-        if forms:
-            next_player = state.current_player
-            next_must_capture = True
+        board[dst] = cur
+        # Mill formation flips must_capture and keeps the current player.
+        if forms_mill(board, dst, cur):
+            next_player = cur
+            next_must_capture = 1
         else:
             next_player = opp
-            next_must_capture = False
-        key = (
-            *board.tolist(),
-            next_player,
-            int(next_must_capture),
-            *state.pieces_in_hand,
-        )
-        # Restore board immediately
+            next_must_capture = 0
+        # bytes(numpy_int8_array) is a C memcpy of 24 bytes (~0.3µs), vs
+        # ~5µs for *board.tolist() + tuple construction. Hot path called
+        # ~15 candidates × ~800 MCTS sims per move, so the speedup matters.
+        key_bytes = bytes(board) + bytes((next_player, next_must_capture, p1h, p2h))
         board[src] = original_src
         board[dst] = original_dst
-        if key not in recent:
+        if key_bytes not in recent_bytes:
             legal.append(a)
     return legal
 
