@@ -143,6 +143,13 @@ self_play:
     low_temp_value: 0.0
     high_noise_alpha: 1.0        # Dirichlet α for the high-noise side
     high_noise_epsilon: 0.5      # mix fraction for the high-noise side
+    # Random-opening regime: one randomly-chosen side plays uniformly random
+    # for the first random_opening_k plies; the other side plays MCTS normal.
+    # After ply K both sides resume normal play. Random plies are NOT recorded
+    # in the buffer (uniform policy target is useless). Goal: diversify start
+    # positions to break the draw attractor.
+    prob_random_opening: 0.0
+    random_opening_k: 4
   # Discard halfmove-cap games from the replay buffer entirely. Their value=0
   # targets on non-draw positions reinforce the draw attractor. Enabled = fewer
   # samples but cleaner signal; the curriculum compensates with more decisive games.

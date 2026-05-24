@@ -114,6 +114,9 @@ class GameRecord:
     # is disabled (every move counted as "full").
     full_sim_moves: int = 0   # plies that ran the full-sim search
     fast_sim_moves: int = 0   # plies that ran the fast-sim search
+    # Random-opening regime (Phase 3 v3). Plies where one side was forced
+    # to play uniformly random for the first K moves. Excluded from buffer.
+    random_opening_moves: int = 0
 
     # Curriculum observability (Phase 3). True if this game started from
     # a random late-game position rather than initial_state(). Pieces is
@@ -132,9 +135,11 @@ class GameRecord:
     # Asymmetric self-play regime (Phase 3). When asymmetric self-play is
     # enabled, each game is sampled into one of three regimes used to
     # break the Nash-conservative draw attractor:
-    #   "sym"        — both players: T-schedule + Dirichlet α=0.3 (standard)
-    #   "t_asym"     — one player T=1.0 always, the other T=0
-    #   "noise_asym" — one player Dirichlet α=1.0 mix=0.5, the other standard
+    #   "sym"            — both players: T-schedule + Dirichlet α=0.3 (standard)
+    #   "t_asym"         — one player T=1.0 always, the other T=0
+    #   "noise_asym"     — one player Dirichlet α=1.0 mix=0.5, the other standard
+    #   "random_opening" — one player plays uniformly random for K plies, the
+    #                      other plays MCTS normal; random plies excluded from buffer
     # Tracked here so the trainer can log per-regime length / decisive rate.
     regime: str = "sym"
 
@@ -303,6 +308,12 @@ class AsymmetricConfig:
     # side's plies only. The other side keeps the standard search.
     high_noise_alpha: float = 1.0
     high_noise_epsilon: float = 0.5
+    # Random-opening regime: one randomly-chosen side plays uniformly at
+    # random for the first random_opening_k plies; the other side plays
+    # normal MCTS. After ply K both sides resume normal MCTS. Random plies
+    # are NOT recorded to the buffer (uniform policy target = useless).
+    prob_random_opening: float = 0.0
+    random_opening_k: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +410,8 @@ def _sample_regime(
     regime_params has:
       - "high_side": 1 or 2 (which player gets the "high" treatment for
         t_asym / noise_asym; for sym this is absent and unused).
+      - "random_side", "k": for random_opening only — which side plays the
+        first K plies uniformly random.
     """
     if not cfg.enabled:
         return "sym", {}
@@ -409,7 +422,13 @@ def _sample_regime(
     cum += cfg.prob_t_asym
     if r < cum:
         return "t_asym", {"high_side": int(rng.choice([1, 2]))}
-    return "noise_asym", {"high_side": int(rng.choice([1, 2]))}
+    cum += cfg.prob_noise_asym
+    if r < cum:
+        return "noise_asym", {"high_side": int(rng.choice([1, 2]))}
+    return "random_opening", {
+        "random_side": int(rng.choice([1, 2])),
+        "k": int(cfg.random_opening_k),
+    }
 
 
 def _play_game(
@@ -533,6 +552,7 @@ def _play_game(
     )
     full_sim_moves = 0
     fast_sim_moves = 0
+    random_opening_moves = 0
 
     # Action-space size for the legal mask — taken from game_fns if provided,
     # else falls back to the Morris constant from board.py.
@@ -554,6 +574,10 @@ def _play_game(
             temp = (_asym_cfg.high_temp_value
                     if state.current_player == _high_side
                     else _asym_cfg.low_temp_value)
+            # ctree rejects exact 0 — clamp to the same epsilon the standard
+            # schedule uses for argmax plies.
+            if temp <= 0.0:
+                temp = _ARGMAX_TEMPERATURE
         else:
             temp = _temperature_for_move(move_count, temperature_threshold)
         encoded = _encode_state(state).squeeze(0).numpy().copy()
@@ -590,35 +614,53 @@ def _play_game(
                     resigned_by_player = actor_now
                     break  # game ends here, value targets handled below
 
-        # Pick search instance for this ply. Forced captures (Morris-only) use
-        # the full search regardless; for other games must_capture is always
-        # False so the cap logic applies normally.
-        if cap_active and not getattr(state, "must_capture", False):
-            is_full = rng.random() < playout_cap_config.full_sim_fraction
-        else:
-            is_full = True
-        active_search = search if is_full else search_fast
-        if is_full:
-            full_sim_moves += 1
-        else:
-            fast_sim_moves += 1
-
-        # Noise-asym regime override: the high-noise side uses the dedicated
-        # high-Dirichlet search instance. Only applied on "full" plies (the
-        # fast-sim search keeps its own dirichlet, no point swapping there).
-        # Falls back to the standard search if search_high_noise wasn't
-        # provided by the worker (defensive).
-        if (
-            regime == "noise_asym"
-            and is_full
-            and search_high_noise is not None
-            and state.current_player == _high_side
-        ):
-            active_search = search_high_noise
-
-        action, visit_probs = active_search.run(
-            state, temperature=temp, add_noise=True
+        # Random-opening regime (Phase 3 v3): the chosen side plays uniformly
+        # random for the first K plies. Skip MCTS entirely and force is_full
+        # to False so the buffer-recording path excludes this ply (uniform
+        # policy target would be noise). Forced captures bypass this — they
+        # must always run a real search to find the actual capture target.
+        is_random_opening_ply = (
+            regime == "random_opening"
+            and move_count < regime_params.get("k", 0)
+            and state.current_player == regime_params.get("random_side")
+            and not getattr(state, "must_capture", False)
         )
+        if is_random_opening_ply:
+            legals = _get_legal_actions(state)
+            action = int(rng.choice(legals))
+            visit_probs = np.zeros(_action_space_n, dtype=np.float32)
+            is_full = False
+            random_opening_moves += 1
+        else:
+            # Pick search instance for this ply. Forced captures (Morris-only)
+            # use the full search regardless; for other games must_capture is
+            # always False so the cap logic applies normally.
+            if cap_active and not getattr(state, "must_capture", False):
+                is_full = rng.random() < playout_cap_config.full_sim_fraction
+            else:
+                is_full = True
+            active_search = search if is_full else search_fast
+            if is_full:
+                full_sim_moves += 1
+            else:
+                fast_sim_moves += 1
+
+            # Noise-asym regime override: the high-noise side uses the
+            # dedicated high-Dirichlet search instance. Only applied on "full"
+            # plies (the fast-sim search keeps its own dirichlet, no point
+            # swapping there). Falls back to the standard search if
+            # search_high_noise wasn't provided by the worker (defensive).
+            if (
+                regime == "noise_asym"
+                and is_full
+                and search_high_noise is not None
+                and state.current_player == _high_side
+            ):
+                active_search = search_high_noise
+
+            action, visit_probs = active_search.run(
+                state, temperature=temp, add_noise=True
+            )
 
         # Capture stats around the action: state.must_capture flips are the
         # cleanest signal of mill / capture events (Morris-specific; zero-impact
@@ -693,6 +735,7 @@ def _play_game(
         verify_resigning_player=verify_resigning_player,
         full_sim_moves=full_sim_moves,
         fast_sim_moves=fast_sim_moves,
+        random_opening_moves=random_opening_moves,
         curriculum_start=curriculum_start,
         curriculum_pieces=curriculum_pieces,
         timeout_discarded=timeout_discarded,

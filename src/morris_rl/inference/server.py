@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from morris_rl.env.rules import (
     GameState,
     apply_action,
+    compute_aux_features,
     get_legal_actions,
     is_terminal,
 )
@@ -113,6 +114,12 @@ class PlayResponse(BaseModel):
     description: str
     top_moves: list[MoveInfo]
     value_estimate: float   # [-1, 1]; positive = agent thinks it's winning
+    # Aux signals exposed to the UI so it can show "you're losing" feedback
+    # (shake / loser animation) without re-computing the rules client-side.
+    # Both are signed and from the perspective of the player whose turn comes
+    # next on `board_after` (typically the human after the agent's move).
+    pieces_diff: float      # own_pieces_on_board - opp_pieces_on_board
+    mill_diff: float        # own_active_mills - opp_active_mills
     board_after: BoardState
     using_network: bool     # False when falling back to minimax
     agent_name: str
@@ -332,12 +339,18 @@ def play(request: PlayRequest) -> PlayResponse:
         if (done_after and outcome_after is not None and outcome_after.value > 0)
         else None
     )
+    # Aux signals from the POV of whoever moves next on `board_after`
+    # (i.e. the human in the normal turn flow). The frontend uses these to
+    # decide whether to play the loser / shake animations.
+    mill_diff, pieces_diff = compute_aux_features(next_state)
 
     return PlayResponse(
         action=action,
         description=describe_action(action, state.must_capture),
         top_moves=top_moves,
         value_estimate=value,
+        pieces_diff=pieces_diff,
+        mill_diff=mill_diff,
         board_after=_state_to_board(next_state, done_after, winner),
         using_network=using_network,
         agent_name=agent_label,

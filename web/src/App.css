@@ -240,13 +240,42 @@
 @media (max-width: 700px) {
   .app-main {
     flex-direction: column;
-    padding: 16px;
-    align-items: center;
+    padding: 12px;
+    gap: 12px;
+    align-items: stretch;
   }
 
   .panel-section {
     max-width: 100%;
     width: 100%;
+  }
+
+  .app-header {
+    padding: 12px 14px;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .app-header h1 {
+    font-size: 14px;
+    letter-spacing: 0.12em;
+  }
+
+  /* Buttons in the controls bar — full width on mobile so they're tappable */
+  .controls button,
+  .controls .button {
+    min-height: 44px;
+    padding: 10px 12px;
+  }
+}
+
+/* Very narrow screens (older phones, landscape phones in portrait UI) */
+@media (max-width: 380px) {
+  .app-header {
+    padding: 10px 10px;
+  }
+  .app-header h1 {
+    font-size: 13px;
   }
 }
 

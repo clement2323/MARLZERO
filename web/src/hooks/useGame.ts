@@ -49,6 +49,14 @@ export interface GameState {
   selectedPos: number | null;
   topMoves: MoveInfo[];
   valueEstimate: number;
+  // Signed (own - opp) from the human's POV. Updated after every agent move.
+  // Drives the auto-shake / auto-loser anim triggers in App.tsx.
+  piecesDiff: number;
+  millDiff: number;
+  // Monotonic id incremented on every received PlayResponse so App.tsx can
+  // run side effects exactly once per server reply (instead of debouncing
+  // on valueEstimate/piecesDiff which may repeat across moves).
+  responseTick: number;
   usingNetwork: boolean;
   agentDescription: string;
   agentName: string;
@@ -90,6 +98,9 @@ function initialState(humanPlayer: 1 | 2 = 1): GameState {
     selectedPos: null,
     topMoves: [],
     valueEstimate: 0,
+    piecesDiff: 0,
+    millDiff: 0,
+    responseTick: 0,
     usingNetwork: false,
     agentDescription: "",
     agentName: "",
@@ -141,6 +152,11 @@ export function useGame() {
           moveHistory: [...prev.moveHistory, { player: agentPlayer, desc: resp.description }],
           topMoves: resp.top_moves,
           valueEstimate: resp.value_estimate,
+          // Server returns pieces_diff/mill_diff from the POV of whoever moves
+          // next on board_after (typically the human) — feed that straight in.
+          piecesDiff: resp.pieces_diff,
+          millDiff: resp.mill_diff,
+          responseTick: prev.responseTick + 1,
           usingNetwork: resp.using_network,
           agentDescription: resp.description,
           agentName: resp.agent_name,

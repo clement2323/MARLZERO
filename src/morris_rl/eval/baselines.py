@@ -181,7 +181,16 @@ class NetworkAgent:
         device: torch.device,
         num_simulations: int = 800,
     ) -> None:
-        self._search = MorrisSearch(network, device, num_simulations=num_simulations)
+        # Detect GraphNet so MCTS leaf evaluation uses the 11-plane graph
+        # encoder. Without this MorrisSearch falls back to the legacy 7-plane
+        # encoder and the network errors out on input_proj (mat1 7 vs mat2 11).
+        game_fns: dict | None = None
+        if type(network).__name__ == "MorrisGraphNet":
+            from morris_rl.env.encoding_graph import encode_state_graph
+            game_fns = {"encode_state": encode_state_graph}
+        self._search = MorrisSearch(
+            network, device, num_simulations=num_simulations, game_fns=game_fns
+        )
 
     def select_action(self, state: GameState) -> int:
         action, _ = self._search.run(state, temperature=_ARGMAX_TEMP, add_noise=False)

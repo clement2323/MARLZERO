@@ -19,6 +19,10 @@ export interface PlayResponse {
   description: string;
   top_moves: MoveInfo[];
   value_estimate: number;
+  // Signed (own - opp) from the POV of whoever moves next on board_after
+  // (typically the human). Used by the UI to trigger shake / loser anims.
+  pieces_diff: number;
+  mill_diff: number;
   board_after: BoardState;
   using_network: boolean;
   agent_name: string;

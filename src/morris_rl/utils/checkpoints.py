@@ -54,7 +54,11 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     src = Path(path)
     if not src.exists():
         raise FileNotFoundError(f"Checkpoint not found: {src}")
-    payload: dict[str, Any] = torch.load(src, weights_only=False)
+    # Force CPU loading so checkpoints saved on a GPU machine still load in
+    # CPU-only environments (HF Spaces, CI). The trainer / agent moves the
+    # network onto its target device after loading state_dict, so mapping to
+    # CPU here is the safe default everywhere.
+    payload: dict[str, Any] = torch.load(src, weights_only=False, map_location="cpu")
     if payload.get("version") != _CHECKPOINT_VERSION:
         raise ValueError(
             f"Unsupported checkpoint version {payload.get('version')!r}; "

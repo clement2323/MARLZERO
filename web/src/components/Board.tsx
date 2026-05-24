@@ -87,6 +87,10 @@ const MILLS: [number, number, number][] = [
 ];
 
 const RADIUS = 18;
+// Larger invisible hit target for touch screens. Apple HIG / Material both
+// recommend ≥ 44 CSS-px tap targets. Our SVG is scaled to viewport so the
+// effective hit area follows the SVG scale.
+const HIT_RADIUS = 28;
 // Player 1 moves first (engine invariant) → white, by chess/Morris convention.
 // Mirror of the CSS palette in index.css. Keep the two in sync.
 const COLORS = {
@@ -232,12 +236,18 @@ export default function Board({
 
   return (
     <svg
-      width={SIZE}
-      height={SIZE}
+      viewBox={`0 0 ${SIZE} ${SIZE}`}
+      width="100%"
+      height="auto"
+      preserveAspectRatio="xMidYMid meet"
       style={{
         background: COLORS.surface,
         borderRadius: 16,
         display: "block",
+        maxWidth: SIZE,
+        width: "100%",
+        height: "auto",
+        touchAction: "manipulation",
         boxShadow:
           "0 0 0 1px rgba(255,255,255,0.04), 0 30px 80px rgba(0,0,0,0.55), 0 0 60px rgba(167,139,250,0.06)",
       }}
@@ -375,9 +385,26 @@ export default function Board({
         return (
           <g
             key={pos}
-            onClick={() => !disabled && isLegal && onPositionClick(pos)}
-            style={{ cursor: isLegal && !disabled ? "pointer" : "default" }}
+            onPointerDown={(e) => {
+              if (!disabled && isLegal) {
+                e.preventDefault();
+                onPositionClick(pos);
+              }
+            }}
+            style={{
+              cursor: isLegal && !disabled ? "pointer" : "default",
+              touchAction: "manipulation",
+            }}
           >
+            {/* Invisible hit target — keeps the visual piece small while
+                giving touch screens a comfortable tap zone (≥ 44 CSS-px). */}
+            <circle
+              cx={cx}
+              cy={cy}
+              r={HIT_RADIUS}
+              fill="transparent"
+              pointerEvents={isLegal && !disabled ? "all" : "none"}
+            />
             {isSelected && (
               <circle
                 cx={cx} cy={cy} r={RADIUS + 7}

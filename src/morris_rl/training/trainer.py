@@ -717,6 +717,14 @@ class Trainer:
                     recent_term_reasons_normal=recent_term_reasons_normal,
                 )
 
+                # Rolling decisive/draw share over all games collected — handy
+                # to spot the draw-attractor collapse without having to open TB.
+                total_games_pbar = sum(outcome_counts.values()) or 1
+                decisive_pct = (
+                    (outcome_counts["p1_win"] + outcome_counts["p2_win"])
+                    / total_games_pbar * 100
+                )
+                draw_pct = outcome_counts["draw"] / total_games_pbar * 100
                 for _ in range(updates_per_game):
                     if self._step >= total_steps:
                         break
@@ -728,6 +736,8 @@ class Trainer:
                         "v": f"{metrics['value_loss']:.3f}",
                         "buf": len(buffer),
                         "games": games_collected,
+                        "dec": f"{decisive_pct:.0f}%",
+                        "drw": f"{draw_pct:.0f}%",
                     })
                     if self._step % _MEMORY_LOG_INTERVAL == 0:
                         self._log_memory_health(manager)

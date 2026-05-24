@@ -1,10 +1,18 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Board from "./components/Board";
 import AnalysisPanel from "./components/AnalysisPanel";
 import RulesTheater from "./components/RulesTheater";
 import { useGame } from "./hooks/useGame";
 import { useShake } from "./hooks/useShake";
 import "./App.css";
+
+// Auto-trigger thresholds — kept here so they're easy to tweak from one spot.
+// Mirror the resign-detection logic used during training (threshold -0.9 there,
+// looser -0.7 here so the UI reacts before the position is hopeless).
+const LOSING_VALUE_THRESHOLD = 0.7;     // |value| above this counts as "losing"
+const LOSING_VALUE_STREAK = 3;          // consecutive plies above threshold
+const LOSING_PIECES_DIFF = -3;          // pieces_diff <= this triggers shake
+const MOVING_PHASE_PIECES_IN_HAND = 0;  // both hands empty = movement phase
 
 function statusMessage(
   status: string,
@@ -34,11 +42,55 @@ export default function App() {
   const { gs, legalActions, handlePositionClick, resetGame, setSelectedAgent } = useGame();
   const { jitter, trigger: triggerShake } = useShake();
   const [loserKey, setLoserKey] = useState(0);
+  const losingValueStreakRef = useRef(0);
+  const lastTickProcessed = useRef(0);
+  const loserPlayedForGame = useRef(false);
 
   const playerPieces: [number, number] = [
     gs.board.filter((x) => x === 1).length,
     gs.board.filter((x) => x === 2).length,
   ];
+
+  // Auto-trigger animations based on signals returned by the server.
+  // Fires once per agent reply (responseTick) so we don't double-fire on
+  // unrelated re-renders. The "is losing" logic is:
+  //   value > +0.7 (agent winning, i.e. human losing) for 3 consecutive
+  //   replies, OR pieces_diff <= -3 during the movement phase.
+  useEffect(() => {
+    if (gs.responseTick === lastTickProcessed.current) return;
+    lastTickProcessed.current = gs.responseTick;
+
+    // The server's value_estimate is from the agent's POV at the root state
+    // BEFORE the agent's move — so value > 0 means agent is winning (= human
+    // losing).  pieces_diff is from the human's POV on board_after.
+    const humanLosingByValue = gs.valueEstimate > LOSING_VALUE_THRESHOLD;
+    losingValueStreakRef.current = humanLosingByValue
+      ? losingValueStreakRef.current + 1
+      : 0;
+
+    const inMovementPhase =
+      gs.piecesInHand[0] <= MOVING_PHASE_PIECES_IN_HAND &&
+      gs.piecesInHand[1] <= MOVING_PHASE_PIECES_IN_HAND;
+    const humanLosingByPieces = inMovementPhase && gs.piecesDiff <= LOSING_PIECES_DIFF;
+
+    const shouldShake =
+      losingValueStreakRef.current >= LOSING_VALUE_STREAK || humanLosingByPieces;
+    if (shouldShake) triggerShake();
+  }, [gs.responseTick, gs.valueEstimate, gs.piecesDiff, gs.piecesInHand, triggerShake]);
+
+  // Loser overlay on real game-over loss — fire exactly once per game.
+  useEffect(() => {
+    if (gs.status !== "game_over") {
+      loserPlayedForGame.current = false;
+      return;
+    }
+    if (loserPlayedForGame.current) return;
+    const humanLost = gs.winner !== null && gs.winner !== gs.humanPlayer;
+    if (humanLost) {
+      loserPlayedForGame.current = true;
+      setLoserKey((k) => k + 1);
+    }
+  }, [gs.status, gs.winner, gs.humanPlayer]);
 
   const msg = statusMessage(
     gs.status,
@@ -102,17 +154,6 @@ export default function App() {
               className={`btn${gs.humanPlayer === 2 ? " is-active-black" : ""}`}
             >
               ● Black
-            </button>
-
-            <span className="controls-label">Test</span>
-            <button onClick={triggerShake} className="btn is-test">
-              Shake
-            </button>
-            <button
-              onClick={() => setLoserKey((k) => k + 1)}
-              className="btn is-test"
-            >
-              Loser
             </button>
           </div>
 

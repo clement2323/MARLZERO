@@ -333,10 +333,15 @@ def main(cfg: DictConfig) -> None:
             low_temp_value=float(asymmetric_node.get("low_temp_value", 0.0)),
             high_noise_alpha=float(asymmetric_node.get("high_noise_alpha", 1.0)),
             high_noise_epsilon=float(asymmetric_node.get("high_noise_epsilon", 0.5)),
+            prob_random_opening=float(asymmetric_node.get("prob_random_opening", 0.0)),
+            random_opening_k=int(asymmetric_node.get("random_opening_k", 4)),
         )
         logger.info(
             f"Asymmetric self-play enabled: sym={asymmetric_config.prob_sym} "
-            f"t_asym={asymmetric_config.prob_t_asym} noise_asym={asymmetric_config.prob_noise_asym}"
+            f"t_asym={asymmetric_config.prob_t_asym} "
+            f"noise_asym={asymmetric_config.prob_noise_asym} "
+            f"random_opening={asymmetric_config.prob_random_opening} "
+            f"(K={asymmetric_config.random_opening_k})"
         )
     manager = SelfPlayManager(
         network=network,
