@@ -39,6 +39,10 @@ network:
   lora_rank: 0        # 0 = disabled. Set to 8 for two-phase fine-tuning.
   lora_alpha: 16.0    # Scaling factor: scale = lora_alpha / lora_rank.
   freeze_trunk: false # Set true with lora_rank>0 to freeze base weights.
+  # Weights-only init from a supervised warmup checkpoint (Phase 3 transition).
+  # Unlike training.resume, this does NOT load the optimizer or step counter —
+  # the trainer starts fresh on top of the pre-trained network.
+  init_from: null     # e.g. outputs/sup_warmup_5k/best.pt
 
 input_encoding:
   num_planes: 7
@@ -126,6 +130,19 @@ self_play:
     enabled: true
     random_start_fraction: 0.3
     pieces_per_player: 5
+  # Phase 3 — Asymmetric self-play (3 regimes per game to break the draw
+  # attractor). One player is the "high" side (high temperature or high
+  # Dirichlet noise), the other the "low" side. Side assignment is randomized
+  # per game so neither P1 nor P2 carries the explorer role systematically.
+  asymmetric:
+    enabled: false               # opt in; default keeps standard symmetric play
+    prob_sym: 0.5                # share of games with standard schedule
+    prob_t_asym: 0.3             # share with temperature asymmetric
+    prob_noise_asym: 0.2         # share with Dirichlet asymmetric
+    high_temp_value: 1.0
+    low_temp_value: 0.0
+    high_noise_alpha: 1.0        # Dirichlet α for the high-noise side
+    high_noise_epsilon: 0.5      # mix fraction for the high-noise side
   # Discard halfmove-cap games from the replay buffer entirely. Their value=0
   # targets on non-draw positions reinforce the draw attractor. Enabled = fewer
   # samples but cleaner signal; the curriculum compensates with more decisive games.
@@ -149,6 +166,27 @@ training:
   symmetry_augmentation: true    # 8x augmentation via dihedral group
   mixed_precision: true          # FP16 via torch.cuda.amp
   resume: null                   # path to a .pt checkpoint to resume from, or null
+  # Phase 3 — LR warmup over the first N steps (linear ramp from lr*0.01 to lr)
+  # then cosine decay over the remaining lr_decay_steps - lr_warmup_steps. Set
+  # to 0 (default) for backward compatibility — bare cosine decay as before.
+  lr_warmup_steps: 0
+  # Phase 3 — Sub-buffer of minimax-warmup positions to mix into every minibatch.
+  # Disabled by default; opt in by setting warmup_data_path to a directory
+  # containing worker_*.jsonl files (output of scripts/generate_warmup_dataset.py).
+  warmup_data_path: null
+  warmup_buffer_size: 200000     # capacity in positions (post-augmentation)
+  warmup_mix_fraction: 0.3       # share of each minibatch from the warmup buffer
+  warmup_mix_anneal_steps: 0     # >0 = linear decay of the fraction to 0 over N steps
+  warmup_gamma: 1.0              # discount γ^(T-t) applied to value target when loading
+  warmup_policy_temperature: 1.0 # softmax(scores / τ) on root_scores for policy targets
+  # Phase 3 — Periodic eval vs minimax baselines (logs to TB under eval/*).
+  eval_vs_baselines:
+    enabled: false               # off by default; opt in for Phase 3 runs
+    interval: 5000               # every N gradient steps
+    n_games_d3: 50               # games vs MinimaxAgent(depth=3)
+    n_games_d5: 50               # games vs MinimaxAgent(depth=5)
+    num_sims: 200                # MCTS sims for the NetworkAgent candidate
+    include_bare_argmax: true    # also eval the bare prior (no MCTS) vs d3
 
 device: auto  # "auto" = cuda if available, else cpu
 

@@ -111,6 +111,28 @@ def main(cfg: DictConfig) -> None:
         f"params={sum(p.numel() for p in network.parameters()):,}"
     )
 
+    # ---- Warmup init (Phase 3) ----
+    # Load pre-trained weights from a supervised warmup checkpoint, if provided.
+    # Distinct from training.resume which loads optimizer state + step counter:
+    # init_from is weights-only and the trainer starts at step=0 with a fresh
+    # optimizer — this is what you want when transitioning from supervised
+    # warmup to AlphaZero self-play.
+    init_from = cfg.network.get("init_from", None)
+    if init_from:
+        from morris_rl.utils.checkpoints import load_checkpoint
+        payload = load_checkpoint(init_from)
+        missing, unexpected = network.load_state_dict(
+            payload["state_dict"], strict=False
+        )
+        if missing:
+            logger.warning(f"init_from {init_from}: missing keys = {list(missing)}")
+        if unexpected:
+            logger.warning(f"init_from {init_from}: unexpected keys = {list(unexpected)}")
+        logger.info(
+            f"Initialized network weights from {init_from} "
+            f"(warmup step={payload['step']})"
+        )
+
     # ---- Trainer ----
     mlflow_cfg = cfg.get("mlflow", None)
     if mlflow_cfg is not None and bool(mlflow_cfg.get("enabled", False)):
@@ -142,6 +164,19 @@ def main(cfg: DictConfig) -> None:
         aux_heads_enabled=bool(_aux_cfg.get("enabled", False)),
         aux_weight_mill=float(_aux_cfg.get("mill_diff_weight", 0.0)),
         aux_weight_pieces=float(_aux_cfg.get("pieces_diff_weight", 0.0)),
+        lr_warmup_steps=int(cfg.training.get("lr_warmup_steps", 0)),
+        eval_vs_baselines_enabled=bool(
+            cfg.training.get("eval_vs_baselines", {}).get("enabled", False)
+        ),
+        eval_vs_baselines_interval=int(
+            cfg.training.get("eval_vs_baselines", {}).get("interval", 5000)
+        ),
+        eval_n_d3=int(cfg.training.get("eval_vs_baselines", {}).get("n_games_d3", 50)),
+        eval_n_d5=int(cfg.training.get("eval_vs_baselines", {}).get("n_games_d5", 50)),
+        eval_num_sims=int(cfg.training.get("eval_vs_baselines", {}).get("num_sims", 200)),
+        eval_include_bare_argmax=bool(
+            cfg.training.get("eval_vs_baselines", {}).get("include_bare_argmax", True)
+        ),
     )
 
     # ---- Replay buffer ----
@@ -179,6 +214,46 @@ def main(cfg: DictConfig) -> None:
         action_space_size=_net_cfg["action_space_size"],
         augment_fn=_augment_fn,
     )
+
+    # ---- Warmup sub-buffer (Phase 3) ----
+    # Populate a non-purged ReplayBuffer from warmup JSONL traces. The
+    # Trainer will mix samples from it into every minibatch with the
+    # configured fraction, optionally annealed to 0 as the network surpasses
+    # the d5 prior.
+    warmup_buffer: "ReplayBuffer | None" = None
+    warmup_data_path = cfg.training.get("warmup_data_path", None)
+    if warmup_data_path:
+        from morris_rl.data.warmup_loader import load_warmup_into_buffer
+        warmup_buffer = ReplayBuffer(
+            capacity=int(cfg.training.get("warmup_buffer_size", 200_000)),
+            use_symmetry_augmentation=cfg.training.symmetry_augmentation,
+            num_planes=_buffer_num_planes,
+            num_positions=_net_cfg["num_positions"],
+            action_space_size=_net_cfg["action_space_size"],
+            augment_fn=_augment_fn,
+        )
+        # Encode_fn must match the network input shape (graphnet → 11 planes).
+        if cfg.network.get("type", "resnet") == "graphnet":
+            from morris_rl.env.encoding_graph import encode_state_graph as _warmup_encode
+        else:
+            from morris_rl.mcts.search import encode_state as _warmup_encode  # type: ignore[no-redef]
+        n_added = load_warmup_into_buffer(
+            warmup_buffer,
+            Path(warmup_data_path),
+            encode_fn=_warmup_encode,
+            gamma=float(cfg.training.get("warmup_gamma", 1.0)),
+            policy_temperature=float(cfg.training.get("warmup_policy_temperature", 1.0)),
+            only_with_policy=True,
+        )
+        logger.info(
+            f"Loaded {n_added} positions from {warmup_data_path} into warmup sub-buffer "
+            f"(post-aug size = {len(warmup_buffer)})"
+        )
+        trainer.set_warmup_buffer(
+            warmup_buffer,
+            warmup_mix_fraction=float(cfg.training.get("warmup_mix_fraction", 0.3)),
+            warmup_mix_anneal_steps=int(cfg.training.get("warmup_mix_anneal_steps", 0)),
+        )
 
     # Resume from checkpoint if requested. Pass the buffer so a sibling
     # .buffer.npz (if it exists) is restored — avoids re-warmup.
@@ -244,6 +319,25 @@ def main(cfg: DictConfig) -> None:
             ),
             pieces_per_player=int(curriculum_node.get("pieces_per_player", 6)),
         )
+    # Asymmetric self-play (Phase 3 anti-collapse). Opt-in via config.
+    asymmetric_node = cfg.self_play.get("asymmetric", None)
+    asymmetric_config = None
+    if asymmetric_node is not None and bool(asymmetric_node.get("enabled", False)):
+        from morris_rl.training.self_play import AsymmetricConfig
+        asymmetric_config = AsymmetricConfig(
+            enabled=True,
+            prob_sym=float(asymmetric_node.get("prob_sym", 0.5)),
+            prob_t_asym=float(asymmetric_node.get("prob_t_asym", 0.3)),
+            prob_noise_asym=float(asymmetric_node.get("prob_noise_asym", 0.2)),
+            high_temp_value=float(asymmetric_node.get("high_temp_value", 1.0)),
+            low_temp_value=float(asymmetric_node.get("low_temp_value", 0.0)),
+            high_noise_alpha=float(asymmetric_node.get("high_noise_alpha", 1.0)),
+            high_noise_epsilon=float(asymmetric_node.get("high_noise_epsilon", 0.5)),
+        )
+        logger.info(
+            f"Asymmetric self-play enabled: sym={asymmetric_config.prob_sym} "
+            f"t_asym={asymmetric_config.prob_t_asym} noise_asym={asymmetric_config.prob_noise_asym}"
+        )
     manager = SelfPlayManager(
         network=network,
         network_cfg=_network_cfg_dict(cfg),
@@ -263,6 +357,7 @@ def main(cfg: DictConfig) -> None:
         resign_config=resign_config,
         playout_cap_config=playout_cap_config,
         curriculum_config=curriculum_config,
+        asymmetric_config=asymmetric_config,
         discard_timeout_games=bool(cfg.self_play.get("discard_timeout_games", False)),
         game_name=cfg.get("game", "morris"),
     )

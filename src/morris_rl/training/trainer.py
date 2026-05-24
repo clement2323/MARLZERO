@@ -217,11 +217,44 @@ class Trainer:
         aux_heads_enabled: bool = False,
         aux_weight_mill: float = 0.0,
         aux_weight_pieces: float = 0.0,
+        warmup_buffer: "ReplayBuffer | None" = None,
+        warmup_mix_fraction: float = 0.0,
+        warmup_mix_anneal_steps: int = 0,
+        lr_warmup_steps: int = 0,
+        eval_vs_baselines_enabled: bool = False,
+        eval_vs_baselines_interval: int = 5000,
+        eval_n_d3: int = 50,
+        eval_n_d5: int = 50,
+        eval_num_sims: int = 200,
+        eval_include_bare_argmax: bool = True,
     ) -> None:
         self._network = network.to(device)
         self._device = device
         self._max_grad_norm = max_grad_norm
         self._checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        # Phase 3 anti-collapse: keep a non-purged warmup buffer that contributes
+        # warmup_mix_fraction of every minibatch. None means standard self-play
+        # behaviour (single buffer).
+        #
+        # warmup_mix_anneal_steps > 0 enables a linear decay of the effective
+        # fraction from `warmup_mix_fraction` at step 0 to 0 at that step count.
+        # This avoids polluting a network that has surpassed the warmup's
+        # minimax-d5 level — past that point, the warmup labels are biased
+        # (d5 mistakes encoded as outcomes) and should not pull the network
+        # back. Set anneal_steps to 0 to keep the fraction constant forever.
+        self._warmup_buffer = warmup_buffer
+        self._warmup_mix_fraction_start = (
+            float(warmup_mix_fraction) if warmup_buffer is not None else 0.0
+        )
+        self._warmup_mix_anneal_steps = int(warmup_mix_anneal_steps)
+        # Phase 3 periodic eval config (default disabled for backward compat
+        # with all existing self-play runs).
+        self._eval_vs_baselines_enabled = bool(eval_vs_baselines_enabled)
+        self._eval_vs_baselines_interval = int(eval_vs_baselines_interval)
+        self._eval_n_d3 = int(eval_n_d3)
+        self._eval_n_d5 = int(eval_n_d5)
+        self._eval_num_sims = int(eval_num_sims)
+        self._eval_include_bare_argmax = bool(eval_include_bare_argmax)
         self._checkpoint_interval = checkpoint_interval
         self._config: dict[str, Any] = config or {}
         self._value_head_type = value_head_type
@@ -244,11 +277,37 @@ class Trainer:
             lr=learning_rate,
             weight_decay=weight_decay,
         )
-        self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self._optimizer,
-            T_max=lr_decay_steps,
-            eta_min=learning_rate * 1e-2,
-        )
+        # LR schedule:
+        # - When lr_warmup_steps > 0 (typical for Phase 3 self-play starting from
+        #   a supervised warmup checkpoint): linear ramp from lr*0.01 to lr over
+        #   warmup steps, then cosine decay from lr to lr*0.01 over the remaining
+        #   decay steps. Prevents an abrupt LR=1e-3 from shocking the already-
+        #   trained weights at step 0.
+        # - When lr_warmup_steps == 0 (default): bare cosine decay as before
+        #   (backward compatible with all existing self-play runs).
+        if lr_warmup_steps > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                self._optimizer,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=lr_warmup_steps,
+            )
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self._optimizer,
+                T_max=max(1, lr_decay_steps - lr_warmup_steps),
+                eta_min=learning_rate * 1e-2,
+            )
+            self._scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self._optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[lr_warmup_steps],
+            )
+        else:
+            self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self._optimizer,
+                T_max=lr_decay_steps,
+                eta_min=learning_rate * 1e-2,
+            )
 
         # AMP is only beneficial on CUDA; silently disable on CPU.
         self._amp_enabled = mixed_precision and device.type == "cuda"
@@ -300,9 +359,68 @@ class Trainer:
             eta_min=lr * 1e-2,
         )
 
+    @property
+    def _warmup_mix_fraction(self) -> float:
+        """Effective warmup mix fraction at the current step (linearly annealed).
+
+        Returns the constant start fraction when anneal_steps == 0. Past
+        anneal_steps, returns 0 — the warmup labels are biased by minimax-d5
+        mistakes and shouldn't pull a stronger network back to that level.
+        """
+        if self._warmup_buffer is None or self._warmup_mix_fraction_start <= 0:
+            return 0.0
+        if self._warmup_mix_anneal_steps <= 0:
+            return self._warmup_mix_fraction_start
+        progress = min(1.0, self._step / self._warmup_mix_anneal_steps)
+        return self._warmup_mix_fraction_start * (1.0 - progress)
+
+    # ------------------------------------------------------------------
+    # Configuration setters (called after __init__ when needed)
+    # ------------------------------------------------------------------
+
+    def set_warmup_buffer(
+        self,
+        warmup_buffer: "ReplayBuffer | None",
+        warmup_mix_fraction: float = 0.0,
+        warmup_mix_anneal_steps: int = 0,
+    ) -> None:
+        """Attach (or detach) a non-purged warmup sub-buffer for mix sampling.
+
+        Call this from the train entrypoint AFTER the warmup buffer has been
+        built and populated. Passing None disables mix sampling.
+        """
+        self._warmup_buffer = warmup_buffer
+        self._warmup_mix_fraction_start = (
+            float(warmup_mix_fraction) if warmup_buffer is not None else 0.0
+        )
+        self._warmup_mix_anneal_steps = int(warmup_mix_anneal_steps)
+
     # ------------------------------------------------------------------
     # Core training step
     # ------------------------------------------------------------------
+
+    def _sample_mixed(
+        self, buffer: ReplayBuffer, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample a batch from the main buffer, optionally mixing with warmup.
+
+        When `self._warmup_buffer` is set and has enough samples, draws
+        `warmup_n = round(batch_size * warmup_mix_fraction)` from it and
+        `batch_size - warmup_n` from the main buffer, then concatenates along
+        the batch dimension. The order is [main_samples ; warmup_samples];
+        the network/loss treat them identically.
+
+        Falls back to single-buffer sampling when warmup is None / empty.
+        """
+        if self._warmup_buffer is None or self._warmup_mix_fraction <= 0:
+            return buffer.sample(batch_size, device=self._device)
+        warmup_n = int(round(batch_size * self._warmup_mix_fraction))
+        if warmup_n <= 0 or len(self._warmup_buffer) < warmup_n:
+            return buffer.sample(batch_size, device=self._device)
+        main_n = batch_size - warmup_n
+        main = buffer.sample(main_n, device=self._device)
+        wm = self._warmup_buffer.sample(warmup_n, device=self._device)
+        return tuple(torch.cat([m, w], dim=0) for m, w in zip(main, wm))  # type: ignore[return-value]
 
     def step(self, buffer: ReplayBuffer, batch_size: int) -> dict[str, float]:
         """One gradient update.
@@ -316,7 +434,7 @@ class Trainer:
             ``learning_rate``, ``grad_norm``, ``value_mean``, ``value_std``.
         """
         states, policy_targets, value_targets, legal_masks, mill_targets, pieces_targets = (
-            buffer.sample(batch_size, device=self._device)
+            self._sample_mixed(buffer, batch_size)
         )
 
         self._optimizer.zero_grad()
@@ -609,7 +727,117 @@ class Trainer:
 
                 manager.update_network(self._network.state_dict())
 
+                # Phase 3 periodic eval vs minimax baselines (configurable).
+                # Runs in the main trainer process while workers continue
+                # generating games — eval blocks weight updates but not
+                # data collection. Cost ~20 min per tick on default
+                # interval (5000 steps), ~7 % overhead on a 10 h run.
+                if (
+                    self._eval_vs_baselines_enabled
+                    and self._eval_vs_baselines_interval > 0
+                    and self._step > 0
+                    and self._step % self._eval_vs_baselines_interval == 0
+                ):
+                    try:
+                        eval_metrics = self.eval_vs_baselines(
+                            n_d3=self._eval_n_d3,
+                            n_d5=self._eval_n_d5,
+                            num_sims=self._eval_num_sims,
+                            include_bare_argmax=self._eval_include_bare_argmax,
+                            opening_random_k=4,
+                        )
+                        for k, v in eval_metrics.items():
+                            self._log_scalar(f"eval/{k}", float(v))
+                        logger.info(f"[step {self._step}] eval vs baselines: {eval_metrics}")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"eval_vs_baselines failed: {exc}")
+
         logger.info(f"Training complete at step {self._step}.")
+
+    # ------------------------------------------------------------------
+    # Phase 3 — Periodic eval vs minimax baselines
+    # ------------------------------------------------------------------
+
+    def eval_vs_baselines(
+        self,
+        n_d3: int = 50,
+        n_d5: int = 50,
+        num_sims: int = 200,
+        include_bare_argmax: bool = True,
+        opening_random_k: int = 4,
+        seed: int = 0,
+    ) -> dict[str, float]:
+        """Play N games vs MinimaxAgent(depth=3) and MinimaxAgent(depth=5).
+
+        Two candidates are evaluated separately if `include_bare_argmax` is on:
+          - Network + MCTS (NetworkAgent with `num_sims` simulations) — the
+            agent the self-play loop actually uses.
+          - Bare network argmax (no MCTS) — tracks the policy-head prior
+            quality independent of search.
+
+        Returns a flat dict keyed `{net|bare}/winrate|drawrate|lossrate_vs_d{3,5}`.
+
+        Important: `opening_random_k=4` is required for statistical validity
+        because both candidate and opponent are deterministic argmax — without
+        random openings every game would replay the same trajectory.
+        """
+        import random as _random
+        from morris_rl.env.rules import Outcome, apply_action, get_legal_actions, initial_state, is_terminal
+        from morris_rl.eval.baselines import MinimaxAgent, NetworkAgent
+        from morris_rl.training.supervised import BareNetworkAgent
+
+        def _play_match(p1, p2, opening_rng) -> int:
+            agents = {1: p1, 2: p2}
+            state = initial_state()
+            halfmove_idx = 0
+            while True:
+                if state.total_halfmoves >= 200:
+                    return 0
+                done, outcome = is_terminal(state)
+                if done:
+                    return 0 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
+                if halfmove_idx < opening_random_k and opening_rng is not None:
+                    a = opening_rng.choice(get_legal_actions(state))
+                else:
+                    a = agents[state.current_player].select_action(state)
+                state = apply_action(state, int(a))
+                halfmove_idx += 1
+
+        def _play_series(cand, opp, n: int, label_prefix: str) -> dict[str, float]:
+            wins = draws = losses = 0
+            for i in range(n):
+                cand_side = 1 if i % 2 == 0 else 2
+                p1, p2 = (cand, opp) if cand_side == 1 else (opp, cand)
+                rng = _random.Random(seed + self._step * 1009 + i)
+                outcome = _play_match(p1, p2, rng)
+                if outcome == 0:
+                    draws += 1
+                elif outcome == cand_side:
+                    wins += 1
+                else:
+                    losses += 1
+            return {
+                f"{label_prefix}_winrate": wins / max(n, 1),
+                f"{label_prefix}_drawrate": draws / max(n, 1),
+                f"{label_prefix}_lossrate": losses / max(n, 1),
+            }
+
+        metrics: dict[str, float] = {}
+        # MCTS-powered network (real agent used by self-play)
+        net_agent = NetworkAgent(self._network, self._device, num_simulations=num_sims)
+        d3 = MinimaxAgent(depth=3)
+        if n_d3 > 0:
+            metrics.update(_play_series(net_agent, d3, n_d3, "net_vs_d3"))
+        if n_d5 > 0:
+            d5 = MinimaxAgent(depth=5)
+            metrics.update(_play_series(net_agent, d5, n_d5, "net_vs_d5"))
+        # Optionally also evaluate the bare prior (no MCTS) so we can see how
+        # much MCTS contributes vs the raw network learning.
+        if include_bare_argmax:
+            bare = BareNetworkAgent(self._network, self._device)
+            if n_d3 > 0:
+                metrics.update(_play_series(bare, d3, n_d3, "bare_vs_d3"))
+        return metrics
 
     # ------------------------------------------------------------------
     # Checkpoint I/O

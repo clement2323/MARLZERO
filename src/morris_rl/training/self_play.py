@@ -129,6 +129,15 @@ class GameRecord:
     # replayed offline with scripts/replay_game.py. Empty when tracing off.
     actions_history: list[int] = field(default_factory=list)
 
+    # Asymmetric self-play regime (Phase 3). When asymmetric self-play is
+    # enabled, each game is sampled into one of three regimes used to
+    # break the Nash-conservative draw attractor:
+    #   "sym"        — both players: T-schedule + Dirichlet α=0.3 (standard)
+    #   "t_asym"     — one player T=1.0 always, the other T=0
+    #   "noise_asym" — one player Dirichlet α=1.0 mix=0.5, the other standard
+    # Tracked here so the trainer can log per-regime length / decisive rate.
+    regime: str = "sym"
+
 
 def _maybe_log_trace(record: "GameRecord", worker_id: int, game: str = "morris") -> None:
     """Append a JSONL trace of *record* to MORRIS_TRACE_DIR when enabled.
@@ -262,6 +271,40 @@ class CurriculumConfig:
     pieces_per_player: int = 6
 
 
+@dataclass
+class AsymmetricConfig:
+    """Per-game regime sampler for breaking the draw attractor — Phase 3.
+
+    With probability `prob_t_asym` a game uses temperature-asymmetric play
+    (one player T=1.0 always, the other T=0). With probability `prob_noise_asym`
+    one player uses an inflated Dirichlet noise (α=1.0, mix=0.5) while the
+    other uses the standard α=0.3 mix=0.25. The remainder (~50%) is standard
+    symmetric self-play.
+
+    Effect: the asymmetry sources decisive results from positions where two
+    identical agents would otherwise converge to mutual cautious draws. The
+    deterministic side learns to punish the explorer's "mistakes"; the
+    explorer's trajectory diversifies the dataset.
+
+    Disable by setting `enabled=False` — the loop reverts to fully symmetric
+    play and `GameRecord.regime` stays "sym" for every game.
+    """
+
+    enabled: bool = False
+    prob_sym: float = 0.5
+    prob_t_asym: float = 0.3
+    prob_noise_asym: float = 0.2
+    # T-asymmetric regime: high-temperature side uses this temperature for
+    # ALL of its plies (no schedule), low side uses 0 (argmax).
+    high_temp_value: float = 1.0
+    low_temp_value: float = 0.0
+    # Noise-asymmetric regime: the high-noise search instance is built once
+    # at worker init with these Dirichlet params, then used for the high
+    # side's plies only. The other side keeps the standard search.
+    high_noise_alpha: float = 1.0
+    high_noise_epsilon: float = 0.5
+
+
 # ---------------------------------------------------------------------------
 # Game-play helpers
 # ---------------------------------------------------------------------------
@@ -348,6 +391,27 @@ def _assign_value_targets(
     return records
 
 
+def _sample_regime(
+    rng: "np.random.Generator", cfg: "AsymmetricConfig"
+) -> tuple[str, dict]:
+    """Return (regime_name, regime_params) for one game.
+
+    regime_params has:
+      - "high_side": 1 or 2 (which player gets the "high" treatment for
+        t_asym / noise_asym; for sym this is absent and unused).
+    """
+    if not cfg.enabled:
+        return "sym", {}
+    r = float(rng.random())
+    cum = cfg.prob_sym
+    if r < cum:
+        return "sym", {}
+    cum += cfg.prob_t_asym
+    if r < cum:
+        return "t_asym", {"high_side": int(rng.choice([1, 2]))}
+    return "noise_asym", {"high_side": int(rng.choice([1, 2]))}
+
+
 def _play_game(
     search: "MorrisSearch",
     temperature_threshold: int = 10,
@@ -358,6 +422,8 @@ def _play_game(
     curriculum_config: CurriculumConfig | None = None,
     discard_timeout_games: bool = False,
     game_fns: dict | None = None,
+    asymmetric_config: "AsymmetricConfig | None" = None,
+    search_high_noise: "MorrisSearch | None" = None,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data.
 
@@ -390,6 +456,14 @@ def _play_game(
 
     if rng is None:
         rng = np.random.default_rng()
+
+    # Asymmetric self-play regime sampling (Phase 3 anti-collapse).
+    # Picks one of {sym, t_asym, noise_asym} per game. When asymmetric is
+    # disabled or not provided, always "sym" with no special params.
+    _asym_cfg = asymmetric_config or AsymmetricConfig(enabled=False)
+    regime, regime_params = _sample_regime(rng, _asym_cfg)
+    _high_side = regime_params.get("high_side")  # 1 or 2, or None for "sym"
+
     # Curriculum start (Phase 3). Per-game Bernoulli — independent of any
     # per-move randomness inside the search.
     curriculum_start = False
@@ -469,7 +543,19 @@ def _play_game(
         if done:
             break
 
-        temp = _temperature_for_move(move_count, temperature_threshold)
+        # Temperature per regime:
+        # - sym         : usual schedule (T=1 for the first temperature_threshold
+        #                 plies, then T=0)
+        # - t_asym      : per-player override — high_side plays T=high_temp_value
+        #                 every ply, low_side plays T=low_temp_value
+        # - noise_asym  : same schedule as sym (only the Dirichlet noise differs
+        #                 between sides; temperature stays standard)
+        if regime == "t_asym":
+            temp = (_asym_cfg.high_temp_value
+                    if state.current_player == _high_side
+                    else _asym_cfg.low_temp_value)
+        else:
+            temp = _temperature_for_move(move_count, temperature_threshold)
         encoded = _encode_state(state).squeeze(0).numpy().copy()
         # Snapshot the legal mask BEFORE applying the chosen action — we want
         # the mask of the state the policy_target was computed for.
@@ -516,6 +602,19 @@ def _play_game(
             full_sim_moves += 1
         else:
             fast_sim_moves += 1
+
+        # Noise-asym regime override: the high-noise side uses the dedicated
+        # high-Dirichlet search instance. Only applied on "full" plies (the
+        # fast-sim search keeps its own dirichlet, no point swapping there).
+        # Falls back to the standard search if search_high_noise wasn't
+        # provided by the worker (defensive).
+        if (
+            regime == "noise_asym"
+            and is_full
+            and search_high_noise is not None
+            and state.current_player == _high_side
+        ):
+            active_search = search_high_noise
 
         action, visit_probs = active_search.run(
             state, temperature=temp, add_noise=True
@@ -598,6 +697,7 @@ def _play_game(
         curriculum_pieces=curriculum_pieces,
         timeout_discarded=timeout_discarded,
         actions_history=actions_history,
+        regime=regime,
     )
 
 
@@ -746,6 +846,7 @@ def _worker_fn(
     resign_config: ResignConfig | None = None,
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
+    asymmetric_config: AsymmetricConfig | None = None,
     discard_timeout_games: bool = False,
     game_name: str = "morris",
 ) -> None:
@@ -854,6 +955,20 @@ def _worker_fn(
             game_fns=_game_fns,
         )
 
+    # Build the high-noise companion search for noise_asym regime. Same network,
+    # same num_simulations, but inflated Dirichlet parameters. Only present when
+    # asymmetric self-play is enabled — adds another ~30 MB RSS per worker.
+    search_high_noise: MorrisSearch | None = None
+    if asymmetric_config is not None and asymmetric_config.enabled:
+        search_high_noise = MorrisSearch(
+            network,
+            torch.device("cpu"),
+            num_simulations=num_simulations,
+            dirichlet_alpha=asymmetric_config.high_noise_alpha,
+            dirichlet_epsilon=asymmetric_config.high_noise_epsilon,
+            game_fns=_game_fns,
+        )
+
     import psutil
     proc = psutil.Process()
     games_played = 0
@@ -881,6 +996,8 @@ def _worker_fn(
                 curriculum_config=curriculum_config,
                 discard_timeout_games=discard_timeout_games,
                 game_fns=_game_fns,
+                asymmetric_config=asymmetric_config,
+                search_high_noise=search_high_noise,
             )
             _maybe_log_trace(game, worker_id, game=game_name)
             results_queue.put(game)
@@ -1072,6 +1189,7 @@ class SelfPlayManager:
         resign_config: ResignConfig | None = None,
         playout_cap_config: PlayoutCapConfig | None = None,
         curriculum_config: CurriculumConfig | None = None,
+        asymmetric_config: AsymmetricConfig | None = None,
         discard_timeout_games: bool = False,
         game_name: str = "morris",
     ) -> None:
@@ -1096,6 +1214,7 @@ class SelfPlayManager:
         self._resign_config = resign_config
         self._playout_cap_config = playout_cap_config
         self._curriculum_config = curriculum_config
+        self._asymmetric_config = asymmetric_config
         self._discard_timeout_games = discard_timeout_games
         self._game_name = game_name
 
@@ -1202,6 +1321,7 @@ class SelfPlayManager:
                     self._resign_config,
                     self._playout_cap_config,
                     self._curriculum_config,
+                    self._asymmetric_config,
                     self._discard_timeout_games,
                     self._game_name,
                 ),
