@@ -248,6 +248,20 @@
   .panel-section {
     max-width: 100%;
     width: 100%;
+    padding: 16px;
+    min-width: 0;            /* allow inner flex children to shrink */
+  }
+
+  /* Let any flex row inside the analysis panel wrap its children
+     instead of overflowing the viewport. Combined with min-width:0 on
+     the children, this fixes the "text doesn't fit" reports on phones. */
+  .panel-section > div,
+  .panel-section > div > div {
+    min-width: 0;
+  }
+  .panel-section * {
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .app-header {
@@ -261,11 +275,27 @@
     letter-spacing: 0.12em;
   }
 
+  .legend {
+    gap: 12px;
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+
+  .controls {
+    flex-wrap: wrap;
+  }
+
   /* Buttons in the controls bar — full width on mobile so they're tappable */
   .controls button,
   .controls .button {
     min-height: 44px;
     padding: 10px 12px;
+  }
+
+  /* Status bar text shouldn't get clipped; let it wrap on narrow phones */
+  .status-bar {
+    white-space: normal;
+    line-height: 1.35;
   }
 }
 
@@ -276,6 +306,9 @@
   }
   .app-header h1 {
     font-size: 13px;
+  }
+  .panel-section {
+    padding: 12px;
   }
 }
 
