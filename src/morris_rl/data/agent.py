@@ -54,7 +54,12 @@ def _negamax(
     if done:
         if outcome is None or outcome == Outcome.DRAW:
             return 0.0
-        return -_WIN_SCORE  # current player just lost (terminal triggered on their turn)
+        # Depth-aware: more remaining depth at terminal = shorter win path.
+        # Returning -(WIN_SCORE + depth) makes the parent (after sign flip)
+        # see +1004 for a 1-ply win vs +1000 for a 5-ply win. Without this
+        # the agent ties between all winning moves and picks randomly,
+        # producing endgames where it postpones an immediate mill closure.
+        return -(_WIN_SCORE + depth)
 
     if depth == 0:
         return heuristic_fn(state)

@@ -93,7 +93,9 @@ def _negamax(state: GameState, depth: int, alpha: float, beta: float) -> float:
     if done:
         if outcome is None or outcome == Outcome.DRAW:
             return 0.0
-        return -_WIN_SCORE  # current player lost
+        # Depth-aware: remaining depth as a small bonus on the loss magnitude
+        # ensures the parent prefers quick wins over slow wins.
+        return -(_WIN_SCORE + depth)
 
     if depth == 0:
         return _heuristic(state)

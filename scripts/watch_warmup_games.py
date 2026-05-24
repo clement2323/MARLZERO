@@ -181,7 +181,10 @@ def main() -> None:
     parser.add_argument("out_dir", type=Path, help="Directory containing worker_*.jsonl")
     parser.add_argument("--follow", action="store_true", default=True, help="Tail -f mode (default).")
     parser.add_argument("--once", action="store_true", help="Render existing and exit.")
-    parser.add_argument("--render-each", action="store_true", help="Render final board for each game.")
+    parser.add_argument("--summary", action="store_true", default=True,
+                        help="One-line summary per game (default).")
+    parser.add_argument("--render-each", action="store_true",
+                        help="Render final board for each game (overrides --summary).")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--worker", type=int, default=None, help="Show only this worker.")
     parser.add_argument("--only-decisive", action="store_true", help="Hide draws.")
