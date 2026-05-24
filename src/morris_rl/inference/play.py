@@ -86,15 +86,23 @@ def get_network_value(
     network: nn.Module,
     device: torch.device,
     state: GameState,
+    encode_fn=encode_state,
 ) -> float:
     """Run a single forward pass and return the value estimate in [-1, 1].
 
     Positive means the current player is predicted to win.
+
+    ``encode_fn`` defaults to the legacy 7-plane encoder. Pass
+    ``encode_state_graph`` (Morris-only) when the network is a GraphNet —
+    the trunk expects 11 planes there.
     """
-    x = encode_state(state).to(device)
+    x = encode_fn(state).to(device)
     full_mask = torch.ones(1, ACTION_SPACE_SIZE, dtype=torch.bool, device=device)
     with torch.no_grad():
-        _, value = network(x, full_mask)
+        # Networks with aux heads return extra tensors; we only care about
+        # the value (second element of the tuple).
+        out = network(x, full_mask)
+    value = out[1] if isinstance(out, tuple) else out
     return float(value.item())
 
 
@@ -106,11 +114,16 @@ def run_mcts_analysis(
     num_top_moves: int = 3,
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
+    encode_fn=encode_state,
 ) -> tuple[int, list[tuple[int, float]], float]:
     """Run MCTS from *state* and return analysis results.
 
     Creates a fresh :class:`MorrisSearch` instance per call so that concurrent
     requests against a shared network do not interfere.
+
+    ``encode_fn`` defaults to the 7-plane legacy encoder. Pass
+    ``encode_state_graph`` when the network is a GraphNet — both MCTS leaf
+    evaluation and the root value forward pass will use the 11-plane encoding.
 
     Returns:
         Tuple of:
@@ -118,12 +131,18 @@ def run_mcts_analysis(
           - top_moves: list of (action, visit_probability) sorted descending
           - value_estimate: network's value for the root state in [-1, 1]
     """
+    # Thread the encoder into MorrisSearch so MCTS leaf evaluations use the
+    # right number of planes for the network architecture.
+    game_fns: dict | None = (
+        None if encode_fn is encode_state else {"encode_state": encode_fn}
+    )
     search = MorrisSearch(
         network,
         device,
         num_simulations=num_simulations,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
+        game_fns=game_fns,
     )
     action, visit_probs = search.run(state, temperature=1e-6, add_noise=False)
 
@@ -132,5 +151,5 @@ def run_mcts_analysis(
     sorted_idx = legal_indices[np.argsort(visit_probs[legal_indices])[::-1]]
     top_moves = [(int(i), float(visit_probs[i])) for i in sorted_idx[:num_top_moves]]
 
-    value = get_network_value(network, device, state)
+    value = get_network_value(network, device, state, encode_fn=encode_fn)
     return int(action), top_moves, value

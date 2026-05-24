@@ -46,7 +46,8 @@ from morris_rl.inference.play import (
     reconstruct_state,
     run_mcts_analysis,
 )
-from morris_rl.network.resnet import MorrisResNet
+from morris_rl.network.factory import build_network
+from morris_rl.network.resnet import MorrisResNet  # noqa: F401  (kept for backward compat / type hints)
 from morris_rl.utils.checkpoints import load_checkpoint
 from morris_rl.utils.logging import logger
 
@@ -59,6 +60,10 @@ _device: torch.device = torch.device("cpu")
 _num_simulations: int = 200
 _checkpoint_label: str | None = None
 _default_agent_id: str = "minimax-5"
+# Architecture of the loaded checkpoint and the matching state encoder.
+# Both are set by _load_network() based on the checkpoint's config.network.type.
+_network_type: str | None = None
+_encode_fn = None  # Callable[[GameState], torch.Tensor] | None
 
 _AGENT_CHECKPOINT = "checkpoint"
 _AGENT_MINIMAX_3 = "minimax-3"
@@ -131,38 +136,52 @@ class PlayResponse(BaseModel):
 
 
 def _load_network() -> None:
-    """Load the ResNet checkpoint if configured. The default agent flips to
-    'checkpoint' when a network is available, otherwise stays on 'minimax-5'."""
+    """Load whichever network type is recorded in the checkpoint's config.
+
+    Supports both ResNet (legacy 7-plane) and GraphNet (Morris-only 11-plane)
+    via the factory. The default agent flips to 'checkpoint' when a network is
+    available, otherwise stays on 'minimax-5'.
+    """
     global _network, _device, _num_simulations, _checkpoint_label, _default_agent_id
+    global _network_type, _encode_fn
 
     _device = torch.device(os.getenv("DEVICE", "cpu"))
     _num_simulations = int(os.getenv("NUM_SIMULATIONS", "200"))
     checkpoint_path = os.getenv("MODEL_CHECKPOINT", "")
 
     if checkpoint_path and Path(checkpoint_path).exists():
+        from omegaconf import OmegaConf
+        from morris_rl.env.encoding_graph import encode_state_graph
+        from morris_rl.mcts.search import encode_state as encode_state_legacy
+
         payload = load_checkpoint(checkpoint_path)
-        net_cfg = (payload.get("config") or {}).get("network", {})
-        num_blocks = net_cfg.get("num_blocks", int(os.getenv("NUM_BLOCKS", "10")))
-        num_channels = net_cfg.get("num_channels", int(os.getenv("NUM_CHANNELS", "128")))
-        network = MorrisResNet(
-            num_blocks=num_blocks,
-            num_channels=num_channels,
-            num_planes=_NUM_PLANES,
-            policy_head_hidden=net_cfg.get("policy_head_hidden", 64),
-            value_head_hidden=net_cfg.get("value_head_hidden", 64),
-            value_head_type=net_cfg.get("value_head_type", "scalar"),
-        )
+        cfg_dict = payload.get("config") or {}
+        cfg = OmegaConf.create(cfg_dict)
+        net_cfg = cfg.get("network", {}) or {}
+        network = build_network(cfg)
         network.load_state_dict(payload["state_dict"])
         network.eval().to(_device)
         _network = network
+        _network_type = str(net_cfg.get("type", "resnet"))
+        _encode_fn = (
+            encode_state_graph if _network_type == "graphnet" else encode_state_legacy
+        )
         step = payload["step"]
+        num_blocks = int(net_cfg.get("num_blocks", 0))
+        num_channels = int(net_cfg.get("num_channels", 0))
+        tag = "GraphNet" if _network_type == "graphnet" else "ResNet"
         _checkpoint_label = (
-            f"ResNet{num_blocks}×{num_channels} step={step} ({_num_simulations} sims)"
+            f"{tag}{num_blocks}×{num_channels} step={step} ({_num_simulations} sims)"
         )
         _default_agent_id = _AGENT_CHECKPOINT
-        logger.info(f"Loaded network from {checkpoint_path} (step {step})")
+        logger.info(
+            f"Loaded {_network_type} from {checkpoint_path} "
+            f"(step {step}, {num_blocks}×{num_channels})"
+        )
     else:
         _network = None
+        _network_type = None
+        _encode_fn = None
         _checkpoint_label = None
         _default_agent_id = _AGENT_MINIMAX_5
         logger.info("No checkpoint found — defaulting to Minimax depth=5")
@@ -293,8 +312,13 @@ def play(request: PlayRequest) -> PlayResponse:
                 status_code=400,
                 detail="Checkpoint agent requested but no checkpoint is loaded",
             )
+        from morris_rl.mcts.search import encode_state as _encode_state_legacy
         action, top_moves_raw, value = run_mcts_analysis(
-            _network, _device, state, num_simulations=_num_simulations
+            _network,
+            _device,
+            state,
+            num_simulations=_num_simulations,
+            encode_fn=_encode_fn or _encode_state_legacy,
         )
         top_moves = [
             MoveInfo(
