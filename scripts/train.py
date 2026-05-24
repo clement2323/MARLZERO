@@ -59,6 +59,7 @@ def _network_cfg_dict(cfg: DictConfig) -> dict:
         num_positions, action_space_size = _np, _acs
     aux_cfg = cfg.get("aux_heads", {}) or {}
     return {
+        "type": cfg.network.get("type", "resnet"),
         "num_blocks": cfg.network.num_blocks,
         "num_channels": cfg.network.num_channels,
         "num_planes": cfg.input_encoding.num_planes,
@@ -163,10 +164,17 @@ def main(cfg: DictConfig) -> None:
                 )
                 for p in _R_PERMS[1:]
             ]
+    # GraphNet emits an 11-plane encoding (7 legacy + 4 structural). Force the
+    # buffer storage shape to match so worker writes don't collide with the
+    # cfg.input_encoding.num_planes default of 7. Reversi keeps its own value.
+    _buffer_num_planes = (
+        11 if cfg.network.get("type", "resnet") == "graphnet"
+        else _net_cfg["num_planes"]
+    )
     buffer = ReplayBuffer(
         capacity=cfg.training.replay_buffer_size,
         use_symmetry_augmentation=cfg.training.symmetry_augmentation,
-        num_planes=_net_cfg["num_planes"],
+        num_planes=_buffer_num_planes,
         num_positions=_net_cfg["num_positions"],
         action_space_size=_net_cfg["action_space_size"],
         augment_fn=_augment_fn,

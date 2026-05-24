@@ -54,7 +54,19 @@ from morris_rl.env.board import ACTION_SPACE_SIZE
 from morris_rl.network.resnet import MorrisResNet
 from morris_rl.utils.logging import logger
 
-_NUM_PLANES = 7
+_NUM_PLANES = 7  # legacy Morris default (ResNet). GraphNet overrides to 11.
+
+
+def _num_planes_for(network_cfg: dict[str, Any]) -> int:
+    """Return the encoded-state plane count expected by the configured network.
+
+    Defaults to 7 (legacy ResNet on Morris). GraphNet uses 11 planes including
+    the 4 new structural features (threats, degree, ring). Reversi keeps the
+    config-supplied num_planes — typically 3.
+    """
+    if network_cfg.get("type", "resnet") == "graphnet":
+        return 11
+    return int(network_cfg.get("num_planes", _NUM_PLANES))
 
 
 @dataclass(frozen=True)
@@ -95,8 +107,8 @@ class ServerError:
 # ---------------------------------------------------------------------------
 
 
-def _alloc_shm(num_workers: int) -> tuple[ShmNames, list[SharedMemory]]:
-    req_bytes = num_workers * _NUM_PLANES * 24 * 4
+def _alloc_shm(num_workers: int, num_planes: int = _NUM_PLANES) -> tuple[ShmNames, list[SharedMemory]]:
+    req_bytes = num_workers * num_planes * 24 * 4
     probs_bytes = num_workers * ACTION_SPACE_SIZE * 4
     values_bytes = num_workers * 4
 
@@ -118,13 +130,13 @@ def _alloc_shm(num_workers: int) -> tuple[ShmNames, list[SharedMemory]]:
 
 
 def _attach_views(
-    names: ShmNames, num_workers: int
+    names: ShmNames, num_workers: int, num_planes: int = _NUM_PLANES
 ) -> tuple[list[SharedMemory], np.ndarray, np.ndarray, np.ndarray]:
     req_shm = SharedMemory(name=names.request_states)
     probs_shm = SharedMemory(name=names.reply_probs)
     values_shm = SharedMemory(name=names.reply_values)
     request_states = np.ndarray(
-        (num_workers, _NUM_PLANES, 24), dtype=np.float32, buffer=req_shm.buf
+        (num_workers, num_planes, 24), dtype=np.float32, buffer=req_shm.buf
     )
     reply_probs = np.ndarray(
         (num_workers, ACTION_SPACE_SIZE), dtype=np.float32, buffer=probs_shm.buf
@@ -133,17 +145,26 @@ def _attach_views(
     return [req_shm, probs_shm, values_shm], request_states, reply_probs, reply_values
 
 
-def _build_server_network(network_cfg: dict[str, Any]) -> MorrisResNet:
-    return MorrisResNet(
+def _build_server_network(network_cfg: dict[str, Any]) -> torch.nn.Module:
+    """Build the network from a Hydra-serialised config. Dispatches on
+    ``network_cfg["type"]`` ("resnet" or "graphnet"). Defaults to "resnet"
+    for backward compatibility with existing checkpoints.
+    """
+    net_type = network_cfg.get("type", "resnet")
+    common_kwargs = dict(
         num_blocks=network_cfg["num_blocks"],
         num_channels=network_cfg["num_channels"],
-        num_planes=network_cfg.get("num_planes", _NUM_PLANES),
+        num_planes=_num_planes_for(network_cfg),
         policy_head_hidden=network_cfg["policy_head_hidden"],
         value_head_hidden=network_cfg["value_head_hidden"],
         value_head_type=network_cfg.get("value_head_type", "scalar"),
         aux_heads_enabled=bool(network_cfg.get("aux_heads_enabled", False)),
         aux_head_hidden=int(network_cfg.get("aux_head_hidden", 64)),
     )
+    if net_type == "graphnet":
+        from morris_rl.network.graphnet import MorrisGraphNet
+        return MorrisGraphNet(**common_kwargs)
+    return MorrisResNet(**common_kwargs)
 
 
 def _drain_weight_update(weights_queue: mp.Queue, network: torch.nn.Module) -> bool:  # type: ignore[type-arg]
@@ -404,8 +425,10 @@ def _server_loop(
     network = _build_server_network(network_cfg)
     network.to(device).eval()
 
+    num_planes_runtime = _num_planes_for(network_cfg)
+
     handles, request_states, reply_probs, reply_values = _attach_views(
-        shm_names, num_workers
+        shm_names, num_workers, num_planes=num_planes_runtime
     )
 
     initial = weights_queue.get()
@@ -424,7 +447,7 @@ def _server_loop(
         graphed_forward = GraphedForward(
             network=network,
             max_batch=max_batch,
-            num_planes=_NUM_PLANES,
+            num_planes=num_planes_runtime,
             action_space=ACTION_SPACE_SIZE,
             device=device,
         )
@@ -532,17 +555,21 @@ def make_remote_eval_fn(
     num_workers: int,
     encode_state: Any,
     get_legal_actions: Any,
-    get_legal_actions_no_rep: Any = None,
     request_timeout_s: float = 60.0,
+    num_planes: int = _NUM_PLANES,
 ) -> Any:
     """Build an EvalFn that round-trips through the inference server.
 
     Attaches to the three shared memory regions on first call, then reuses the
     views for the lifetime of the worker. Bulky tensors travel via shared
     memory; only a small control message goes through the pipe.
+
+    ``num_planes`` must match the encoded-state plane count produced by
+    ``encode_state`` (7 for legacy Morris ResNet, 11 for GraphNet, 3 for
+    Reversi) so the shared memory view has the right shape.
     """
     handles, request_states, reply_probs, reply_values = _attach_views(
-        shm_names, num_workers
+        shm_names, num_workers, num_planes=num_planes
     )
     counter = {"n": 0}
 
@@ -552,13 +579,6 @@ def make_remote_eval_fn(
         # points to freed memory (silent SIGSEGV in daemon worker).
         _ = handles
         legal = get_legal_actions(state)
-        if not legal and get_legal_actions_no_rep is not None:
-            # Empty set means every movement candidate matched a recent position
-            # (no-rep window). Fall back to rule-legal moves only — i.e. release
-            # the repetition filter, not the rule-level legality. The state is
-            # still terminal per is_terminal (piece-count tie-break) but MCTS
-            # may visit it transiently and needs a non-empty prior support.
-            legal = get_legal_actions_no_rep(state)
         encoded = encode_state(state).squeeze(0).numpy()
         np.copyto(request_states[worker_id], encoded.astype(np.float32, copy=False))
         counter["n"] += 1
@@ -655,7 +675,10 @@ class InferenceServer:
         self._process: Any = None
         self._running = False
 
-        self._shm_names, self._shm_handles = _alloc_shm(num_workers)
+        self._num_planes = _num_planes_for(network_cfg)
+        self._shm_names, self._shm_handles = _alloc_shm(
+            num_workers, num_planes=self._num_planes
+        )
 
     def start(self) -> None:
         if self._running:
@@ -744,3 +767,7 @@ class InferenceServer:
     @property
     def num_workers(self) -> int:
         return self._num_workers
+
+    @property
+    def num_planes(self) -> int:
+        return self._num_planes

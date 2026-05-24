@@ -411,6 +411,11 @@ class Trainer:
         recent_captures: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         recent_pieces_diff: deque[int] = deque(maxlen=_GAME_LENGTH_WINDOW)
         recent_term_reasons: deque[str] = deque(maxlen=_GAME_LENGTH_WINDOW)
+        # Parallel deque storing the tiebreak level for games that hit the cap
+        # ("pieces" / "mills" / "fallback_p1" / None for non-tiebreak ends).
+        # Used downstream to decompose game/term_piece_count_tiebreak_rate into
+        # genuine-signal vs P1-bias-fallback fractions.
+        recent_tiebreak_levels: deque[str | None] = deque(maxlen=_GAME_LENGTH_WINDOW)
         # Resign-feature deques: eligible / triggered are over the same window;
         # verify_outcomes accumulates only the (rare) verify games and tracks
         # whether the would-be-resigner actually lost (1) or not (0). The
@@ -482,6 +487,7 @@ class Trainer:
                 recent_captures.append(game.captures_p1 + game.captures_p2)
                 recent_pieces_diff.append(game.final_pieces_diff)
                 recent_term_reasons.append(game.term_reason)
+                recent_tiebreak_levels.append(getattr(game, "tiebreak_level", None))
                 recent_resign_eligible.append(game.resign_eligible)
                 recent_resigned.append(game.resigned_by_player is not None)
                 recent_full_sim.append(game.full_sim_moves)
@@ -545,6 +551,7 @@ class Trainer:
                     recent_term_reasons,
                     outcome_counts,
                     games_collected,
+                    recent_tiebreak_levels=recent_tiebreak_levels,
                 )
                 self._log_resign_stats(
                     recent_resign_eligible,
@@ -716,6 +723,7 @@ class Trainer:
         recent_term_reasons: deque[str],
         outcome_counts: dict[str, int],
         games_collected: int,
+        recent_tiebreak_levels: deque[str | None] | None = None,
     ) -> None:
         """Log overall per-game scalar stats (all games) and a periodic length histogram."""
         if not recent_lengths:
@@ -760,6 +768,27 @@ class Trainer:
             "game/term_board_full_rate": term_window.count("board_full") / n_recent,
             "game/term_piece_count_tiebreak_rate": term_window.count("piece_count_tiebreak") / n_recent,
         }
+        # Decompose the piece_count_tiebreak rate by which level of
+        # _piece_count_winner actually decided the game:
+        #   "pieces"      → level 1 (count differs)         — genuine signal
+        #   "mills"       → level 2 (mills count differs)   — genuine signal
+        #   "fallback_p1" → level 3 (full symmetry)         — pure P1 BIAS
+        # The three rates sum to game/term_piece_count_tiebreak_rate; their
+        # split tells us how much of the observed P1 win-rate comes from the
+        # bias path vs real outcome differences. None values (non-tiebreak
+        # games) are skipped.
+        if recent_tiebreak_levels:
+            tb_window = [t for t in recent_tiebreak_levels if t is not None]
+            tb_n = len(tb_window) or 1
+            stats["game/tiebreak_pieces_rate"] = tb_window.count("pieces") / n_recent
+            stats["game/tiebreak_mills_rate"] = tb_window.count("mills") / n_recent
+            stats["game/tiebreak_fallback_p1_rate"] = tb_window.count("fallback_p1") / n_recent
+            # Per-tiebreak conditional fractions (denominator = tiebreak games only),
+            # easier to read when comparing across runs with different total
+            # tiebreak rates.
+            stats["game/tiebreak_pieces_share"] = tb_window.count("pieces") / tb_n
+            stats["game/tiebreak_mills_share"] = tb_window.count("mills") / tb_n
+            stats["game/tiebreak_fallback_p1_share"] = tb_window.count("fallback_p1") / tb_n
         for tag, value in stats.items():
             if self._writer is not None:
                 self._writer.add_scalar(tag, value, games_collected)

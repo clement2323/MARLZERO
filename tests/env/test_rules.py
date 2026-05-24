@@ -114,10 +114,12 @@ def test_placement_decrements_hand() -> None:
     assert state.pieces_in_hand[PLAYER_1 - 1] == NUM_PIECES_PER_PLAYER - 1
 
 
-def test_placement_resets_halfmove_clock() -> None:
+def test_placement_does_not_reset_halfmove_clock() -> None:
+    # New semantics: halfmove_clock counts halfmoves since the last *capture*.
+    # Placement increments it; only a capture resets it to 0.
     state = _make_state([0] * NUM_POSITIONS, p1_hand=1, halfmove_clock=10)
     state2 = apply_action(state, 0)
-    assert state2.halfmove_clock == 0
+    assert state2.halfmove_clock == 11
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +374,10 @@ def test_game_continues_with_legal_moves() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_halfmove_clock_at_limit_decisive() -> None:
-    # Reaching MAX_HALFMOVES no-progress clock now returns a decisive outcome
-    # (piece-count tiebreak), never DRAW.
+def test_halfmove_clock_at_limit_is_draw() -> None:
+    # MAX_HALFMOVES is the chess-style 50-move no-capture clock. Hitting it
+    # returns a real DRAW (not a piece-count tiebreak) — these samples are
+    # meant to be discarded from the training buffer via discard_timeout_games.
     board = [0] * NUM_POSITIONS
     board[0] = board[2] = board[4] = PLAYER_1
     board[8] = board[10] = board[12] = PLAYER_2
@@ -383,13 +386,13 @@ def test_halfmove_clock_at_limit_decisive() -> None:
     )
     done, outcome = is_terminal(state)
     assert done
-    assert outcome != Outcome.DRAW
-    assert outcome in (Outcome.PLAYER_1_WINS, Outcome.PLAYER_2_WINS)
+    assert outcome == Outcome.DRAW
 
 
-def test_threefold_repetition_decisive() -> None:
-    # Threefold repetition now resolves via piece-count tiebreak, not DRAW.
-    # Use total_halfmoves < MAX_TOTAL_HALFMOVES so the total cap doesn't fire first.
+def test_threefold_repetition_is_draw() -> None:
+    # Threefold repetition now resolves to a real DRAW. Combined with
+    # discard_timeout_games=true, those samples are dropped from training so
+    # the network is not pulled toward value=0 on non-trivial positions.
     from morris_rl.env.rules import THREEFOLD_LIMIT
 
     board = [0] * NUM_POSITIONS
@@ -403,8 +406,7 @@ def test_threefold_repetition_decisive() -> None:
         s = apply_action(s, _encode_move(11, 10))  # P2: 11→10  ← original pos
     done, outcome = is_terminal(s)
     assert done
-    assert outcome != Outcome.DRAW
-    assert outcome in (Outcome.PLAYER_1_WINS, Outcome.PLAYER_2_WINS)
+    assert outcome == Outcome.DRAW
 
 
 def test_total_halfmoves_counter_increments() -> None:

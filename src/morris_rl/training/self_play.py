@@ -85,7 +85,17 @@ class GameRecord:
     #   "halfmove_cap"      — drew by MAX_HALFMOVES no-progress clock
     #   "threefold"         — drew by repetition limit
     #   "resign"            — losing player resigned (only with feature 1 active)
+    #   "piece_count_tiebreak" — game hit the total-halfmove cap, resolved by tiebreak
     term_reason: str = "unknown"
+    # When term_reason == "piece_count_tiebreak", which level of _piece_count_winner
+    # decided the game:
+    #   "pieces"      — level 1: more pieces on board (genuine signal)
+    #   "mills"       — level 2: tied on pieces, more active mills (genuine signal)
+    #   "fallback_p1" — level 3: fully symmetric, P1 wins by default (BIAS signal)
+    # None when the game ended for another reason. Used by the trainer to
+    # decompose game/term_piece_count_tiebreak_rate into 3 metrics so we can
+    # see how much of the P1 bias comes from the fallback vs real count/mill wins.
+    tiebreak_level: str | None = None
 
     # Resign-feature observability (Phase 2a). All zero-init when the feature
     # is disabled — the trainer treats those games as "not eligible" so the
@@ -548,6 +558,12 @@ def _play_game(
     else:
         _, outcome = _is_terminal(state)
         term_reason = _detect_term_reason(state, outcome, get_legal_actions_fn=_get_legal_actions)
+    # When the game ended at the halfmove cap, record which tiebreak level
+    # decided it — lets the trainer separate "P1 wins by piece count" (real
+    # signal) from "P1 wins by fallback at perfect equality" (pure bias).
+    tiebreak_level: str | None = None
+    if term_reason == "piece_count_tiebreak":
+        tiebreak_level = _detect_tiebreak_level(state)
     final_pieces_p1 = pieces_on_board(state.board, 1)
     final_pieces_p2 = pieces_on_board(state.board, 2)
     final_pieces_diff = final_pieces_p1 - final_pieces_p2
@@ -571,6 +587,7 @@ def _play_game(
         captures_p2=captures_p2,
         final_pieces_diff=final_pieces_diff,
         term_reason=term_reason,
+        tiebreak_level=tiebreak_level,
         resign_eligible=resign_eligible,
         resigned_by_player=resigned_by_player,
         was_verify_play=was_verify_play,
@@ -582,6 +599,34 @@ def _play_game(
         timeout_discarded=timeout_discarded,
         actions_history=actions_history,
     )
+
+
+def _detect_tiebreak_level(state: Any) -> str:
+    """Identify which level of _piece_count_winner resolved this Morris game.
+
+    Mirrors the cascade in [rules._piece_count_winner](src/morris_rl/env/rules.py):
+
+      1. "pieces"      — pieces on board differ (genuine outcome signal)
+      2. "mills"       — pieces tied, active mills differ (genuine signal)
+      3. "fallback_p1" — both pieces and mills tied, P1 wins by default (BIAS)
+
+    Returns "n/a" for non-Morris states (no board attr) just so the caller
+    can short-circuit. The pieces/mills counts are recomputed from
+    ``state.board`` so this function works even when called outside the
+    rules module.
+    """
+    board = getattr(state, "board", None)
+    if board is None:
+        return "n/a"
+    b1 = int((board == 1).sum())
+    b2 = int((board == 2).sum())
+    if b1 != b2:
+        return "pieces"
+    m1 = sum(1 for m in MILLS if all(board[p] == 1 for p in m))
+    m2 = sum(1 for m in MILLS if all(board[p] == 2 for p in m))
+    if m1 != m2:
+        return "mills"
+    return "fallback_p1"
 
 
 def _detect_term_reason(
@@ -627,8 +672,14 @@ def _detect_term_reason(
 # ---------------------------------------------------------------------------
 
 
-def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
-    return MorrisResNet(
+def _build_worker_network(cfg: dict[str, Any]) -> nn.Module:
+    """Reconstruct the network described by *cfg* inside a worker process.
+
+    Dispatches on cfg["type"]: "resnet" (default, works for all games) or
+    "graphnet" (Morris only — uses board adjacency + mill matrices).
+    """
+    net_type = cfg.get("type", "resnet")
+    common_kwargs = dict(
         num_blocks=cfg["num_blocks"],
         num_channels=cfg["num_channels"],
         num_planes=cfg.get("num_planes", _NUM_PLANES),
@@ -640,6 +691,12 @@ def _build_worker_network(cfg: dict[str, Any]) -> MorrisResNet:
         aux_heads_enabled=bool(cfg.get("aux_heads_enabled", False)),
         aux_head_hidden=int(cfg.get("aux_head_hidden", 64)),
     )
+    if net_type == "graphnet":
+        from morris_rl.network.graphnet import MorrisGraphNet
+        # GraphNet always uses 11 planes regardless of what's in cfg.
+        common_kwargs["num_planes"] = 11
+        return MorrisGraphNet(**common_kwargs)
+    return MorrisResNet(**common_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -740,14 +797,18 @@ def _worker_fn(
         # Aux head targets are Morris-specific (mill_diff, pieces_diff). Wire
         # the helper here so _play_game can compute them per ply. For other
         # games this stays unset → NaN aux targets → aux loss masked out.
-        from morris_rl.env.rules import (
-            compute_aux_features as _morris_aux,
-            get_legal_actions_no_rep as _morris_legal_no_rep,
-        )
+        from morris_rl.env.rules import compute_aux_features as _morris_aux
         _game_fns = {
             "compute_aux_features": _morris_aux,
-            "get_legal_actions_no_rep": _morris_legal_no_rep,
         }
+        # When the network is the GraphNet backbone, swap in the graph-aware
+        # encoder (11 planes including threats/degree/ring). Everything else
+        # in the worker pipeline keeps the same shape convention
+        # (1, num_planes, NUM_POSITIONS) so replay buffer & symmetry
+        # augmentation continue to work unchanged.
+        if network_cfg.get("type", "resnet") == "graphnet":
+            from morris_rl.env.encoding_graph import encode_state_graph
+            _game_fns["encode_state"] = encode_state_graph
 
     # Each worker is one MCTS pipeline; using torch's default (= all CPU cores)
     # means N workers fight over N×cores threads. One thread per worker keeps the
@@ -858,6 +919,8 @@ def _worker_fn_remote(
     playout_cap_config: PlayoutCapConfig | None = None,
     curriculum_config: CurriculumConfig | None = None,
     discard_timeout_games: bool = False,
+    network_type: str = "resnet",
+    num_planes: int = 7,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -879,9 +942,14 @@ def _worker_fn_remote(
     _devnull = open(os.devnull, "w")
     sys.stderr = _devnull
     try:
-        from morris_rl.env.rules import get_legal_actions, get_legal_actions_no_rep
+        from morris_rl.env.rules import get_legal_actions
         from morris_rl.mcts.search import MorrisSearch, encode_state
         from morris_rl.training.inference_server import make_remote_eval_fn
+        # GraphNet uses the structural-feature encoder. ResNet keeps the
+        # legacy 7-plane encoder.
+        if network_type == "graphnet":
+            from morris_rl.env.encoding_graph import encode_state_graph
+            encode_state = encode_state_graph  # type: ignore[assignment]
     finally:
         sys.stderr = _old_stderr
         _devnull.close()
@@ -908,7 +976,7 @@ def _worker_fn_remote(
         num_workers=num_workers,
         encode_state=encode_state,
         get_legal_actions=get_legal_actions,
-        get_legal_actions_no_rep=get_legal_actions_no_rep,
+        num_planes=num_planes,
     )
     search = MorrisSearch(
         eval_fn=eval_fn,
@@ -1110,6 +1178,8 @@ class SelfPlayManager:
                     self._playout_cap_config,
                     self._curriculum_config,
                     self._discard_timeout_games,
+                    self._network_cfg.get("type", "resnet"),
+                    self._inference_server.num_planes,
                 ),
                 daemon=True,
             )

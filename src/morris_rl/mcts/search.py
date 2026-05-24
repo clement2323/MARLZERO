@@ -190,7 +190,6 @@ def _make_local_eval_fn(
     device: torch.device,
     encode_fn=None,
     get_legal_fn=None,
-    get_legal_fn_no_rep=None,
     action_space_size: int | None = None,
 ) -> EvalFn:
     """Build an EvalFn that runs the given network in-process on *device*.
@@ -198,20 +197,13 @@ def _make_local_eval_fn(
     Optional overrides allow the same factory to serve non-Morris games without
     touching the Morris defaults: pass encode_fn, get_legal_fn, and
     action_space_size from the game's own module; omit them for Morris.
-
-    ``get_legal_fn_no_rep`` is the no-repetition-filter variant used as a
-    fallback when ``get_legal_fn`` returns an empty list (rep-filter
-    saturation). Omit for games without a rep filter (e.g. Reversi).
     """
     _encode = encode_fn or encode_state
     _legal = get_legal_fn or get_legal_actions
-    _legal_no_rep = get_legal_fn_no_rep
     _n = action_space_size or ACTION_SPACE_SIZE
 
     def evaluate(state: GameState) -> tuple[dict[int, float], float]:
         legal = _legal(state)
-        if not legal and _legal_no_rep is not None:
-            legal = _legal_no_rep(state)
         x = _encode(state).to(device)
         if legal:
             mask = torch.zeros(1, _n, dtype=torch.bool, device=device)
@@ -292,7 +284,6 @@ class MorrisSearch:
                 device,
                 encode_fn=_fns.get("encode_state"),
                 get_legal_fn=_fns.get("get_legal_actions"),
-                get_legal_fn_no_rep=_fns.get("get_legal_actions_no_rep"),
                 action_space_size=_fns.get("action_space_size"),
             )
         self._sim_env = MorrisSimEnv(game_fns)

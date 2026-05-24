@@ -8,6 +8,11 @@ run_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
 algorithm: alphazero
 
 network:
+  # type ∈ {"resnet", "graphnet"}.
+  #   resnet   — legacy Conv1d trunk, works for both Morris and Reversi.
+  #   graphnet — Morris-only heterogeneous MPN that exploits the board's
+  #              adjacency + mill matrices natively. Uses 11 input planes
+  #              (7 legacy + 4 structural: threats, degree, ring).
   type: resnet
   # 16x208 (~4.1M params): bumped from 16x192 to take advantage of the
   # 7+ GB of free VRAM in shared_gpu mode after Tier 2.1 (CUDA-graphed
@@ -15,6 +20,9 @@ network:
   # because shared_gpu favours larger conv ops on small batches.
   # With per_worker_cpu the CPU forwards become the bottleneck — drop
   # back to 12x128 if you ever want to revert.
+  # For type=graphnet a good default is num_blocks=4, num_channels=128
+  # (~300 k params, comparable expressivity to the 165 k ResNet 6×64
+  # baseline plus graph-aware inductive bias).
   num_blocks: 16
   num_channels: 208
   policy_head_hidden: 64

@@ -96,13 +96,16 @@ def transform_board(board: npt.NDArray[Any], perm: npt.NDArray[np.intp]) -> npt.
 def transform_encoded_state(
     encoded: npt.NDArray[np.float32], perm: npt.NDArray[np.intp]
 ) -> npt.NDArray[np.float32]:
-    """Apply a board symmetry to an encoded state of shape (7, 24).
+    """Apply a board symmetry to an encoded state of shape (C, 24).
 
-    Only planes 0-1 (piece positions) are position-dependent; planes 2-6 are
-    scalar broadcasts that are invariant under symmetry.
+    Permutes the position axis (last) for every plane. Scalar-broadcast
+    planes (constant across positions) are unaffected since permuting a
+    constant array is identity. Works for both the legacy 7-plane encoding
+    (only planes 0-1 are position-dependent) and the 11-plane graph
+    encoding (planes 0-1, 7-10 are position-dependent).
     """
-    new_encoded = encoded.copy()
-    new_encoded[:2, perm] = encoded[:2]
+    new_encoded = np.empty_like(encoded)
+    new_encoded[:, perm] = encoded
     return new_encoded
 
 

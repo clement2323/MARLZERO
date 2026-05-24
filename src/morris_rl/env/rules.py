@@ -32,19 +32,21 @@ PLAYER_1: Final[int] = 1
 PLAYER_2: Final[int] = 2
 EMPTY: Final[int] = 0
 
-MAX_HALFMOVES: Final[int] = 300        # no-progress clock (dead-code when total cap active)
-MAX_TOTAL_HALFMOVES: Final[int] = 200  # absolute game length cap — piece count breaks ties
-# Raised from 60 → 200 so more games reach natural termination (≤2 pieces or
-# no_legal_moves) instead of being decided by an artificial piece-count tiebreak.
-# Cleaner value targets at the cost of longer self-play games.
+MAX_HALFMOVES: Final[int] = 50         # no-capture clock — chess-style 50-move rule.
+# `halfmove_clock` counts halfmoves since the last *capture*. Hitting 50 = DRAW,
+# no piece_count tiebreak — these samples should be discarded from the buffer
+# via self_play.discard_timeout_games=true so the network is never trained on
+# "value=0 on a non-decisive position" (the lazy-mean attractor).
+MAX_TOTAL_HALFMOVES: Final[int] = 300  # absolute ceiling, safety net only.
+# With MAX_HALFMOVES=50 capturing-progress rule active, games can theoretically
+# stretch (50 plies × ~18 max captures) but in practice end well before this
+# ceiling once pieces run low. Hitting this falls back to _piece_count_winner.
 THREEFOLD_LIMIT: Final[int] = 3
-# Sliding window for the no-repetition rule. A candidate action is illegal if
-# its resulting position_key matches any position visited within the last
-# REPETITION_WINDOW halfmoves. Eliminates ping-pong A↔B↔A cycles (period 2
-# halfmoves) and longer tactical loops up to ~half the window depth.
-# Game-changing relative to standard Morris: a player with no non-repeating
-# move loses by no_legal_moves rather than drawing by repetition.
-REPETITION_WINDOW: Final[int] = 8
+# No-repetition rule removed: repetitions are not filtered out of get_legal_actions.
+# The network learns to avoid useless cycles on its own (visiting a cycle gives
+# the same value at each step → MCTS Q has no gradient → exploration moves
+# elsewhere). Threefold-repetition termination via THREEFOLD_LIMIT in is_terminal
+# + piece_count_winner still resolves genuine draws when the game gets stuck.
 
 
 class Phase(IntEnum):
@@ -71,11 +73,6 @@ class GameState:
     halfmove_clock: int  # resets on placement or capture; kept for legacy metrics
     total_halfmoves: int = 0  # absolute game length — never reset; cap at MAX_TOTAL_HALFMOVES
     position_counts: dict[tuple[int, ...], int] = field(default_factory=dict)
-    # Sliding window of the last REPETITION_WINDOW position keys. Used by
-    # get_legal_actions to forbid candidates whose resulting position matches
-    # any recent one — prevents short tactical cycles (ping-pong moves).
-    # Tuple (not deque) so GameState stays trivially picklable for mp workers.
-    recent_position_keys: tuple[tuple[int, ...], ...] = ()
 
     def copy(self) -> GameState:
         """Deep copy — board array and position_counts dict are duplicated."""
@@ -87,7 +84,6 @@ class GameState:
             halfmove_clock=self.halfmove_clock,
             total_halfmoves=self.total_halfmoves,
             position_counts=dict(self.position_counts),
-            recent_position_keys=self.recent_position_keys,  # tuple is immutable, share safely
         )
 
 
@@ -215,15 +211,17 @@ def random_late_game_state(
     return initial_state()
 
 
-def get_legal_actions_no_rep(state: GameState) -> list[int]:
-    """Like ``get_legal_actions`` but WITHOUT the no-repetition filter.
+def get_legal_actions(state: GameState) -> list[int]:
+    """Return all legal action indices for the current state.
 
-    Used as a fallback by the MCTS leaf evaluator when ``get_legal_actions``
-    returns an empty list purely because every movement candidate matches a
-    recent position in the sliding window. The state is still terminal per
-    ``is_terminal`` (resolved via piece-count tie-break), but MCTS may visit
-    it during simulation and we need a non-empty action set so the masked
-    log-softmax stays finite. Rule-level illegal moves remain excluded.
+    Three branches depending on the sub-turn:
+      - ``must_capture``: capture actions, with the mill-protection rule.
+      - PLACING phase: every empty position is a legal placement.
+      - MOVING phase: every adjacency edge from an own piece to an empty cell.
+
+    Repetitions are NOT filtered out here — the network learns to avoid
+    pointless cycles via the value head, and threefold-repetition termination
+    in is_terminal handles genuinely stuck games.
     """
     if state.must_capture:
         return _legal_capture_actions(state)
@@ -231,66 +229,6 @@ def get_legal_actions_no_rep(state: GameState) -> list[int]:
     if phase == Phase.PLACING:
         return [p for p in range(NUM_POSITIONS) if state.board[p] == EMPTY]
     return _legal_move_actions(state)
-
-
-def get_legal_actions(state: GameState) -> list[int]:
-    """Return all legal action indices for the current state.
-
-    Filters out movement candidates whose resulting position matches any of
-    the last REPETITION_WINDOW visited positions. This prevents short cycles
-    (ping-pong A↔B↔A) without ending the game — the network simply never
-    sees these moves as options. Placement and capture actions are never
-    filtered (placements strictly grow piece count, so cycles are impossible;
-    captures strictly shrink it).
-    """
-    if state.must_capture:
-        return _legal_capture_actions(state)
-    phase = get_phase(state, state.current_player)
-    if phase == Phase.PLACING:
-        return [p for p in range(NUM_POSITIONS) if state.board[p] == EMPTY]
-    candidates = _legal_move_actions(state)
-    if not state.recent_position_keys:
-        return candidates
-    # Convert the recent tuple-keys to bytes once so per-candidate lookups
-    # are O(1) hash on a flat bytes buffer instead of O(28) tuple hashing.
-    # tuple-keys come from _position_key: (b0..b23, current_player,
-    # must_capture, p1_hand, p2_hand) — 28 ints, all small enough for bytes.
-    recent_bytes: set[bytes] = {
-        bytes(t[:NUM_POSITIONS]) + bytes(t[NUM_POSITIONS:])
-        for t in state.recent_position_keys
-    }
-    legal = []
-    board = state.board
-    opp = opponent(state.current_player)
-    p1h, p2h = state.pieces_in_hand
-    cur = state.current_player
-    for a in candidates:
-        src, dst = MOVE_EDGES[a - NUM_PLACE_CAPTURE_ACTIONS]
-        original_src = int(board[src])
-        original_dst = int(board[dst])
-        board[src] = EMPTY
-        board[dst] = cur
-        # Mill formation flips must_capture and keeps the current player.
-        if forms_mill(board, dst, cur):
-            next_player = cur
-            next_must_capture = 1
-        else:
-            next_player = opp
-            next_must_capture = 0
-        # bytes(numpy_int8_array) is a C memcpy of 24 bytes (~0.3µs), vs
-        # ~5µs for *board.tolist() + tuple construction. Hot path called
-        # ~15 candidates × ~800 MCTS sims per move, so the speedup matters.
-        key_bytes = bytes(board) + bytes((next_player, next_must_capture, p1h, p2h))
-        board[src] = original_src
-        board[dst] = original_dst
-        if key_bytes not in recent_bytes:
-            legal.append(a)
-    # Rep-filter saturation: every rule-legal move would repeat a recent
-    # position. Fall back to the unfiltered set so the action space is never
-    # empty on a non-rule-terminal state. is_terminal already resolves the
-    # actual draw-by-repetition path via piece_count_winner; MCTS visiting
-    # such a state transiently needs a non-empty prior support.
-    return legal if legal else candidates
 
 
 def apply_action(state: GameState, action: int) -> GameState:
@@ -316,14 +254,22 @@ def is_terminal(state: GameState) -> tuple[bool, Outcome | None]:
         return False, None
 
     if state.total_halfmoves >= MAX_TOTAL_HALFMOVES:
+        # Safety-net ceiling: in practice almost never hit thanks to the
+        # no-capture clock below. Resolve via piece-count tiebreak.
         return True, _piece_count_winner(state)
 
     key = _position_key(state)
     if state.position_counts.get(key, 0) >= THREEFOLD_LIMIT:
-        return True, _piece_count_winner(state)
+        # Threefold repetition: genuine stuck-game signal → DRAW, not tiebreak.
+        # Combined with self_play.discard_timeout_games=true these samples are
+        # not used for training.
+        return True, Outcome.DRAW
 
     if state.halfmove_clock >= MAX_HALFMOVES:
-        return True, _piece_count_winner(state)
+        # 50-halfmove no-capture rule (chess-style). No progress in either
+        # player's piece count for MAX_HALFMOVES halfmoves → DRAW. Samples
+        # discarded when self_play.discard_timeout_games=true.
+        return True, Outcome.DRAW
 
     player = state.current_player
     if state.pieces_in_hand[player - 1] == 0:
@@ -402,7 +348,10 @@ def _apply_placement(state: GameState, position: int) -> None:
     hand = list(state.pieces_in_hand)
     hand[player - 1] -= 1
     state.pieces_in_hand = (hand[0], hand[1])
-    state.halfmove_clock = 0  # placement always resets the no-progress clock
+    # halfmove_clock counts halfmoves since the last *capture* — placement does
+    # NOT reset it (it might or might not lead to a mill+capture; the capture
+    # itself, if any, resets the clock via _apply_capture below).
+    state.halfmove_clock += 1
     state.total_halfmoves += 1
 
     if forms_mill(state.board, position, player):
@@ -449,9 +398,3 @@ def _position_key(state: GameState) -> tuple[int, ...]:
 def _register_position(state: GameState) -> None:
     key = _position_key(state)
     state.position_counts[key] = state.position_counts.get(key, 0) + 1
-    # Append to sliding window, capped at REPETITION_WINDOW. Tuple ops are
-    # O(K) but K is small (8) so cost is negligible vs the rest of apply.
-    window = state.recent_position_keys + (key,)
-    if len(window) > REPETITION_WINDOW:
-        window = window[-REPETITION_WINDOW:]
-    state.recent_position_keys = window
