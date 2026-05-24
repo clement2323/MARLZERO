@@ -61,6 +61,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--early-stop-patience", type=int, default=5)
+    parser.add_argument("--no-early-stop", action="store_true",
+                        help="Disable early stopping entirely; always run --epochs epochs.")
 
     # Data
     parser.add_argument("--gamma", type=float, default=1.0)
@@ -103,6 +105,7 @@ def main() -> None:
         val_seed=args.val_seed,
         epochs=args.epochs,
         early_stop_patience=args.early_stop_patience,
+        early_stop_disabled=args.no_early_stop,
         eval_every=args.eval_every,
         n_eval_random=args.n_eval_random,
         n_eval_d3=args.n_eval_d3,

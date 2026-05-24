@@ -201,18 +201,36 @@ class BareNetworkAgent:
 # ---------------------------------------------------------------------------
 
 
-def _play_match(agent_p1, agent_p2, max_halfmoves: int = 200) -> int:
-    """Return outcome ∈ {0=DRAW, 1=P1, 2=P2}. Cap at max_halfmoves → DRAW."""
+def _play_match(
+    agent_p1,
+    agent_p2,
+    max_halfmoves: int = 200,
+    opening_random_k: int = 0,
+    rng=None,
+) -> int:
+    """Return outcome ∈ {0=DRAW, 1=P1, 2=P2}. Cap at max_halfmoves → DRAW.
+
+    When `opening_random_k > 0` and `rng` is provided, the first K plies are
+    played uniformly at random. This breaks the determinism between two
+    argmax-based agents (network argmax + minimax argmax) that would
+    otherwise produce only 2 distinct games no matter how many we run.
+    """
+    import random as _random
     agents = {1: agent_p1, 2: agent_p2}
     state = initial_state()
+    halfmove_idx = 0
     while True:
         if state.total_halfmoves >= max_halfmoves:
             return 0
         done, outcome = is_terminal(state)
         if done:
             return 0 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
-        action = agents[state.current_player].select_action(state)
+        if halfmove_idx < opening_random_k and rng is not None:
+            action = rng.choice(get_legal_actions(state))
+        else:
+            action = agents[state.current_player].select_action(state)
         state = apply_action(state, int(action))
+        halfmove_idx += 1
 
 
 def eval_vs_baselines(
@@ -221,12 +239,18 @@ def eval_vs_baselines(
     n_random: int = 100,
     n_d3: int = 50,
     base_seed: int = 0,
+    opening_random_k: int = 4,
 ) -> dict[str, float]:
     """Play `n_random` games vs RandomAgent and `n_d3` vs MinimaxAgent(depth=3).
 
     Returns winrate / drawrate / lossrate from the network's POV. The network
     alternates between P1 and P2 across games to wash out first-mover bias.
+
+    `opening_random_k=4` is critical when both agents are deterministic
+    argmax (network bare + minimax) — without it, all 50 d3 games collapse
+    onto 2 distinct game trajectories.
     """
+    import random as _random
     net_agent = BareNetworkAgent(network, device)
 
     def play_series(opponent_factory, n: int, seed_offset: int) -> dict[str, float]:
@@ -238,7 +262,12 @@ def eval_vs_baselines(
                 p1, p2 = net_agent, opp
             else:
                 p1, p2 = opp, net_agent
-            outcome = _play_match(p1, p2)
+            match_rng = _random.Random(base_seed + 31_337 + seed_offset + i)
+            outcome = _play_match(
+                p1, p2,
+                opening_random_k=opening_random_k,
+                rng=match_rng,
+            )
             if outcome == 0:
                 draws += 1
             elif outcome == net_side:
@@ -298,6 +327,7 @@ class TrainArgs:
     val_seed: int = 0
     epochs: int = 40
     early_stop_patience: int = 5
+    early_stop_disabled: bool = False
     eval_every: int = 5
     n_eval_random: int = 100
     n_eval_d3: int = 50
@@ -476,7 +506,7 @@ def train_supervised(args: TrainArgs) -> dict[str, Any]:
             )
         else:
             patience += 1
-            if patience >= args.early_stop_patience:
+            if not args.early_stop_disabled and patience >= args.early_stop_patience:
                 print(f"  early stop at epoch {epoch} (no val improvement for {patience} epochs)", flush=True)
                 break
 
