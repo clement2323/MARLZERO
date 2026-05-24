@@ -262,9 +262,11 @@ export default function RulesTheater({ triggerKey }: RulesTheaterProps) {
   return (
     <svg
       className="rules-theater"
-      width={AREA_WIDTH}
-      height={AREA_HEIGHT}
       viewBox={`0 0 ${AREA_WIDTH} ${AREA_HEIGHT}`}
+      width="100%"
+      height="auto"
+      preserveAspectRatio="xMidYMid meet"
+      style={{ maxWidth: AREA_WIDTH, display: "block" }}
     >
       {lines.map((line, i) => (
         <text

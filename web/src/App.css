@@ -139,6 +139,7 @@
 
 .rules-block {
   max-width: 560px;
+  width: 100%;
   margin: 18px 0 0;
   padding-top: 16px;
   border-top: 1px solid var(--rule);
@@ -262,6 +263,15 @@
     width: 100%;
     padding: 16px;
     min-width: 0;            /* allow inner flex children to shrink */
+  }
+
+  .rules-block {
+    max-width: 480px;
+  }
+
+  .rules-theater {
+    width: 100%;
+    height: auto;
   }
 
   /* Let any flex row inside the analysis panel wrap its children
