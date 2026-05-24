@@ -51,7 +51,11 @@ class HeuristicWeights:
 WEIGHTS_PLACEMENT = HeuristicWeights(
     material=1.0,
     closed_mills=0.4,
-    potential_mills=0.25,
+    # potential_mills lowered (0.25 → 0.15): the previous ratio of 0.625 vs
+    # closed_mills triggered the horizon effect — the agent rushed to set up
+    # 2-of-3 mills at leaf nodes, which the opponent blocked at the next ply.
+    # Lit. ratio ~0.3-0.5 vs closed; 0.375 here.
+    potential_mills=0.15,
     mobility=0.05,
     forks=0.7,
     crossroads=0.08,
@@ -61,7 +65,8 @@ WEIGHTS_PLACEMENT = HeuristicWeights(
 WEIGHTS_MOVEMENT = HeuristicWeights(
     material=1.2,
     closed_mills=0.5,
-    potential_mills=0.30,
+    # See WEIGHTS_PLACEMENT.potential_mills comment.
+    potential_mills=0.20,
     mobility=0.10,
     forks=0.8,
     crossroads=0.12,
