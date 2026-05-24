@@ -22,6 +22,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from morris_rl.env.rules import (
@@ -31,6 +33,38 @@ from morris_rl.env.rules import (
     get_phase,
     initial_state,
 )
+from morris_rl.env.symmetries import SYMMETRY_PERMUTATIONS
+
+
+def _canonical_position_key(state) -> tuple[int, ...]:
+    """Return the lex-min representative of the position under the D4 × color-swap
+    group orbit (16 elements). Two positions equivalent under any of the 16
+    symmetries produce the same canonical key.
+
+    Color swap = exchange P1/P2 on the board, swap pieces_in_hand, flip
+    current_player. The position_counts dict is excluded — it depends on the
+    trajectory, not the position itself.
+    """
+    board = state.board.astype(np.int8, copy=False)
+    h1, h2 = state.pieces_in_hand
+    p = state.current_player
+    mc = int(state.must_capture)
+
+    best: tuple[int, ...] | None = None
+    for perm in SYMMETRY_PERMUTATIONS:
+        permuted = np.empty_like(board)
+        permuted[perm] = board
+        # Variant A: colors as-is.
+        key_a = (*permuted.tolist(), p, mc, int(h1), int(h2))
+        # Variant B: swap P1 ↔ P2 (+ hands + current_player).
+        swapped = np.where(permuted == 1, 2, np.where(permuted == 2, 1, 0)).astype(np.int8)
+        flipped_p = 2 if p == 1 else 1
+        key_b = (*swapped.tolist(), flipped_p, mc, int(h2), int(h1))
+        for k in (key_a, key_b):
+            if best is None or k < best:
+                best = k
+    assert best is not None
+    return best
 
 
 def _load_traces(out_dir: Path) -> list[dict[str, Any]]:
@@ -62,6 +96,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("out_dir", type=Path, help="Directory with worker_*.jsonl files")
     parser.add_argument("--top-k", type=int, default=5, help="Show top-K most common positions.")
+    parser.add_argument(
+        "--canonical",
+        action="store_true",
+        help="Canonicalize positions over the 16-element D4 × color-swap group "
+             "(reports 'true unique up to symmetry'). Slower (~16x).",
+    )
     args = parser.parse_args()
 
     if not args.out_dir.exists():
@@ -89,12 +129,13 @@ def main() -> None:
     positions_with_policy = 0   # minimax-evaluated positions (root_scores != None)
     positions_no_policy = 0     # random plies (opening or ε)
 
+    key_fn = _canonical_position_key if args.canonical else _position_key
     for g in games:
         state = initial_state()
         actions = g["actions"]
         root_scores = g.get("root_scores", [None] * len(actions))
         for t, a in enumerate(actions):
-            key = _position_key(state)
+            key = key_fn(state)
             position_count[key] += 1
             phase_positions[_phase_label(state)][key] += 1
             total_positions += 1
@@ -148,8 +189,9 @@ def main() -> None:
     print()
 
     print("Position coverage:")
+    canon_label = "canonical (D4×color-swap)" if args.canonical else "raw (no symmetry)"
     print(f"  total positions visited  : {total_positions:>7d}")
-    print(f"  unique canonical positions: {unique_positions:>7d}   "
+    print(f"  unique positions [{canon_label}]: {unique_positions:>7d}   "
           f"({coverage_ratio * 100:5.2f} % unique)")
     print(f"  minimax-labeled positions: {positions_with_policy:>7d}   "
           f"({positions_with_policy / max(total_positions, 1) * 100:5.1f} % of total)")
