@@ -320,6 +320,24 @@ def _decode_last_move(
     return int(src), int(dst), None, None
 
 
+def _action_origin_tag(trace: dict[str, Any], action_index: int) -> str:
+    """Color-coded tag identifying who chose the action at half-move `action_index`.
+
+    Warmup traces (from generate_warmup_dataset.py) carry `opening_random_k`
+    and `epsilon_random_indices` fields. Self-play traces don't — they return
+    an empty string so the line stays uncluttered.
+    """
+    open_k = int(trace.get("opening_random_k", 0))
+    eps_indices = set(trace.get("epsilon_random_indices", []))
+    if open_k == 0 and not eps_indices:
+        return ""  # not a warmup trace
+    if action_index < open_k:
+        return "\033[33m[OPENING-RANDOM]\033[0m "      # yellow
+    if action_index in eps_indices:
+        return "\033[31m[ε-RANDOM]\033[0m "        # red
+    return "\033[32m[MINIMAX]\033[0m "                  # green
+
+
 def _print_screen(trace: dict[str, Any], states: list[Any], step: int) -> None:
     print("\033[2J\033[H", end="")  # clear + home
     n = len(states) - 1
@@ -338,7 +356,8 @@ def _print_screen(trace: dict[str, Any], states: list[Any], step: int) -> None:
         prev_state = states[step - 1]
         action = trace["actions"][step - 1]
         was_capture = prev_state.must_capture
-        print(f"Last action: {describe_action(int(action), must_capture=was_capture)}")
+        tag = _action_origin_tag(trace, step - 1)
+        print(f"Last action: {tag}{describe_action(int(action), must_capture=was_capture)}")
         moved_from, moved_to, placed_at, captured_at = _decode_last_move(
             prev_state, int(action)
         )

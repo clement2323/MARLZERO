@@ -116,6 +116,7 @@ def compute_loss(
     pieces_diff_target: torch.Tensor | None = None,
     aux_weight_mill: float = 0.0,
     aux_weight_pieces: float = 0.0,
+    policy_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute AlphaZero combined loss with optional KataGo-style aux heads.
 
@@ -130,6 +131,11 @@ def compute_loss(
             entries are masked out so samples lacking aux supervision still
             contribute to policy/value losses.
         aux_weight_mill, aux_weight_pieces: scalar λ weights. 0 disables.
+        policy_mask: optional (batch,) bool/float tensor. Samples with
+            policy_mask=0 contribute zero to the policy loss (used by the
+            supervised warmup trainer to skip random plies which have no
+            informative policy target). Default None preserves the original
+            self-play behaviour (every sample contributes equally).
 
     Returns:
         (total_loss, policy_loss, value_loss, mill_loss, pieces_loss).
@@ -138,7 +144,13 @@ def compute_loss(
     # 0 × -inf = NaN when policy_target=0 on masked actions — zero out explicitly.
     contrib = policy_target * log_policy
     contrib = torch.where(policy_target > 0, contrib, torch.zeros_like(contrib))
-    policy_loss = -contrib.sum(dim=1).mean()
+    per_sample_policy_loss = -contrib.sum(dim=1)  # (batch,)
+    if policy_mask is not None:
+        mask = policy_mask.to(per_sample_policy_loss.dtype)
+        denom = mask.sum().clamp(min=1.0)
+        policy_loss = (per_sample_policy_loss * mask).sum() / denom
+    else:
+        policy_loss = per_sample_policy_loss.mean()
     if value_logits is not None:
         # Map continuous target ∈ [-1, +1] → 3-class index {0=win, 1=draw, 2=loss}.
         # round() (not truncation) is critical when targets come from the hybrid
