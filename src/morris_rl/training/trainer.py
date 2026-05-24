@@ -272,7 +272,14 @@ class Trainer:
         # limited to LoRA adapters when freeze_trunk() has been called before
         # creating the Trainer. When the trunk is not frozen this is equivalent
         # to network.parameters() — fully backward-compatible.
-        self._optimizer = torch.optim.Adam(
+        #
+        # AdamW (Loshchilov & Hutter 2019) instead of plain Adam: the weight
+        # decay is applied DIRECTLY to the weights, decoupled from the Adam
+        # moment update. This is the modern default (BERT, GPT, KataGo, …);
+        # Adam's `weight_decay` actually applies L2 via the gradient, which
+        # gets divided by sqrt(variance(g)) and behaves differently than
+        # intended in most published recipes.
+        self._optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, network.parameters()),
             lr=learning_rate,
             weight_decay=weight_decay,
@@ -341,14 +348,14 @@ class Trainer:
                 self._mlflow_active = False
 
     def rebuild_optimizer(self) -> None:
-        """Rebuild the Adam optimizer to cover only currently-trainable parameters.
+        """Rebuild the AdamW optimizer to cover only currently-trainable parameters.
 
         Call this after ``network.freeze_trunk()`` so that LoRA adapters (and
         only those) appear in the parameter group. The current learning rate is
         carried over from the previous optimizer; scheduler resets to step 0.
         """
         lr = self._optimizer.param_groups[0]["lr"]
-        self._optimizer = torch.optim.Adam(
+        self._optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self._network.parameters()),
             lr=lr,
             weight_decay=self._weight_decay,

@@ -74,7 +74,11 @@ class SupervisedTrainer:
         self.aux_weight_pieces = float(aux_weight_pieces)
         self.max_grad_norm = float(max_grad_norm)
 
-        self.optimizer = torch.optim.Adam(
+        # AdamW with decoupled weight decay — matches the self-play Trainer
+        # and standard modern practice (BERT, GPT, KataGo). The two trainers
+        # use the same optimizer family so checkpoints flow cleanly when the
+        # supervised warmup state is loaded into Phase 3.
+        self.optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.network.parameters()),
             lr=lr,
             weight_decay=weight_decay,
