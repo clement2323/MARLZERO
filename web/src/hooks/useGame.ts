@@ -1,8 +1,12 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { fetchAgents, fetchNewGame, fetchPlay, fetchState } from "../api/client";
 import type { AgentOption, BoardState, MoveInfo, PlayResponse } from "../types/game";
-
-const NUM_PLACE_CAPTURE_ACTIONS = 24;
+import {
+  ADJACENCY,
+  EDGE_INDEX,
+  NUM_PLACE_CAPTURE_ACTIONS,
+  decodeMoveAction,
+} from "../utils/actions";
 
 // Must stay in sync with morris_rl/inference/play.py POSITION_LABELS
 const POSITION_LABELS: string[] = [
@@ -20,66 +24,16 @@ const POSITION_LABELS: string[] = [
   "c4",
 ];
 
-// Mirror of morris_rl/env/board.py ADJACENCY. Each entry lists the positions
-// that share a board line with the indexed position (sorted ascending).
-// Must stay byte-for-byte identical to the backend or movement actions will
-// mismatch and the server will reject the replay with IllegalActionError.
-const ADJACENCY: number[][] = [
-  [1, 7],         // 0  a7
-  [0, 2, 9],      // 1  d7
-  [1, 3],         // 2  g7
-  [2, 4, 11],     // 3  g4
-  [3, 5],         // 4  g1
-  [4, 6, 13],     // 5  d1
-  [5, 7],         // 6  a1
-  [0, 6, 15],     // 7  a4
-  [9, 15],        // 8  b6
-  [1, 8, 10, 17], // 9  d6
-  [9, 11],        // 10 f6
-  [3, 10, 12, 19],// 11 f4
-  [11, 13],       // 12 f2
-  [5, 12, 14, 21],// 13 d2
-  [13, 15],       // 14 b2
-  [7, 8, 14, 23], // 15 b4
-  [17, 23],       // 16 c5
-  [9, 16, 18],    // 17 d5
-  [17, 19],       // 18 e5
-  [11, 18, 20],   // 19 e4
-  [19, 21],       // 20 e3
-  [13, 20, 22],   // 21 d3
-  [21, 23],       // 22 c3
-  [15, 16, 22],   // 23 c4
-];
-
-// Compact (src, dst) → action_index lookup, built from ADJACENCY in the same
-// order the backend uses (src ascending, then dst ascending within each src).
-// Reproduces morris_rl/env/board.py MOVE_EDGES + EDGE_INDEX so this stays
-// consistent without any backend round-trip.
-const EDGE_INDEX: number[][] = (() => {
-  const idx: number[][] = Array.from({ length: 24 }, () => Array(24).fill(-1));
-  let k = 0;
-  for (let src = 0; src < 24; src++) {
-    for (const dst of ADJACENCY[src]) {
-      idx[src][dst] = NUM_PLACE_CAPTURE_ACTIONS + k;
-      k += 1;
-    }
-  }
-  return idx;
-})();
-
 function describeAction(action: number, mustCapture: boolean): string {
   if (action < NUM_PLACE_CAPTURE_ACTIONS) {
     return mustCapture
       ? `Capture ${POSITION_LABELS[action]}`
       : `Place ${POSITION_LABELS[action]}`;
   }
-  // Find (src, dst) by linear scan over EDGE_INDEX — fine for ≤ 56 edges.
-  for (let src = 0; src < 24; src++) {
-    for (const dst of ADJACENCY[src]) {
-      if (EDGE_INDEX[src][dst] === action) {
-        return `${POSITION_LABELS[src]} → ${POSITION_LABELS[dst]}`;
-      }
-    }
+  const decoded = decodeMoveAction(action);
+  if (decoded) {
+    const [src, dst] = decoded;
+    return `${POSITION_LABELS[src]} → ${POSITION_LABELS[dst]}`;
   }
   return `move ${action}`;
 }

@@ -4,6 +4,7 @@ import {
   justifyToWidth,
 } from "../utils/pretextLayout";
 import type { Jitter } from "../hooks/useShake";
+import { decodeMoveAction, NUM_PLACE_CAPTURE_ACTIONS as _NUM_PLACE_CAPTURE_ACTIONS } from "../utils/actions";
 
 // SVG canvas is 560×560, 7×7 grid with 80px cells, 40px padding.
 // Board positions indexed 0-23 matching morris_rl POSITION_LABELS.
@@ -204,9 +205,6 @@ export default function Board({
   lastPlacedPos = null,
   lastMoveKey = 0,
 }: Props) {
-  // Determine which positions are valid click targets
-  const NUM_PLACE_CAPTURE_ACTIONS = 24;
-
   // Per-position coordinates (jittered if a shake is active). All renderers —
   // scaffold, rails, mill banners, pieces, ring paths — read from this single
   // array so the whole board moves coherently each frame.
@@ -215,19 +213,24 @@ export default function Board({
     jitter,
   );
 
+  // Decode legalActions into the set of board positions the human can tap.
+  // Movement actions go through decodeMoveAction (utils/actions.ts) which
+  // mirrors the backend's MOVE_EDGES table — using the legacy dense 24×24
+  // layout here silently mislabels positions and the destination cell
+  // becomes unclickable in the movement phase.
   const legalPositions = new Set<number>();
   for (const action of legalActions) {
-    if (action < NUM_PLACE_CAPTURE_ACTIONS) {
+    if (action < _NUM_PLACE_CAPTURE_ACTIONS) {
       legalPositions.add(action);
-    } else {
-      const relative = action - NUM_PLACE_CAPTURE_ACTIONS;
-      const src = Math.floor(relative / 24);
-      const dst = relative % 24;
-      if (selectedPos === src) {
-        legalPositions.add(dst);
-      } else if (selectedPos === null) {
-        legalPositions.add(src);
-      }
+      continue;
+    }
+    const decoded = decodeMoveAction(action);
+    if (!decoded) continue;
+    const [src, dst] = decoded;
+    if (selectedPos === src) {
+      legalPositions.add(dst);
+    } else if (selectedPos === null) {
+      legalPositions.add(src);
     }
   }
 
