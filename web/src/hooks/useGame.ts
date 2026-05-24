@@ -145,7 +145,10 @@ export function useGame() {
   // its turn (e.g. it just formed a mill and now owes a capture).
   const callAgent = useCallback((actions: number[], humanPlayer: 1 | 2) => {
     setGs((prev) => ({ ...prev, status: "thinking" }));
-    const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 700));
+    // Minimum "thinking" delay so the agent doesn't feel instant. Kept short
+    // so the loser overlay fires close to the game-ending move instead of
+    // lagging by most of a second.
+    const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 280));
     Promise.all([fetchPlay(actions, selectedAgentRef.current), minDelay])
       .then(([resp]: [PlayResponse, void]) => {
         const newActions = [...actions, resp.action];
