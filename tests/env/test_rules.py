@@ -421,8 +421,13 @@ def test_total_halfmoves_counter_increments() -> None:
     assert state3.total_halfmoves == 2
 
 
-def test_piece_count_tiebreak_at_cap() -> None:
-    """At total_halfmoves == MAX_TOTAL_HALFMOVES, winner is determined by board pieces."""
+def test_total_halfmove_cap_returns_draw_regardless_of_piece_diff() -> None:
+    """At total_halfmoves == MAX_TOTAL_HALFMOVES the game terminates as a DRAW.
+
+    Previously this branch resolved via _piece_count_winner (board pieces →
+    mills → P1 fallback). That gave minimax an incentive to drag games to
+    the cap when it had a small material edge; we now declare a clean draw.
+    """
     board = [0] * NUM_POSITIONS
     board[0] = board[2] = board[4] = board[6] = PLAYER_1   # 4 pieces
     board[8] = board[10] = board[12] = PLAYER_2              # 3 pieces
@@ -431,11 +436,11 @@ def test_piece_count_tiebreak_at_cap() -> None:
     )
     done, outcome = is_terminal(state)
     assert done
-    assert outcome == Outcome.PLAYER_1_WINS   # P1 has more board pieces
+    assert outcome == Outcome.DRAW
 
 
-def test_piece_count_tiebreak_p2_wins() -> None:
-    """Piece-count tiebreak gives win to P2 when P2 has more pieces."""
+def test_total_halfmove_cap_draw_even_when_p2_leads() -> None:
+    """Same as above but with P2 ahead on pieces — still a DRAW at cap."""
     board = [0] * NUM_POSITIONS
     board[0] = board[2] = PLAYER_1                           # 2 pieces
     board[8] = board[10] = board[12] = board[14] = PLAYER_2  # 4 pieces
@@ -444,18 +449,16 @@ def test_piece_count_tiebreak_p2_wins() -> None:
     )
     done, outcome = is_terminal(state)
     assert done
-    assert outcome == Outcome.PLAYER_2_WINS
+    assert outcome == Outcome.DRAW
 
 
-def test_piece_count_tiebreak_mill_fallback() -> None:
-    """Equal board pieces → player with more active mills wins."""
+def test_total_halfmove_cap_draw_with_mill_advantage() -> None:
+    """Mill advantage at cap no longer matters either — draw is unconditional."""
     from morris_rl.env.board import MILLS
-    # Use first mill for P1, leave P2 with no mills but same piece count.
-    mill = MILLS[0]  # e.g. (0, 1, 2)
+    mill = MILLS[0]
     board = [0] * NUM_POSITIONS
     for pos in mill:
         board[pos] = PLAYER_1  # P1 has a mill
-    # P2 gets same count of pieces but no mill
     occupied = set(mill)
     p2_count = 0
     for pos in range(NUM_POSITIONS):
@@ -467,7 +470,7 @@ def test_piece_count_tiebreak_mill_fallback() -> None:
     )
     done, outcome = is_terminal(state)
     assert done
-    assert outcome == Outcome.PLAYER_1_WINS  # same pieces, P1 has a mill
+    assert outcome == Outcome.DRAW
 
 
 # ---------------------------------------------------------------------------

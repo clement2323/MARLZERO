@@ -246,8 +246,14 @@ def apply_action(state: GameState, action: int) -> GameState:
 def is_terminal(state: GameState) -> tuple[bool, Outcome | None]:
     """Return (done, outcome). outcome is None when not done.
 
-    No draws are possible: the 100-halfmove total cap and threefold repetition
-    both resolve via _piece_count_winner (pieces → mills → P1 fallback).
+    Decisive verdicts:
+      - opponent reduced to <3 pieces  →  current player wins
+      - current player has no legal move  →  opponent wins
+
+    Draw verdicts:
+      - total-halfmove cap reached
+      - threefold repetition
+      - 50-halfmove no-capture clock
     """
     # The must_capture sub-turn is not a terminal check point.
     if state.must_capture:
@@ -255,8 +261,12 @@ def is_terminal(state: GameState) -> tuple[bool, Outcome | None]:
 
     if state.total_halfmoves >= MAX_TOTAL_HALFMOVES:
         # Safety-net ceiling: in practice almost never hit thanks to the
-        # no-capture clock below. Resolve via piece-count tiebreak.
-        return True, _piece_count_winner(state)
+        # no-capture clock below. Hitting it now resolves to a clean DRAW
+        # rather than a piece-count tiebreak — this avoids minimax (and
+        # self-play) preferring to drag the game to the cap when it has a
+        # small material edge. The piece_count tiebreak heuristic stayed
+        # in the code (see _piece_count_winner) in case we revert later.
+        return True, Outcome.DRAW
 
     key = _position_key(state)
     if state.position_counts.get(key, 0) >= THREEFOLD_LIMIT:
