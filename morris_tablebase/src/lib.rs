@@ -7,5 +7,6 @@
 pub mod board;
 pub mod hash;
 pub mod rules;
+pub mod subspace;
 pub mod symmetry;
 pub mod wave;
