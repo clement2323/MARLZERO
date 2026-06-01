@@ -38,3 +38,8 @@ logs/
 node_modules/
 dist/
 .parcel-cache/
+
+# Rust (morris_tablebase crate)
+morris_tablebase/target/
+# Cargo.lock kept in VCS — this is a private application-style crate,
+# we want reproducible builds across machines

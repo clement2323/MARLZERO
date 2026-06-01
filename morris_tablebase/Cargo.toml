@@ -1,0 +1,21 @@
+[package]
+name = "morris_tablebase"
+version = "0.1.0"
+edition = "2021"
+description = "Retrograde tablebase for Nine Men's Morris (Gasser 1996 reproduction)"
+license = "MIT"
+
+[lib]
+name = "morris_tablebase"
+path = "src/lib.rs"
+
+# Phase 1 has no external deps yet. pyo3 / rayon / indicatif / memmap2 will
+# be added when we wire to Python, parallelise the wave, render progress
+# bars, and persist tables on disk respectively.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
