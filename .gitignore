@@ -43,3 +43,6 @@ dist/
 morris_tablebase/target/
 # Cargo.lock kept in VCS — this is a private application-style crate,
 # we want reproducible builds across machines
+
+# Gasser tablebase binary files (multi-GB, generated locally)
+data/tablebase/

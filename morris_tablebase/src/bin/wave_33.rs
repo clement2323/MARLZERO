@@ -19,7 +19,7 @@ fn main() {
     let sub = Subspace::movement(3, 3);
     let tb = Tablebase::new();
     let t0 = Instant::now();
-    let (_table, stats) = solve_movement(sub, Variant::Flying, &tb);
+    let (_table, stats) = solve_movement(sub, Variant::Flying, &tb, None);
     let dt = t0.elapsed().as_secs_f64();
     let WaveStats { n_states, win, loss, draw, max_dtw } = stats;
 

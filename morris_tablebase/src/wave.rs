@@ -78,10 +78,14 @@ fn for_each_simple_move<F: FnMut(u8, bool, u32, u8)>(
 /// Solve one movement subspace. The tablebase must contain all SMALLER
 /// movement subspaces (i.e. all `(w', b')` with `w' + b' < w + b`).
 /// Returns the resolved [SubspaceTable] and aggregate stats.
+///
+/// If `progress` is provided, the bar is set to length = n_states and
+/// updated as positions get resolved across init + wave + finalize phases.
 pub fn solve_movement(
     sub: Subspace,
     variant: Variant,
     tablebase: &Tablebase,
+    progress: Option<&indicatif::ProgressBar>,
 ) -> (SubspaceTable, WaveStats) {
     assert!(sub.is_movement(), "solve_movement called on placement subspace {:?}", sub);
     let n = sub.n_states() as usize;
@@ -89,6 +93,12 @@ pub fn solve_movement(
     let mut dtw: Vec<u16> = vec![0u16; n];
     let mut count: Vec<u16> = vec![0u16; n];
     let mut queue: Vec<u32> = Vec::with_capacity(n / 4);
+
+    if let Some(pb) = progress {
+        pb.set_length(n as u64);
+        pb.set_position(0);
+        pb.set_message("init");
+    }
 
     // Phase 0 — enumerate positions, compute initial verdict using cross-
     // subspace lookups for capture children that go to smaller subspaces.
@@ -100,13 +110,38 @@ pub fn solve_movement(
         }
     });
 
+    // Count states already resolved at init (queued + init-resolved DRAWs).
+    let mut resolved: u64 = 0;
+    for &v in &verdict {
+        if v != UNKNOWN { resolved += 1; }
+    }
+    if let Some(pb) = progress {
+        pb.set_position(resolved);
+        pb.set_message("wave");
+    }
+
     // Phase 1 — wave propagation through intra-subspace parents.
     let mut head = 0usize;
+    let mut last_tick = resolved;
     while head < queue.len() {
         let p_idx = queue[head];
         head += 1;
+        let prev_len = queue.len();
         propagate_to_parents(sub, variant, p_idx,
                              &mut verdict, &mut dtw, &mut count, &mut queue);
+        let new_pushes = (queue.len() - prev_len) as u64;
+        resolved += new_pushes;
+        if let Some(pb) = progress {
+            if resolved - last_tick >= 100_000 {
+                pb.set_position(resolved);
+                last_tick = resolved;
+            }
+        }
+    }
+
+    if let Some(pb) = progress {
+        pb.set_position(resolved);
+        pb.set_message("finalize");
     }
 
     // Phase 2 — UNKNOWN → DRAW, tally.
@@ -119,6 +154,11 @@ pub fn solve_movement(
             DRAW => stats.draw += 1,
             _ => unreachable!(),
         }
+    }
+
+    if let Some(pb) = progress {
+        pb.set_position(n as u64);
+        pb.finish_with_message("done");
     }
 
     let table = SubspaceTable { subspace: sub, verdict, dtw };

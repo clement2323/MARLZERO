@@ -21,7 +21,7 @@ fn main() {
     let sub33 = Subspace::movement(3, 3);
     let mut tb = Tablebase::new();
     let t0 = Instant::now();
-    let (table33, stats33) = solve_movement(sub33, Variant::Flying, &tb);
+    let (table33, stats33) = solve_movement(sub33, Variant::Flying, &tb, None);
     let t33 = t0.elapsed().as_secs_f64();
     println!("  WIN={} LOSS={} DRAW={} max_dtw={} in {:.2}s",
         stats33.win, stats33.loss, stats33.draw, stats33.max_dtw, t33);
@@ -30,7 +30,7 @@ fn main() {
     println!("\n=== Stage 2: solve (4,3,0,0) using (3,3) cross-subspace ===");
     let sub43 = Subspace::movement(4, 3);
     let t1 = Instant::now();
-    let (table43, stats43) = solve_movement(sub43, Variant::Flying, &tb);
+    let (table43, stats43) = solve_movement(sub43, Variant::Flying, &tb, None);
     let t43 = t1.elapsed().as_secs_f64();
     let WaveStats { n_states, win, loss, draw, max_dtw } = stats43;
     println!("  Aggregate: WIN={} LOSS={} DRAW={} max_dtw={} in {:.2}s",
