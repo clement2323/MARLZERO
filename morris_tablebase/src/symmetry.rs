@@ -72,3 +72,22 @@ pub fn canonicalize(wbb: u32, bbb: u32) -> (u32, u32) {
     }
     best
 }
+
+/// Orbit size of `(wbb, bbb)` under D4. By orbit-stabilizer theorem:
+/// orbit_size = |G| / |Stab(p)|. Most positions have trivial stabilizer
+/// (only identity fixes them) so orbit_size = 8; positions on symmetry
+/// axes have smaller orbits {1, 2, 4}.
+#[inline]
+pub fn orbit_size(wbb: u32, bbb: u32) -> u32 {
+    let mut stab = 1u32; // identity always fixes p
+    let mut t = 1;
+    while t < NUM_TRANSFORMS {
+        let w = apply_transform(wbb, t);
+        let b = apply_transform(bbb, t);
+        if (w, b) == (wbb, bbb) {
+            stab += 1;
+        }
+        t += 1;
+    }
+    NUM_TRANSFORMS as u32 / stab
+}

@@ -23,10 +23,11 @@ fn main() {
     let dt = t0.elapsed().as_secs_f64();
     let WaveStats { n_states, win, loss, draw, max_dtw } = stats;
 
-    let total_pos = n_states / 2;
-    let pct_per_stm = |c: u32| c as f64 / total_pos as f64 * 100.0;
+    let total_pos = n_states as u64 / 2;
+    let pct_per_stm = |c: u64| c as f64 / total_pos as f64 * 100.0;
 
-    println!("\nStates: {} ({} positions × 2 STMs)", n_states, total_pos);
+    println!("\nRaw states (orbit-weighted): {} ({} positions × 2 STMs)",
+        n_states, total_pos);
     println!("Wave runtime: {:.2}s\n", dt);
 
     println!("Per-STM verdict counts (totals divided by 2):");
@@ -36,9 +37,9 @@ fn main() {
     println!("\nMax DTW observed: {}", max_dtw);
 
     // Cross-check against Python fixture (sums across both STMs).
-    let expected_win = 2_232_160 * 2;
-    let expected_loss = 455_648 * 2;
-    let expected_draw = 4_112 * 2;
+    let expected_win: u64 = 2_232_160 * 2;
+    let expected_loss: u64 = 455_648 * 2;
+    let expected_draw: u64 = 4_112 * 2;
     let ok = win == expected_win && loss == expected_loss && draw == expected_draw;
     println!("\nPython fixture cross-check:");
     if ok {

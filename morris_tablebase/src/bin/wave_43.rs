@@ -36,14 +36,17 @@ fn main() {
     println!("  Aggregate: WIN={} LOSS={} DRAW={} max_dtw={} in {:.2}s",
         win, loss, draw, max_dtw, t43);
 
-    // Break down per-STM (the two sides are NOT symmetric here: WHITE has 4
-    // pieces and cannot fly; BLACK has 3 pieces and flies).
-    let mut by_stm = [[0u32; 4]; 2]; // [stm_idx][verdict]: indices for stm 1,2
-    for idx in 0..n_states {
-        let v = table43.verdict[idx as usize];
-        let stm = (idx & 1) as usize;
-        by_stm[stm][v as usize] += 1;
-    }
+    // Break down per-STM via orbit-weighted accounting (canonical positions
+    // are iterated; each contributes orbit_size to its STM's bucket).
+    let mut by_stm = [[0u64; 4]; 2];
+    sub43.enumerate_positions(|wbb, bbb| {
+        let osize = morris_tablebase::symmetry::orbit_size(wbb, bbb) as u64;
+        for stm in [1u8, 2u8] {
+            let idx = sub43.state_index_canonical(wbb, bbb, stm) as usize;
+            let v = table43.verdict[idx] as usize;
+            by_stm[(stm - 1) as usize][v] += osize;
+        }
+    });
     let total = n_states / 2;
     println!("\n=== Per-STM (4,3,0,0) ===");
     for stm in [STM_WHITE, STM_BLACK] {

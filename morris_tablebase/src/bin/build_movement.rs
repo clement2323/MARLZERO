@@ -102,21 +102,10 @@ fn main() {
         };
         let dt = t0.elapsed().as_secs_f64();
 
-        // Compute stats from the verdict array (same whether loaded or solved).
-        let mut win = 0u32;
-        let mut loss = 0u32;
-        let mut draw = 0u32;
-        let mut max_dtw = 0u16;
-        for (i, &v) in table.verdict.iter().enumerate() {
-            match v {
-                morris_tablebase::wave::WIN => { win += 1; if table.dtw[i] > max_dtw { max_dtw = table.dtw[i]; } }
-                morris_tablebase::wave::LOSS => { loss += 1; if table.dtw[i] > max_dtw { max_dtw = table.dtw[i]; } }
-                morris_tablebase::wave::DRAW => draw += 1,
-                _ => {}
-            }
-        }
-        let n_states = table.verdict.len() as u32;
-        let total = n_states / 2;
+        // Raw (orbit-weighted) stats, same whether loaded or freshly solved.
+        let (win, loss, draw, max_dtw) = table.raw_stats();
+        let n_states = sub.n_positions() * 2;
+        let total = (n_states / 2) as u64;
         let win_pct = if total > 0 { win as f64 / 2.0 / total as f64 * 100.0 } else { 0.0 };
         multi.suspend(|| {
             println!(

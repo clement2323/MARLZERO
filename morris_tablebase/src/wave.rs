@@ -9,6 +9,8 @@
 //! (3,3,0,0): bitmask state, BFS queue, count-field, LOSS DTW = max child
 //! DTW + 1.
 
+use std::collections::HashSet;
+
 use crate::board::{ADJACENCY, NUM_POSITIONS};
 use crate::rules::{is_mill_through, legal_capture_targets, popcount};
 use crate::subspace::{Subspace, SubspaceTable, Tablebase};
@@ -27,13 +29,16 @@ pub enum Variant {
     NoFlying,
 }
 
-/// Aggregate counts after a wave run on one subspace.
+/// Aggregate orbit-weighted RAW counts after a wave run on one subspace.
+/// These match Gasser 1996's per-subspace published numbers and the
+/// Python fixture: every raw position contributes 1 to exactly one of
+/// `win` / `loss` / `draw` (via its orbit canonical's verdict).
 #[derive(Debug, Default)]
 pub struct WaveStats {
     pub n_states: u32,
-    pub win: u32,
-    pub loss: u32,
-    pub draw: u32,
+    pub win: u64,
+    pub loss: u64,
+    pub draw: u64,
     pub max_dtw: u16,
 }
 
@@ -144,17 +149,25 @@ pub fn solve_movement(
         pb.set_message("finalize");
     }
 
-    // Phase 2 — UNKNOWN → DRAW, tally.
-    let mut stats = WaveStats { n_states: n as u32, ..Default::default() };
-    for i in 0..n {
-        if verdict[i] == UNKNOWN { verdict[i] = DRAW; }
-        match verdict[i] {
-            WIN => { stats.win += 1; if dtw[i] > stats.max_dtw { stats.max_dtw = dtw[i]; } }
-            LOSS => { stats.loss += 1; if dtw[i] > stats.max_dtw { stats.max_dtw = dtw[i]; } }
-            DRAW => stats.draw += 1,
-            _ => unreachable!(),
+    // Phase 2 — UNKNOWN → DRAW on canonical slots only (non-canonical raw
+    // slots stay as 0/UNKNOWN; they are never queried directly because
+    // state_index always canonicalises first). Tally is orbit-weighted to
+    // give RAW counts that match Gasser 1996's published per-subspace
+    // numbers and the Python fixture for (3,3,0,0).
+    let mut stats = WaveStats { n_states: sub.n_positions() * 2, ..Default::default() };
+    sub.enumerate_positions(|wbb, bbb| {
+        let osize = crate::symmetry::orbit_size(wbb, bbb) as u64;
+        for &stm in &[STM_WHITE, STM_BLACK] {
+            let idx = sub.state_index_canonical(wbb, bbb, stm) as usize;
+            if verdict[idx] == UNKNOWN { verdict[idx] = DRAW; }
+            match verdict[idx] {
+                WIN => { stats.win += osize; if dtw[idx] > stats.max_dtw { stats.max_dtw = dtw[idx]; } }
+                LOSS => { stats.loss += osize; if dtw[idx] > stats.max_dtw { stats.max_dtw = dtw[idx]; } }
+                DRAW => stats.draw += osize,
+                _ => unreachable!(),
+            }
         }
-    }
+    });
 
     if let Some(pb) = progress {
         pb.set_position(n as u64);
@@ -188,14 +201,17 @@ fn init_position(
 
     let mut win_dtw: Option<u16> = None;
     let mut max_lose_dtw_cross: u16 = 0;
-    let mut n_intra: u16 = 0;
     let mut has_draw_child: bool = false;
     let mut any_move: bool = false;
+
+    // Intra-subspace children are deduplicated by their canonical state index:
+    // multiple raw (src, dst) moves can collapse to the same orbit child, and
+    // count(p) must reflect orbit-distinct children rather than raw moves.
+    let mut intra_children: HashSet<u32> = HashSet::new();
 
     for_each_simple_move(stm_bb, opp_bb, can_fly, |_dst, forms_mill, new_stm, _src| {
         any_move = true;
         if forms_mill {
-            // Enumerate each legal capture target — each one is a distinct move.
             let cap_targets = legal_capture_targets(opp_bb);
             let mut c = cap_targets;
             while c != 0 {
@@ -204,10 +220,8 @@ fn init_position(
                 let new_opp = opp_bb & !(1u32 << cap);
                 let opp_new_count = popcount(new_opp);
                 if opp_new_count < 3 {
-                    // Opponent reduced below 3 → terminal LOSS for opp → WIN for STM at DTW=1.
                     win_dtw = Some(win_dtw.map_or(1, |d| d.min(1)));
                 } else {
-                    // Cross-subspace lookup in already-resolved smaller subspace.
                     let target_sub = subspace_after_capture(sub, stm, opp_new_count as u8);
                     let (new_wbb, new_bbb) = if stm == STM_WHITE { (new_stm, new_opp) } else { (new_opp, new_stm) };
                     let (v, d) = tb.query(target_sub, new_wbb, new_bbb, 3 - stm)
@@ -216,11 +230,13 @@ fn init_position(
                 }
             }
         } else {
-            // Non-capture move stays in current subspace. Always count.
-            let _ = new_stm;
-            n_intra = n_intra.saturating_add(1);
+            // Intra-subspace child — dedup by canonical index.
+            let (new_wbb, new_bbb) = if stm == STM_WHITE { (new_stm, opp_bb) } else { (opp_bb, new_stm) };
+            let child_idx = sub.state_index(new_wbb, new_bbb, 3 - stm);
+            intra_children.insert(child_idx);
         }
     });
+    let n_intra = intra_children.len() as u16;
 
     // Stalemate: no legal moves at all → LOSS for STM at DTW=0.
     if !any_move {
@@ -281,6 +297,12 @@ fn subspace_after_capture(sub: Subspace, stm: u8, opp_new_count: u8) -> Subspace
 }
 
 /// Propagate one resolved state to its intra-subspace parents.
+///
+/// Each raw inverse move yields a (possibly non-canonical) parent state.
+/// Multiple raw inverses can collapse to the same canonical orbit, so we
+/// deduplicate by canonical state index before applying any update —
+/// otherwise a single resolved child would decrement the same parent's
+/// count multiple times.
 fn propagate_to_parents(
     sub: Subspace, variant: Variant, p_idx: u32,
     verdict: &mut [u8], dtw: &mut [u16], count: &mut [u16], queue: &mut Vec<u32>,
@@ -296,12 +318,11 @@ fn propagate_to_parents(
     let occupied = wbb | bbb;
     let empties = !occupied & ((1u32 << NUM_POSITIONS) - 1);
 
+    let mut seen_parents: HashSet<u32> = HashSet::new();
     let mut mb = mover_bb;
     while mb != 0 {
         let dst = mb.trailing_zeros() as u8;
         mb &= mb - 1;
-        // Skip mill-forming destinations: the parent's move would have captured,
-        // putting the parent in a LARGER subspace (handled when that subspace runs).
         if is_mill_through(mover_bb, dst) { continue; }
         let pred_mask = if mover_can_fly { empties } else { adjacency_mask(dst) & empties };
         let mut em = pred_mask;
@@ -311,6 +332,7 @@ fn propagate_to_parents(
             let new_mover = (mover_bb & !(1u32 << dst)) | (1u32 << src);
             let (new_wbb, new_bbb) = if mover_stm == STM_WHITE { (new_mover, fixed_bb) } else { (fixed_bb, new_mover) };
             let q_idx = sub.state_index(new_wbb, new_bbb, mover_stm);
+            if !seen_parents.insert(q_idx) { continue; }
             let q_i = q_idx as usize;
             if verdict[q_i] != UNKNOWN { continue; }
             if p_v == LOSS {
@@ -318,7 +340,6 @@ fn propagate_to_parents(
                 dtw[q_i] = p_dtw + 1;
                 queue.push(q_idx);
             } else if p_v == WIN {
-                // Decrement the low 15 bits; the high bit holds the DRAW flag.
                 let new_count_field = count[q_i] - 1;
                 count[q_i] = new_count_field;
                 if (new_count_field & COUNT_MASK) == 0 {
@@ -326,10 +347,8 @@ fn propagate_to_parents(
                     if had_draw {
                         verdict[q_i] = DRAW;
                     } else {
-                        // dtw[q_i] currently holds the cross-subspace max LOSE
-                        // DTW stashed at init time. Combine with intra-subspace
-                        // max from now-resolved siblings to set true LOSS DTW.
-                        let intra_max = max_win_child_dtw(sub, variant, new_wbb, new_bbb, mover_stm, verdict, dtw);
+                        let (qw, qb, _) = sub.decode_state(q_idx);
+                        let intra_max = max_win_child_dtw(sub, variant, qw, qb, mover_stm, verdict, dtw);
                         let combined = intra_max.max(dtw[q_i]);
                         verdict[q_i] = LOSS;
                         dtw[q_i] = combined + 1;
@@ -341,7 +360,13 @@ fn propagate_to_parents(
     }
 }
 
-/// Maximum DTW over all WIN children of `q` (used to set LOSS DTW = max + 1).
+/// Maximum DTW over all intra-subspace WIN children of `q`. Cross-subspace
+/// WIN DTWs are already baked into `dtw[q_idx]` at init time (stashed there
+/// by [init_position] before this position becomes UNKNOWN), so the LOSS
+/// transition combines `intra_max` with that stashed value.
+///
+/// Children are deduplicated by canonical state index — same rationale as
+/// parent dedup in [propagate_to_parents].
 fn max_win_child_dtw(
     sub: Subspace, variant: Variant, wbb: u32, bbb: u32, stm: u8,
     verdict: &[u8], dtw: &[u16],
@@ -350,23 +375,17 @@ fn max_win_child_dtw(
     let stm_count = popcount(stm_bb);
     let can_fly = variant == Variant::Flying && stm_count == 3;
     let mut max = 0u16;
+    let mut seen: HashSet<u32> = HashSet::new();
 
     for_each_simple_move(stm_bb, opp_bb, can_fly, |_dst, forms_mill, new_stm, _src| {
         if forms_mill {
-            // Cross-subspace child via capture. Look up its verdict in the
-            // already-resolved smaller subspace. But we don't have a direct
-            // tablebase ref here; we approximate by treating capture children
-            // as resolved (they were classified at init time) — we just need
-            // max_DTW over the WIN-for-opp ones. For LOSS DTW purposes we use
-            // a conservative bound: re-init won't change verdict.
-            // Skipping for now: at (3,3,0,0) all captures are terminal at
-            // DTW=0 so this doesn't affect counts. For larger subspaces we'd
-            // need to track cross-subspace WIN-child DTWs at init time.
+            // Mill move => capture => cross-subspace or terminal child.
+            // Cross-subspace WIN DTWs were folded into dtw[q_idx] at init time.
             let _ = new_stm;
-            // TODO: thread Tablebase ref + cap target enumeration here.
         } else {
             let (new_wbb, new_bbb) = if stm == STM_WHITE { (new_stm, opp_bb) } else { (opp_bb, new_stm) };
             let c_idx = sub.state_index(new_wbb, new_bbb, 3 - stm);
+            if !seen.insert(c_idx) { return; }
             if verdict[c_idx as usize] == WIN {
                 let d = dtw[c_idx as usize];
                 if d > max { max = d; }
