@@ -5,9 +5,11 @@
 //! for the design and validation strategy.
 
 pub mod board;
+pub mod gevay;
 pub mod hash;
 pub mod rules;
 pub mod storage;
 pub mod subspace;
 pub mod symmetry;
 pub mod wave;
+pub mod work_unit;

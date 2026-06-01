@@ -16,9 +16,33 @@ use std::time::Instant;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use morris_tablebase::storage::{default_filename, load, save};
-use morris_tablebase::subspace::{Subspace, Tablebase};
+use morris_tablebase::storage::{default_filename, save};
+use morris_tablebase::subspace::{MappedTable, Subspace, Tablebase};
 use morris_tablebase::wave::{solve_movement, Variant};
+
+/// Orbit-weighted W/L/D counts for a mmap-backed table (used when stats
+/// weren't returned by solve_movement, e.g. when resuming from disk).
+fn stats_from_mapped(sub: Subspace, table: &MappedTable) -> (u64, u64, u64, u16) {
+    let mut win = 0u64;
+    let mut loss = 0u64;
+    let mut draw = 0u64;
+    let mut max_dtw = 0u16;
+    sub.enumerate_positions(|wbb, bbb| {
+        let osize = morris_tablebase::symmetry::orbit_size(wbb, bbb) as u64;
+        for stm in [1u8, 2u8] {
+            let idx = sub.state_index_canonical(wbb, bbb, stm);
+            let v = table.verdict_at(idx);
+            let d = table.dtw_at(idx);
+            match v {
+                1 => { win += osize; if d > max_dtw { max_dtw = d; } }
+                2 => { loss += osize; if d > max_dtw { max_dtw = d; } }
+                3 => draw += osize,
+                _ => {}
+            }
+        }
+    });
+    (win, loss, draw, max_dtw)
+}
 
 fn list_movement_subspaces(max_total: u8) -> Vec<Subspace> {
     let mut out = Vec::new();
@@ -84,27 +108,51 @@ fn main() {
         sub_pb.set_prefix(format!("({},{})", sub.w_board, sub.b_board));
         sub_pb.set_position(0);
 
-        let (table, source) = match on_disk.as_ref() {
-            Some(p) if p.exists() => {
-                let (t, _v) = load(p).expect("load existing subspace");
-                sub_pb.set_length(t.verdict.len() as u64);
-                sub_pb.set_position(t.verdict.len() as u64);
+        let n_states = sub.n_positions() * 2;
+
+        // Three paths:
+        // - subspace already on disk -> mmap directly, no Vec ever allocated.
+        // - subspace solved fresh -> Vec-backed solve, persist, drop Vec, mmap.
+        // - solve without persistence -> keep Vec in RAM (only used for tiny tests).
+        let source: &str;
+        let stats_opt;
+        let mapped: Option<MappedTable> = match (on_disk.as_ref(), output_dir.is_some()) {
+            (Some(p), _) if p.exists() => {
+                sub_pb.set_length(n_states);
+                sub_pb.set_position(n_states);
                 sub_pb.set_message("loaded from disk");
-                (t, "disk")
+                source = "disk";
+                stats_opt = None;
+                Some(MappedTable::open(p).expect("mmap existing subspace"))
             }
-            _ => {
-                let (t, _stats) = solve_movement(sub, Variant::Flying, &tb, Some(&sub_pb));
-                if let Some(p) = on_disk.as_ref() {
-                    save(&t, Variant::Flying, p).expect("save subspace");
-                }
-                (t, "solve")
+            (Some(p), _) => {
+                let (t, stats) = solve_movement(sub, Variant::Flying, &tb, Some(&sub_pb));
+                save(&t, Variant::Flying, p).expect("save subspace");
+                drop(t); // free Vec<u8>/Vec<u16> immediately so mmap can take over
+                source = "solve";
+                stats_opt = Some(stats);
+                Some(MappedTable::open(p).expect("mmap freshly persisted subspace"))
+            }
+            (None, _) => {
+                // No output dir — keep Vec in RAM (only sensible for tiny smoke runs).
+                let (t, stats) = solve_movement(sub, Variant::Flying, &tb, Some(&sub_pb));
+                source = "solve (no persist)";
+                stats_opt = Some(stats);
+                tb.insert(t);
+                None
             }
         };
         let dt = t0.elapsed().as_secs_f64();
 
-        // Raw (orbit-weighted) stats, same whether loaded or freshly solved.
-        let (win, loss, draw, max_dtw) = table.raw_stats();
-        let n_states = sub.n_positions() * 2;
+        // Stats: use the WaveStats returned by solve_movement when available,
+        // otherwise recompute by sweeping the mmap.
+        let (win, loss, draw, max_dtw) = match stats_opt {
+            Some(s) => (s.win, s.loss, s.draw, s.max_dtw),
+            None => {
+                let m = mapped.as_ref().expect("mmap must exist when stats absent");
+                stats_from_mapped(sub, m)
+            }
+        };
         let total = (n_states / 2) as u64;
         let win_pct = if total > 0 { win as f64 / 2.0 / total as f64 * 100.0 } else { 0.0 };
         multi.suspend(|| {
@@ -117,7 +165,9 @@ fn main() {
         });
         cumulative_states += n_states as u64;
         cumulative_bytes += n_states as u64 * 3;
-        tb.insert(table);
+        if let Some(m) = mapped {
+            tb.insert_mapped(m);
+        }
         global_pb.inc(1);
     }
     sub_pb.finish_and_clear();

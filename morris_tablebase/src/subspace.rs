@@ -29,13 +29,16 @@ impl Subspace {
         self.w_to_place == 0 && self.b_to_place == 0
     }
 
-    pub fn n_positions(&self) -> u32 {
+    /// Total number of raw (wbb, bbb) positions in this subspace.
+    /// Returns u64 because subspaces >= (6,6) exceed u32::MAX × 2 once
+    /// multiplied by 2 STMs (e.g. (9,9) has ~13 billion states).
+    pub fn n_positions(&self) -> u64 {
         let w = self.w_board as usize;
         let b = self.b_board as usize;
-        BINOM[24][w] * BINOM[24 - w][b]
+        BINOM[24][w] as u64 * BINOM[24 - w][b] as u64
     }
 
-    pub fn n_states(&self) -> u32 {
+    pub fn n_states(&self) -> u64 {
         self.n_positions() * 2
     }
 
@@ -43,7 +46,7 @@ impl Subspace {
     /// bitmask pair under D4, so any orbit member maps to the canonical
     /// representative's slot. Side-to-move is kept on the low bit.
     #[inline]
-    pub fn state_index(&self, wbb: u32, bbb: u32, stm: u8) -> u32 {
+    pub fn state_index(&self, wbb: u32, bbb: u32, stm: u8) -> u64 {
         let (cw, cb) = canonicalize(wbb, bbb);
         self.state_index_canonical(cw, cb, stm)
     }
@@ -51,24 +54,24 @@ impl Subspace {
     /// Index assuming the caller already has the canonical bitmasks (skips
     /// the 8-way canonicalisation pass). Used in tight wave inner loops.
     #[inline]
-    pub fn state_index_canonical(&self, cw: u32, cb: u32, stm: u8) -> u32 {
-        let rank_w = rank_subset(cw);
+    pub fn state_index_canonical(&self, cw: u32, cb: u32, stm: u8) -> u64 {
+        let rank_w = rank_subset(cw) as u64;
         let compact_b = compact_against(cb, cw);
-        let rank_b = rank_subset(compact_b);
-        let n_b = BINOM[24 - self.w_board as usize][self.b_board as usize];
+        let rank_b = rank_subset(compact_b) as u64;
+        let n_b = BINOM[24 - self.w_board as usize][self.b_board as usize] as u64;
         let pos = rank_w * n_b + rank_b;
-        pos * 2 + (stm - 1) as u32
+        pos * 2 + (stm - 1) as u64
     }
 
     /// Decode a slot index back to its canonical `(wbb, bbb, stm)`.
     /// The returned bitmasks are always the orbit's canonical representative.
     #[inline]
-    pub fn decode_state(&self, state_idx: u32) -> (u32, u32, u8) {
+    pub fn decode_state(&self, state_idx: u64) -> (u32, u32, u8) {
         let stm = (state_idx & 1) as u8 + 1;
         let pos = state_idx >> 1;
-        let n_b = BINOM[24 - self.w_board as usize][self.b_board as usize];
-        let rank_w = pos / n_b;
-        let rank_b = pos % n_b;
+        let n_b = BINOM[24 - self.w_board as usize][self.b_board as usize] as u64;
+        let rank_w = (pos / n_b) as u32;
+        let rank_b = (pos % n_b) as u32;
         let wbb = unrank_subset(rank_w, 24, self.w_board as u32);
         let compact_b = unrank_subset(rank_b, 24 - self.w_board as u32, self.b_board as u32);
         let bbb = expand_against(compact_b, wbb);
@@ -116,17 +119,92 @@ impl Subspace {
     }
 }
 
-/// In-memory store of resolved subspace tables. Used for cross-subspace
-/// queries during the wave (capture transitions go to smaller subspaces).
+/// Store of resolved subspace tables — used for cross-subspace queries
+/// during the wave. Tables are kept either fully in RAM (Vec) for the
+/// subspace currently being solved, or backed by a memory-mapped `.bin`
+/// file for previously resolved subspaces (the kernel page cache acts as
+/// our automatic working-set manager, capping resident RAM).
 #[derive(Default)]
 pub struct Tablebase {
-    tables: std::collections::HashMap<Subspace, SubspaceTable>,
+    tables: std::collections::HashMap<Subspace, StoredTable>,
+}
+
+/// One entry in [Tablebase]: either an in-RAM table (owned Vec) or a
+/// memory-mapped read-only view of a `.bin` file on disk.
+pub enum StoredTable {
+    Owned(SubspaceTable),
+    Mapped(MappedTable),
 }
 
 pub struct SubspaceTable {
     pub subspace: Subspace,
     pub verdict: Vec<u8>,
     pub dtw: Vec<u16>,
+}
+
+/// Memory-mapped read-only view of a persisted subspace table.
+/// File layout: 32-byte header + n_states verdict bytes + n_states × 2
+/// little-endian DTW bytes — same as the format produced by [crate::storage::save].
+pub struct MappedTable {
+    pub subspace: Subspace,
+    /// Keeps the mmap alive — never accessed directly after construction.
+    _mmap: memmap2::Mmap,
+    verdict_ptr: *const u8,
+    dtw_ptr: *const u16,
+    pub n_states: usize,
+}
+
+// SAFETY: MappedTable is read-only after construction; the raw pointers
+// stay valid because we keep `_mmap` alive. Send/Sync is sound because
+// the mmap region is immutable.
+unsafe impl Send for MappedTable {}
+unsafe impl Sync for MappedTable {}
+
+impl MappedTable {
+    /// Open a `.bin` file and return a read-only mapped view.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        if mmap.len() < 32 {
+            return Err(Error::new(ErrorKind::InvalidData, "file too small for header"));
+        }
+        if &mmap[0..4] != b"MTBL" {
+            return Err(Error::new(ErrorKind::InvalidData, "bad magic"));
+        }
+        let subspace = Subspace {
+            w_board: mmap[8],
+            b_board: mmap[9],
+            w_to_place: mmap[10],
+            b_to_place: mmap[11],
+        };
+        let n_states = u64::from_le_bytes(mmap[12..20].try_into().unwrap()) as usize;
+        let expected_len = 32 + n_states + n_states * 2;
+        if mmap.len() < expected_len {
+            return Err(Error::new(ErrorKind::InvalidData,
+                format!("file shorter than declared n_states ({} vs {})", mmap.len(), expected_len)));
+        }
+        // SAFETY: we've validated the buffer is at least `expected_len` bytes
+        // and the underlying mmap stays alive while `Self` exists. The dtw
+        // slice is cast from little-endian bytes; this is sound on x86_64
+        // (host LE) and on any other LE host. On a BE host the bytes would
+        // need byte-swapping — we don't support those.
+        let verdict_ptr = unsafe { mmap.as_ptr().add(32) };
+        let dtw_ptr = unsafe { mmap.as_ptr().add(32 + n_states) as *const u16 };
+        Ok(Self { subspace, _mmap: mmap, verdict_ptr, dtw_ptr, n_states })
+    }
+
+    #[inline]
+    pub fn verdict_at(&self, idx: u64) -> u8 {
+        debug_assert!((idx as usize) < self.n_states);
+        unsafe { *self.verdict_ptr.add(idx as usize) }
+    }
+
+    #[inline]
+    pub fn dtw_at(&self, idx: u64) -> u16 {
+        debug_assert!((idx as usize) < self.n_states);
+        unsafe { (*self.dtw_ptr.add(idx as usize)).to_le() }
+    }
 }
 
 impl SubspaceTable {
@@ -156,24 +234,40 @@ impl SubspaceTable {
     }
 }
 
+
 impl Tablebase {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Insert an owned (Vec-backed) table. Use this only when keeping the
+    /// table in RAM long-term is acceptable (typically only the currently
+    /// solving subspace and tiny test cases).
     pub fn insert(&mut self, table: SubspaceTable) {
-        self.tables.insert(table.subspace, table);
+        self.tables.insert(table.subspace, StoredTable::Owned(table));
     }
 
-    pub fn get(&self, sub: &Subspace) -> Option<&SubspaceTable> {
-        self.tables.get(sub)
+    /// Insert a memory-mapped read-only table. Preferred path for all
+    /// already-persisted subspaces — keeps RAM use bounded by the OS
+    /// page cache.
+    pub fn insert_mapped(&mut self, table: MappedTable) {
+        self.tables.insert(table.subspace, StoredTable::Mapped(table));
+    }
+
+    pub fn contains(&self, sub: &Subspace) -> bool {
+        self.tables.contains_key(sub)
     }
 
     /// Look up a position in a previously resolved subspace.
     /// Returns `None` if the subspace hasn't been computed yet.
     pub fn query(&self, sub: Subspace, wbb: u32, bbb: u32, stm: u8) -> Option<(u8, u16)> {
-        let table = self.tables.get(&sub)?;
-        let idx = sub.state_index(wbb, bbb, stm) as usize;
-        Some((table.verdict[idx], table.dtw[idx]))
+        let idx = sub.state_index(wbb, bbb, stm);
+        match self.tables.get(&sub)? {
+            StoredTable::Owned(t) => {
+                let i = idx as usize;
+                Some((t.verdict[i], t.dtw[i]))
+            }
+            StoredTable::Mapped(t) => Some((t.verdict_at(idx), t.dtw_at(idx))),
+        }
     }
 }

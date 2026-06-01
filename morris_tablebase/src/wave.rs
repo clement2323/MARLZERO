@@ -33,9 +33,12 @@ pub enum Variant {
 /// These match Gasser 1996's per-subspace published numbers and the
 /// Python fixture: every raw position contributes 1 to exactly one of
 /// `win` / `loss` / `draw` (via its orbit canonical's verdict).
+///
+/// `n_states` is u64 because the largest subspace ((9,9)) has ~13 billion
+/// states, far above u32::MAX.
 #[derive(Debug, Default)]
 pub struct WaveStats {
-    pub n_states: u32,
+    pub n_states: u64,
     pub win: u64,
     pub loss: u64,
     pub draw: u64,
@@ -97,7 +100,7 @@ pub fn solve_movement(
     let mut verdict: Vec<u8> = vec![UNKNOWN; n];
     let mut dtw: Vec<u16> = vec![0u16; n];
     let mut count: Vec<u16> = vec![0u16; n];
-    let mut queue: Vec<u32> = Vec::with_capacity(n / 4);
+    let mut queue: Vec<u64> = Vec::with_capacity(n / 4);
 
     if let Some(pb) = progress {
         pb.set_length(n as u64);
@@ -192,8 +195,8 @@ const COUNT_MASK: u16 = 0x7FFF;
 fn init_position(
     sub: Subspace, variant: Variant, tb: &Tablebase,
     wbb: u32, bbb: u32, stm: u8,
-    verdict: &mut [u8], dtw: &mut [u16], count: &mut [u16], queue: &mut Vec<u32>,
-    idx: u32,
+    verdict: &mut [u8], dtw: &mut [u16], count: &mut [u16], queue: &mut Vec<u64>,
+    idx: u64,
 ) {
     let (stm_bb, opp_bb) = if stm == STM_WHITE { (wbb, bbb) } else { (bbb, wbb) };
     let stm_count = popcount(stm_bb);
@@ -207,7 +210,7 @@ fn init_position(
     // Intra-subspace children are deduplicated by their canonical state index:
     // multiple raw (src, dst) moves can collapse to the same orbit child, and
     // count(p) must reflect orbit-distinct children rather than raw moves.
-    let mut intra_children: HashSet<u32> = HashSet::new();
+    let mut intra_children: HashSet<u64> = HashSet::new();
 
     for_each_simple_move(stm_bb, opp_bb, can_fly, |_dst, forms_mill, new_stm, _src| {
         any_move = true;
@@ -304,8 +307,8 @@ fn subspace_after_capture(sub: Subspace, stm: u8, opp_new_count: u8) -> Subspace
 /// otherwise a single resolved child would decrement the same parent's
 /// count multiple times.
 fn propagate_to_parents(
-    sub: Subspace, variant: Variant, p_idx: u32,
-    verdict: &mut [u8], dtw: &mut [u16], count: &mut [u16], queue: &mut Vec<u32>,
+    sub: Subspace, variant: Variant, p_idx: u64,
+    verdict: &mut [u8], dtw: &mut [u16], count: &mut [u16], queue: &mut Vec<u64>,
 ) {
     let (wbb, bbb, stm_p) = sub.decode_state(p_idx);
     let p_v = verdict[p_idx as usize];
@@ -318,7 +321,7 @@ fn propagate_to_parents(
     let occupied = wbb | bbb;
     let empties = !occupied & ((1u32 << NUM_POSITIONS) - 1);
 
-    let mut seen_parents: HashSet<u32> = HashSet::new();
+    let mut seen_parents: HashSet<u64> = HashSet::new();
     let mut mb = mover_bb;
     while mb != 0 {
         let dst = mb.trailing_zeros() as u8;
@@ -375,7 +378,7 @@ fn max_win_child_dtw(
     let stm_count = popcount(stm_bb);
     let can_fly = variant == Variant::Flying && stm_count == 3;
     let mut max = 0u16;
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: HashSet<u64> = HashSet::new();
 
     for_each_simple_move(stm_bb, opp_bb, can_fly, |_dst, forms_mill, new_stm, _src| {
         if forms_mill {
