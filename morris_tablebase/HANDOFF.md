@@ -186,19 +186,26 @@ morris_tablebase/
 - 8,9,0,0 a été manuellement corrigé par les auteurs (formule surévaluait)
 - Win rate vs adversaire faible : 57% (vs 17% Phase 1 seule)
 
-## Prochaines étapes (par priorité)
+## Prochaines étapes (par priorité, MAJ 2026-06-02 après session)
 
-1. ✅ Build + tests pass après les fixes — vérifier que `cargo test --release` est tout vert
-2. ✅ Commit le fix u64 + mmap + scaffolding Phase 2
-3. ⏳ Lancer `build_movement -- 18` jusqu'au bout (~2-4h estimé avec les fixes)
-4. ⏳ **Phase 2** : implémenter
-   - `src/gevay/multi_value.rs` — multi-valued retrograde (Section IV-B du papier)
-   - `src/gevay/dtw_adjusted.rs` — DTW sign-aware direction (Section IV-B-2)
-   - `src/storage.rs` — extension avec `payload_type` byte
-   - `src/bin/compute_gevay.rs` — driver Phase 2
-5. ⏳ Cross-check vs Table V (W/D/L percents) puis Table VIII (V_Gévay distribution)
-6. ⏳ **Extension étouffement** (différée par décision utilisateur) : `1 - n_legal_opp / max_moves` combiné avec V_Gévay
-7. ⏳ **Phase 3 RL** : design et impl
+1. ⏳ **Fin du run Phase 1** : 46/49 sous-espaces faits, restent (8,9), (9,8), (9,9) — ETA quelques heures
+2. ⏳ **Commit le code Phase 2** : tests verts au moment de l'écriture (11 lib tests + 28 integration tests = 39 total)
+   - `src/work_unit.rs` (6 tests)
+   - `src/gevay/subspace_rank.rs` (4 tests : val_s, ranks antipodaux, overrides)
+   - `src/gevay/multi_value.rs` (7 tests : adjust_first_key, propagate_dtw, queue ordering, work area, forward_moves)
+   - `src/storage.rs` étendu (Phase 1 / Phase 2 payload types)
+   - `src/bin/compute_gevay.rs` (driver + smoke test (3,3) init-only)
+3. ⏳ **Smoke test compute_gevay** : `cargo run --release --bin compute_gevay -- ../data/tablebase/flying/` après le commit
+   - Affiche la table des ranks (cross-check vs paper IV-A)
+   - Lance le init-only solver sur (3,3) ESC et affiche la distribution WIN/LOSS/zero
+4. ⏳ **Phase 2 — wave propagation intra-WU** (le gros qui reste) :
+   - Dans `multi_value.rs`, finir `solve_esc_work_unit` avec une vraie wave loop (BFS sur les états résolus, propagation aux parents intra)
+   - Ajouter `solve_pair_work_unit` pour les paires (s, -s) non-ESC
+   - Dédup des parents (HashSet) comme dans Phase 1
+   - Tests sur (3,3) : devrait reproduire WIN=4.46M LOSS=911k DRAW=8.2k (paire de STMs)
+5. ⏳ **Cross-check Table V et VIII du paper**
+6. ⏳ **Extension étouffement** (différée)
+7. ⏳ **Phase 3 RL**
 
 ## Référence papier
 
