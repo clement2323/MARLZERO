@@ -1,2 +1,2 @@
 - TODO : 
-Elo competitions rqtings entre differentes versions dun algo ?
+Elo competitions rqtings entre differentes versions dun algo

@@ -471,20 +471,170 @@ pub fn solve_esc_work_unit(
     });
 
     // Phase 1 — wave propagation through intra-WU parents.
-    // (Full implementation deferred: requires inverse-move enumeration
-    // mirroring the Phase 1 propagate_to_parents, but with multi-valued
-    // comparison/update semantics. For now we ship the init pass and
-    // mark UNRESOLVED states as rank-0 stable draws below.)
+    // Approximate first-arrival heuristic (mirrors the Phase 1 wave's
+    // documented ~0.006% DTW asymmetry): when a parent becomes
+    // resolvable through its first WIN-class or first all-children-bad
+    // path, we commit to that classification rather than tracking the
+    // multi-valued maximum exactly. Adequate for V_Gévay rank
+    // computation since per-position DTW is not the primary signal.
+    let mut has_draw_for_q: Vec<bool> = vec![false; n];
+    while let Some(entry) = queue.pop() {
+        let p_idx = entry.state_idx;
+        propagate_to_parents_gevay(
+            sub, rank, variant, p_idx,
+            &mut first_key, &mut dtw, &mut count,
+            &mut resolved, &mut has_draw_for_q, &mut queue,
+        );
+    }
 
     // Phase 2 — finalize: unresolved cells default to value 0 (= rank of this WU).
     for i in 0..n {
-        if !resolved[i] && count[i] > 0 {
+        if !resolved[i] {
             first_key[i] = 0; // stable draw within this work unit
             dtw[i] = 0;
         }
     }
 
     (first_key, dtw)
+}
+
+/// Solve a non-ESC work unit (two primary subspaces forming a `(s, -s)`
+/// pair with antipodal ranks `(rank, -rank)`). Each primary subspace's
+/// wave is independent at the cell level — they share secondary
+/// dependencies through `phase1_tb` and `ranks` but no intra-WU edges
+/// cross between them. Returns one `(first_key, dtw)` pair per primary
+/// in the same order as `wu.primary`.
+pub fn solve_pair_work_unit(
+    wu: &WorkUnit,
+    rank_primary_0: Rank,
+    variant: crate::wave::Variant,
+    phase1_tb: &Tablebase,
+    ranks: &std::collections::HashMap<Subspace, Rank>,
+) -> Vec<(Vec<i16>, Vec<i16>)> {
+    debug_assert_eq!(wu.primary.len(), 2, "pair WU expected, got {:?}", wu);
+    let (fk0, dtw0) = solve_esc_work_unit(
+        wu.primary[0], rank_primary_0, variant, phase1_tb, ranks,
+    );
+    let (fk1, dtw1) = solve_esc_work_unit(
+        wu.primary[1], -rank_primary_0, variant, phase1_tb, ranks,
+    );
+    vec![(fk0, dtw0), (fk1, dtw1)]
+}
+
+/// Adjacency bitmask of a board position (mirror of `wave::adjacency_mask`).
+#[inline]
+fn adjacency_mask(pos: u8) -> u32 {
+    let adj = crate::board::ADJACENCY[pos as usize];
+    let mut m = 0u32;
+    for &p in &adj {
+        if p == 0xFF { break; }
+        m |= 1u32 << p;
+    }
+    m
+}
+
+/// Phase 2 inverse-move parent propagation.
+///
+/// Given a resolved child `p` (position at `p_idx`), find every intra-WU
+/// parent `q` (positions whose move yields p) and try to advance q:
+/// - Child looks like `-p.first_key` from q's perspective.
+/// - If positive (q can WIN through this child): commit q immediately
+///   (first-arrival heuristic).
+/// - If negative (LOSS option for q): track max DTW; decrement count.
+/// - If zero (DRAW option for q): set has_draw flag; decrement count.
+/// - When count reaches 0: finalize q as DRAW (if any draw child) or as
+///   LOSS with the stashed max DTW.
+fn propagate_to_parents_gevay(
+    sub: Subspace,
+    _rank: Rank,
+    variant: crate::wave::Variant,
+    p_idx: u64,
+    first_key: &mut [i16],
+    dtw: &mut [i16],
+    count: &mut [u32],
+    resolved: &mut [bool],
+    has_draw_for_q: &mut [bool],
+    queue: &mut std::collections::BinaryHeap<QueueEntry>,
+) {
+    let (wbb, bbb, stm_p) = sub.decode_state(p_idx);
+    let p_fk = first_key[p_idx as usize];
+    let p_dtw = dtw[p_idx as usize];
+    let mover_stm = 3 - stm_p;
+    let (mover_bb, fixed_bb) = if mover_stm == STM_WHITE {
+        (wbb, bbb)
+    } else {
+        (bbb, wbb)
+    };
+    let mover_count = popcount(mover_bb);
+    let mover_can_fly = variant == crate::wave::Variant::Flying && mover_count == 3;
+
+    let occupied = wbb | bbb;
+    let empties = !occupied & ((1u32 << NUM_POSITIONS) - 1);
+
+    let mut seen_parents: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut mb = mover_bb;
+    while mb != 0 {
+        let dst = mb.trailing_zeros() as u8;
+        mb &= mb - 1;
+        if is_mill_through(mover_bb, dst) { continue; }
+        let pred_mask = if mover_can_fly { empties } else { adjacency_mask(dst) & empties };
+        let mut em = pred_mask;
+        while em != 0 {
+            let src = em.trailing_zeros() as u8;
+            em &= em - 1;
+            let new_mover = (mover_bb & !(1u32 << dst)) | (1u32 << src);
+            let (new_wbb, new_bbb) = if mover_stm == STM_WHITE {
+                (new_mover, fixed_bb)
+            } else {
+                (fixed_bb, new_mover)
+            };
+            let q_idx = sub.state_index(new_wbb, new_bbb, mover_stm);
+            if !seen_parents.insert(q_idx) { continue; }
+            let q_i = q_idx as usize;
+            if resolved[q_i] { continue; }
+            let p_from_q = -p_fk;
+            if p_from_q > 0 {
+                // q can WIN through this child — first arrival commits.
+                first_key[q_i] = p_from_q;
+                dtw[q_i] = p_dtw.saturating_add(1);
+                resolved[q_i] = true;
+                queue.push(QueueEntry {
+                    key: QueueKey {
+                        neg_abs_value: -(p_from_q.abs()),
+                        dtw: dtw[q_i],
+                    },
+                    sub_idx: 0,
+                    state_idx: q_idx,
+                });
+            } else {
+                if p_from_q == 0 {
+                    has_draw_for_q[q_i] = true;
+                } else if p_dtw > dtw[q_i] {
+                    // Stash max DTW for LOSS-class children (used at count==0).
+                    dtw[q_i] = p_dtw;
+                }
+                if count[q_i] > 0 { count[q_i] -= 1; }
+                if count[q_i] == 0 {
+                    if has_draw_for_q[q_i] {
+                        first_key[q_i] = 0;
+                        dtw[q_i] = 0;
+                    } else {
+                        first_key[q_i] = p_from_q;
+                        dtw[q_i] = dtw[q_i].saturating_add(1);
+                    }
+                    resolved[q_i] = true;
+                    queue.push(QueueEntry {
+                        key: QueueKey {
+                            neg_abs_value: -(first_key[q_i].abs()),
+                            dtw: dtw[q_i],
+                        },
+                        sub_idx: 0,
+                        state_idx: q_idx,
+                    });
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
