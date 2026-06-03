@@ -348,6 +348,12 @@ pub fn solve_esc_work_unit(
     let mut count: Vec<u32> = vec![0; n];
     // Cells whose verdict is finalised; redundant with first_key != UNRESOLVED but explicit.
     let mut resolved: Vec<bool> = vec![false; n];
+    // has_draw_for_q tracks whether ANY child (cross-subspace at init, or
+    // intra-subspace during wave) yielded a DRAW-class option. Used at the
+    // count==0 transition to choose between DRAW and LOSS classification.
+    // Phase 1 stashes this via a high bit on `count`; we keep it explicit
+    // for readability since multi-value already needs extra arrays.
+    let mut has_draw_for_q: Vec<bool> = vec![false; n];
     let mut queue: std::collections::BinaryHeap<QueueEntry> = std::collections::BinaryHeap::new();
 
     // Phase 0 — init: enumerate canonical positions, classify each STM.
@@ -465,7 +471,20 @@ pub fn solve_esc_work_unit(
                 }
             } else {
                 count[idx] = intra_children.len() as u32;
-                // first_key and dtw stay 0 until wave resolves them.
+                // Stash the init-time cross-subspace flags for the wave's
+                // count==0 transition. Without this, a position that
+                // had a DRAW cross-child but is still waiting on intra-
+                // children would forget the DRAW option and fall through
+                // to LOSS instead.
+                if has_draw {
+                    has_draw_for_q[idx] = true;
+                }
+                if let Some((_rel, d)) = max_lose_rel {
+                    // Stash max LOSS-class DTW into dtw[idx]. Wave updates
+                    // will take max(dtw[idx], child_dtw) on each LOSS-
+                    // direction arrival so the stash survives until count==0.
+                    dtw[idx] = d;
+                }
             }
         }
     });
@@ -477,7 +496,6 @@ pub fn solve_esc_work_unit(
     // path, we commit to that classification rather than tracking the
     // multi-valued maximum exactly. Adequate for V_Gévay rank
     // computation since per-position DTW is not the primary signal.
-    let mut has_draw_for_q: Vec<bool> = vec![false; n];
     while let Some(entry) = queue.pop() {
         let p_idx = entry.state_idx;
         propagate_to_parents_gevay(
@@ -488,9 +506,16 @@ pub fn solve_esc_work_unit(
     }
 
     // Phase 2 — finalize: unresolved cells default to value 0 (= rank of this WU).
+    // Note: the approximate first-arrival wave heuristic can leave a small
+    // fraction (~1% of WIN/LOSS positions at (3,3)) misclassified as DRAW
+    // because cyclic dependencies between intra-WU positions don't fully
+    // unwind. Phase 1 has the same approximate-DTW issue (0.006% color-swap
+    // asymmetry) but its verdict classification is exact. We accept this
+    // approximation for now; refining the wave to track per-position
+    // multi-valued maxima is a future improvement.
     for i in 0..n {
         if !resolved[i] {
-            first_key[i] = 0; // stable draw within this work unit
+            first_key[i] = 0;
             dtw[i] = 0;
         }
     }
@@ -606,33 +631,40 @@ fn propagate_to_parents_gevay(
                     sub_idx: 0,
                     state_idx: q_idx,
                 });
-            } else {
-                if p_from_q == 0 {
-                    has_draw_for_q[q_i] = true;
-                } else if p_dtw > dtw[q_i] {
-                    // Stash max DTW for LOSS-class children (used at count==0).
-                    dtw[q_i] = p_dtw;
-                }
+            } else if p_from_q < 0 {
+                // LOSS-direction intra-child: decrement count, stash max DTW.
+                if p_dtw > dtw[q_i] { dtw[q_i] = p_dtw; }
                 if count[q_i] > 0 { count[q_i] -= 1; }
                 if count[q_i] == 0 {
                     if has_draw_for_q[q_i] {
+                        // Resolve as DRAW but do NOT push — DRAW resolutions
+                        // do not need to propagate (parents see them via their
+                        // own init's has_draw flag if applicable, and intra-
+                        // DRAW signaling is handled by *not* decrementing
+                        // count, which leaves parents UNRESOLVED → DRAW at
+                        // finalize). Mirrors Phase 1.
                         first_key[q_i] = 0;
                         dtw[q_i] = 0;
+                        resolved[q_i] = true;
                     } else {
                         first_key[q_i] = p_from_q;
                         dtw[q_i] = dtw[q_i].saturating_add(1);
+                        resolved[q_i] = true;
+                        queue.push(QueueEntry {
+                            key: QueueKey {
+                                neg_abs_value: -(first_key[q_i].abs()),
+                                dtw: dtw[q_i],
+                            },
+                            sub_idx: 0,
+                            state_idx: q_idx,
+                        });
                     }
-                    resolved[q_i] = true;
-                    queue.push(QueueEntry {
-                        key: QueueKey {
-                            neg_abs_value: -(first_key[q_i].abs()),
-                            dtw: dtw[q_i],
-                        },
-                        sub_idx: 0,
-                        state_idx: q_idx,
-                    });
                 }
             }
+            // p_from_q == 0 (DRAW): no count decrement. Parent stays
+            // UNRESOLVED if it had only DRAW + WIN-direction children,
+            // and falls through to DRAW at finalize. Matches Phase 1's
+            // "DRAW children don't decrement count" invariant.
         }
     }
 }
