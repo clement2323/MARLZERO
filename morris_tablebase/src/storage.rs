@@ -185,13 +185,30 @@ pub fn save(table: &SubspaceTable, variant: Variant, path: &Path) -> io::Result<
     Ok(())
 }
 
-/// Write a Phase 1 V2 compressed (canonical-only sparse) subspace table.
-/// Works on any subspace — `w_board` can be `>`, `=`, or `<` `b_board`.
-/// For ESC subspaces (`w == b`) the file stores WTM only — BTM is recovered
-/// at query time by color-swapping within the same subspace. For non-ESC
-/// (`w != b`) both STMs are stored per entry (10 bytes vs 7).
+/// Write a Phase 1 V2 compressed (canonical-only sparse) subspace table
+/// using `(verdict, dtw)` pairs read from a dense in-RAM SubspaceTable.
 pub fn save_v2(table: &SubspaceTable, variant: Variant, path: &Path) -> io::Result<()> {
     let sub = table.subspace;
+    save_v2_with(sub, variant, path, |cw, cb, stm| {
+        let idx = sub.state_index_canonical(cw, cb, stm) as usize;
+        (table.verdict[idx], table.dtw[idx])
+    })
+}
+
+/// Write a Phase 1 V2 compressed file by streaming entries through a
+/// caller-supplied getter `get(cw, cb, stm) -> (verdict, dtw)`. Use this
+/// when the data source isn't a dense in-RAM `SubspaceTable` — e.g. the
+/// migration tool reads from a mmap'd V1 file, and a re-solve could
+/// stream directly from the wave's working arrays.
+///
+/// Works on any subspace — `w_board` can be `>`, `=`, or `<` `b_board`.
+/// For ESC subspaces (`w == b`) the file stores WTM only — BTM is
+/// recovered at query time by color-swapping within the same subspace.
+/// For non-ESC both STMs are stored per entry (10 bytes vs 7).
+pub fn save_v2_with<F>(sub: Subspace, variant: Variant, path: &Path, mut get: F) -> io::Result<()>
+where
+    F: FnMut(u32, u32, u8) -> (u8, u16),
+{
     let is_esc = sub.w_board == sub.b_board;
     let entry_stride: usize = if is_esc { 7 } else { 10 };
     let w_count = sub.w_board as u32;
@@ -254,15 +271,15 @@ pub fn save_v2(table: &SubspaceTable, variant: Variant, path: &Path) -> io::Resu
                 continue;
             }
             entry_buf[0..4].copy_from_slice(&rank_b.to_le_bytes());
-            let idx_w = sub.state_index_canonical(cw, cb, 1) as usize;
-            entry_buf[4] = table.verdict[idx_w];
-            entry_buf[5..7].copy_from_slice(&table.dtw[idx_w].to_le_bytes());
+            let (v_w, d_w) = get(cw, cb, 1);
+            entry_buf[4] = v_w;
+            entry_buf[5..7].copy_from_slice(&d_w.to_le_bytes());
             let payload_len: usize = if is_esc {
                 7
             } else {
-                let idx_b = sub.state_index_canonical(cw, cb, 2) as usize;
-                entry_buf[7] = table.verdict[idx_b];
-                entry_buf[8..10].copy_from_slice(&table.dtw[idx_b].to_le_bytes());
+                let (v_b, d_b) = get(cw, cb, 2);
+                entry_buf[7] = v_b;
+                entry_buf[8..10].copy_from_slice(&d_b.to_le_bytes());
                 10
             };
             w.write_all(&entry_buf[..payload_len])?;

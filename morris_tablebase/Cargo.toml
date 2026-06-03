@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 indicatif = "0.17"
 memmap2 = "0.9"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
