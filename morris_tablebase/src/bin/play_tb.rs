@@ -14,11 +14,10 @@
 //!   b6 d6 f6 / b4 f4 / b2 d2 f2 (middle)
 //!   c5 d5 e5 / c4 e4 / c3 d3 e3 (inner)
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use morris_tablebase::board::{ADJACENCY, MILLS, NUM_POSITIONS};
+use morris_tablebase::board::{ADJACENCY, NUM_POSITIONS};
 use morris_tablebase::rules::{is_mill_through, legal_capture_targets, popcount};
 use morris_tablebase::storage::default_filename;
 use morris_tablebase::subspace::{MappedTable, Subspace, Tablebase};
@@ -38,30 +37,82 @@ fn parse_label(s: &str) -> Option<u8> {
     POSITION_LABELS.iter().position(|&l| l.eq_ignore_ascii_case(s)).map(|p| p as u8)
 }
 
-/// Render the board with W/B/. markers.
+// ANSI escape codes matching scripts/replay_game.py
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_BLUE: &str = "\x1b[34m";
+
+// 2D grid coordinates (row, col) for each of the 24 board positions.
+// Identical to scripts/replay_game.py _POS_COORDS — 13 rows × 31 cols.
+const POS_COORDS: [(usize, usize); 24] = [
+    (0, 0),  (0, 15), (0, 30),     // 0..2 outer top
+    (6, 30), (12, 30), (12, 15),   // 3..5
+    (12, 0), (6, 0),               // 6, 7
+    (2, 5),  (2, 15), (2, 25),     // 8..10 middle top
+    (6, 25), (10, 25), (10, 15),   // 11..13
+    (10, 5), (6, 5),               // 14, 15
+    (4, 10), (4, 15), (4, 20),     // 16..18 inner top
+    (6, 20), (8, 20), (8, 15),     // 19..21
+    (8, 10), (6, 10),              // 22, 23
+];
+
+/// Render board with X (yellow) for white, O (blue) for black, · for empty.
+/// Mirrors the renderer in scripts/replay_game.py for visual consistency
+/// with the existing Python tooling.
 fn render(wbb: u32, bbb: u32) -> String {
-    let cell = |p: u8| -> char {
-        if (wbb >> p) & 1 != 0 { 'W' }
-        else if (bbb >> p) & 1 != 0 { 'B' }
-        else { '.' }
-    };
-    let mut s = String::new();
-    s += "      a   b   c   d   e   f   g\n";
-    s += &format!("  7   {} ----------- {} ----------- {}\n", cell(0), cell(1), cell(2));
-    s += "      |                       |                       |\n";
-    s += &format!("  6   |   {} --------- {} --------- {}   |\n", cell(8), cell(9), cell(10));
-    s += "      |   |                   |                   |   |\n";
-    s += &format!("  5   |   |   {} ----- {} ----- {}   |   |\n", cell(16), cell(17), cell(18));
-    s += "      |   |   |               |               |   |   |\n";
-    s += &format!("  4   {} - {} - {}             {} - {} - {}\n",
-        cell(7), cell(15), cell(23), cell(19), cell(11), cell(3));
-    s += "      |   |   |               |               |   |   |\n";
-    s += &format!("  3   |   |   {} ----- {} ----- {}   |   |\n", cell(22), cell(21), cell(20));
-    s += "      |   |                   |                   |   |\n";
-    s += &format!("  2   |   {} --------- {} --------- {}   |\n", cell(14), cell(13), cell(12));
-    s += "      |                       |                       |\n";
-    s += &format!("  1   {} ----------- {} ----------- {}\n", cell(6), cell(5), cell(4));
-    s
+    // Initialise a 13×31 grid of single-space strings.
+    let mut grid: Vec<Vec<String>> = (0..13)
+        .map(|_| (0..31).map(|_| " ".to_string()).collect())
+        .collect();
+
+    // Draw connecting line characters between adjacent positions.
+    for src in 0..NUM_POSITIONS {
+        for &dst_raw in &ADJACENCY[src] {
+            if dst_raw == 0xFF { break; }
+            let dst = dst_raw as usize;
+            if src >= dst { continue; } // each undirected pair once
+            let (r1, c1) = POS_COORDS[src];
+            let (r2, c2) = POS_COORDS[dst];
+            if r1 == r2 {
+                let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+                for c in (lo + 1)..hi {
+                    grid[r1][c] = "─".to_string();
+                }
+            } else if c1 == c2 {
+                let (lo, hi) = if r1 < r2 { (r1, r2) } else { (r2, r1) };
+                for r in (lo + 1)..hi {
+                    grid[r][c1] = "│".to_string();
+                }
+            }
+        }
+    }
+
+    // Place pieces.
+    for p in 0..24 {
+        let (r, c) = POS_COORDS[p];
+        let glyph = if (wbb >> p) & 1 != 0 {
+            format!("{}{}X{}", ANSI_BOLD, ANSI_YELLOW, ANSI_RESET)
+        } else if (bbb >> p) & 1 != 0 {
+            format!("{}{}O{}", ANSI_BOLD, ANSI_BLUE, ANSI_RESET)
+        } else {
+            "·".to_string()
+        };
+        grid[r][c] = glyph;
+    }
+
+    // Assemble with row labels (7,6,5,4,3,2,1 on alternating rows).
+    let row_labels = ["7", "", "6", "", "5", "", "4", "", "3", "", "2", "", "1"];
+    let mut out = String::from("    a    b    c    d    e    f    g\n");
+    for (r, row) in grid.iter().enumerate() {
+        let label = if !row_labels[r].is_empty() { row_labels[r] } else { " " };
+        out += &format!("{}   ", label);
+        for cell in row {
+            out += cell;
+        }
+        out += "\n";
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,17 +263,114 @@ fn parse_move_input(input: &str) -> Option<(u8, u8)> {
     Some((src, dst))
 }
 
+/// Generate a random valid (w, b) movement position. Uses a simple LCG
+/// seeded from `seed` so runs are reproducible.
+fn random_position(w: u8, b: u8, stm: u8, mut seed: u64) -> State {
+    debug_assert!(w >= 3 && w <= 9 && b >= 3 && b <= 9);
+    let mut next = || -> u64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed
+    };
+    // Pick w distinct positions for whites.
+    let mut whites: Vec<u8> = Vec::new();
+    while (whites.len() as u8) < w {
+        let p = (next() % 24) as u8;
+        if !whites.contains(&p) { whites.push(p); }
+    }
+    let mut blacks: Vec<u8> = Vec::new();
+    while (blacks.len() as u8) < b {
+        let p = (next() % 24) as u8;
+        if !whites.contains(&p) && !blacks.contains(&p) { blacks.push(p); }
+    }
+    let wbb: u32 = whites.iter().fold(0u32, |acc, &p| acc | (1u32 << p));
+    let bbb: u32 = blacks.iter().fold(0u32, |acc, &p| acc | (1u32 << p));
+    State { wbb, bbb, stm }
+}
+
+/// Parse a position spec like:
+///   "3-3"                                                    → random (3,3)
+///   "9-9"                                                    → random (9,9)
+///   "a7,d7,g7/b6,d6,f6"                                      → explicit whites/blacks via algebraic labels
+///   "a7 d7 g7 / b6 d6 f6"                                    → same, space-separated
+fn parse_start_spec(spec: &str, stm: u8, seed: u64) -> Result<State, String> {
+    // Form 1: "<w>-<b>" → random
+    let bytes = spec.as_bytes();
+    if let Some(dash) = spec.find('-') {
+        let (lhs, rhs) = spec.split_at(dash);
+        let rhs = &rhs[1..];
+        if let (Ok(w), Ok(b)) = (lhs.parse::<u8>(), rhs.parse::<u8>()) {
+            if w >= 3 && w <= 9 && b >= 3 && b <= 9 {
+                return Ok(random_position(w, b, stm, seed));
+            }
+            return Err(format!("piece counts out of range [3..9]: {}-{}", w, b));
+        }
+    }
+    // Form 2: "<white_labels>/<black_labels>"
+    if let Some(slash) = spec.find('/') {
+        let whites_part = &spec[..slash];
+        let blacks_part = &spec[slash + 1..];
+        let parse_list = |s: &str| -> Result<u32, String> {
+            let mut bb = 0u32;
+            for tok in s.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+                let Some(p) = parse_label(tok) else {
+                    return Err(format!("unknown position label '{}'", tok));
+                };
+                if (bb >> p) & 1 != 0 {
+                    return Err(format!("duplicate position '{}'", tok));
+                }
+                bb |= 1u32 << p;
+            }
+            Ok(bb)
+        };
+        let wbb = parse_list(whites_part)?;
+        let bbb = parse_list(blacks_part)?;
+        if wbb & bbb != 0 {
+            return Err("white and black pieces share a square".to_string());
+        }
+        let wc = (wbb.count_ones()) as u8;
+        let bc = (bbb.count_ones()) as u8;
+        if !(3..=9).contains(&wc) || !(3..=9).contains(&bc) {
+            return Err(format!("piece counts {}/{} not in [3..9]", wc, bc));
+        }
+        return Ok(State { wbb, bbb, stm });
+    }
+    let _ = bytes;
+    Err(format!("unrecognised --start spec '{}'\n\
+               Examples: '3-3', '9-9', 'a7,d7,g7,b6,d6,f6,c5,d5,e5/a1,d1,g1,b2,d2,f2,c3,d3,e3'", spec))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: play_tb <PHASE1_DIR> [--side white|black]");
+        eprintln!("usage: play_tb <PHASE1_DIR> [--side white|black] [--start <SPEC>] [--seed N]");
+        eprintln!();
+        eprintln!("  --start SPEC : starting position. Two forms:");
+        eprintln!("    'w-b'      : random (w whites, b blacks) movement position, e.g. '9-9'");
+        eprintln!("    'W_list/B_list' : explicit pieces, e.g. 'a7,d7,g7/a1,d1,g1'");
+        eprintln!("    default    : '3-3' with a fixed configuration");
+        eprintln!("  --seed N     : RNG seed for random positions (default 42)");
         std::process::exit(1);
     }
     let phase1_dir = PathBuf::from(&args[1]);
     let mut human_side = STM_WHITE;
-    for win in args.windows(2) {
-        if win[0] == "--side" {
-            human_side = if win[1].eq_ignore_ascii_case("black") { STM_BLACK } else { STM_WHITE };
+    let mut start_spec: Option<String> = None;
+    let mut seed: u64 = 42;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--side" if i + 1 < args.len() => {
+                human_side = if args[i + 1].eq_ignore_ascii_case("black") { STM_BLACK } else { STM_WHITE };
+                i += 2;
+            }
+            "--start" if i + 1 < args.len() => {
+                start_spec = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--seed" if i + 1 < args.len() => {
+                seed = args[i + 1].parse().unwrap_or(42);
+                i += 2;
+            }
+            _ => { i += 1; }
         }
     }
 
@@ -243,12 +391,20 @@ fn main() {
     }
     println!("Loaded {} subspaces.\n", loaded);
 
-    // Starting position: (3,3) with both sides at corners-ish (a configurable
-    // example; flying makes any 3-3 position fully tactical).
-    let mut state = State {
-        wbb: (1u32 << 0) | (1u32 << 7) | (1u32 << 15), // a7, a4, b4
-        bbb: (1u32 << 4) | (1u32 << 3) | (1u32 << 11), // g1, g4, f4
-        stm: STM_WHITE,
+    // Starting position. Either parsed from --start, or hardcoded (3,3) example.
+    let mut state = match start_spec.as_deref() {
+        Some(spec) => match parse_start_spec(spec, STM_WHITE, seed) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("--start error: {}", e);
+                std::process::exit(1);
+            }
+        },
+        None => State {
+            wbb: (1u32 << 0) | (1u32 << 7) | (1u32 << 15), // a7, a4, b4
+            bbb: (1u32 << 4) | (1u32 << 3) | (1u32 << 11), // g1, g4, f4
+            stm: STM_WHITE,
+        },
     };
 
     println!("Starting position. You are {}.\n",

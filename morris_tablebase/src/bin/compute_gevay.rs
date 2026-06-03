@@ -136,9 +136,8 @@ fn main() {
 
     // Build a Tablebase wrapping the on-disk Phase 1 (3,3) (or nothing,
     // since (3,3) has no smaller dependencies — all captures terminal).
-    let mut phase1_tb = Tablebase::new();
+    let phase1_tb = Tablebase::new();
     // Optional: insert smaller subspaces too. For (3,3) none are needed.
-    let _ = &phase1_tb;
 
     let t = std::time::Instant::now();
     let (first_key, dtw) = solve_esc_work_unit(sub33, rank33, variant, &phase1_tb, &ranks);

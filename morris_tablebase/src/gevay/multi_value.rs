@@ -87,10 +87,10 @@ impl GevayWorkArea {
 /// `(neg_abs_first_key, dtw)`. Inside a single |value| slice we still
 /// want ascending DTW order — same as Phase 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct QueueKey {
+pub struct QueueKey {
     /// `-|first_key_absolute|` — extreme values come out first.
-    neg_abs_value: i16,
-    dtw: i16,
+    pub neg_abs_value: i16,
+    pub dtw: i16,
 }
 
 impl Ord for QueueKey {
