@@ -22,17 +22,17 @@ use morris_tablebase::wave::{solve_movement, Variant};
 
 /// Orbit-weighted W/L/D counts for a mmap-backed table (used when stats
 /// weren't returned by solve_movement, e.g. when resuming from disk).
+/// Format-agnostic: works on both V1 dense and V2 sparse on-disk tables
+/// via [MappedTable::query_canonical].
 fn stats_from_mapped(sub: Subspace, table: &MappedTable) -> (u64, u64, u64, u16) {
     let mut win = 0u64;
     let mut loss = 0u64;
     let mut draw = 0u64;
     let mut max_dtw = 0u16;
-    sub.enumerate_positions(|wbb, bbb| {
-        let osize = morris_tablebase::symmetry::orbit_size(wbb, bbb) as u64;
+    sub.enumerate_positions(|cw, cb| {
+        let osize = morris_tablebase::symmetry::orbit_size(cw, cb) as u64;
         for stm in [1u8, 2u8] {
-            let idx = sub.state_index_canonical(wbb, bbb, stm);
-            let v = table.verdict_at(idx);
-            let d = table.dtw_at(idx);
+            let (v, d) = table.query_canonical(cw, cb, stm);
             match v {
                 1 => { win += osize; if d > max_dtw { max_dtw = d; } }
                 2 => { loss += osize; if d > max_dtw { max_dtw = d; } }

@@ -23,14 +23,15 @@ use morris_tablebase::symmetry::orbit_size;
 use morris_tablebase::wave::Variant;
 use morris_tablebase::work_unit::{list_movement_work_units, negate};
 
-/// Orbit-weighted W/L/D counts split by STM, computed on a mmap'd Phase 1 table.
+/// Orbit-weighted W/L/D counts split by STM, computed on a mmap'd Phase 1
+/// table. Format-agnostic: works on both V1 dense and V2 sparse via
+/// [MappedTable::query_canonical].
 fn count_stats_mapped(sub: Subspace, table: &MappedTable) -> SubspaceStats {
     let mut out = SubspaceStats::default();
-    sub.enumerate_positions(|wbb, bbb| {
-        let osize = orbit_size(wbb, bbb) as u64;
+    sub.enumerate_positions(|cw, cb| {
+        let osize = orbit_size(cw, cb) as u64;
         for stm in [1u8, 2u8] {
-            let idx = sub.state_index_canonical(wbb, bbb, stm);
-            let v = table.verdict_at(idx);
+            let (v, _d) = table.query_canonical(cw, cb, stm);
             let bucket = if stm == 1 {
                 &mut out.white_to_move
             } else {

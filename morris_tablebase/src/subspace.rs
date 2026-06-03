@@ -278,12 +278,15 @@ impl MappedTable {
     /// Look up the (verdict, DTW) for a canonical `(cw, cb, stm)` position
     /// in this table's subspace. Works on both V1 and V2 backends.
     ///
-    /// For V2 ESC files (`w == b`), the `stm` argument is effectively
-    /// ignored — only WTM is stored on disk. Callers that want to query
-    /// BTM in an ESC subspace must first color-swap the inputs
-    /// (`canonicalize(bbb, wbb)`) and call with `stm=WTM=1`. This
-    /// transformation lives in [Tablebase::query] so most callers never
-    /// see it.
+    /// For V2 ESC files (`w == b`), BTM queries are answered by an
+    /// internal color-swap: `(cw, cb, BTM)` is looked up as
+    /// `(canonicalize(cb, cw), WTM)` within the same file. V2 ESC files
+    /// store WTM only, so this is the canonical (and only) way to
+    /// recover BTM data from them.
+    ///
+    /// For V1Dense backends `stm` is honored verbatim — the BTM slot is
+    /// addressed directly. This preserves byte-exact V1 behavior even on
+    /// the rare positions where the wave's BTM and (swap of) WTM differ.
     #[inline]
     pub fn query_canonical(&self, cw: u32, cb: u32, stm: u8) -> (u8, u16) {
         match &self.backend {
@@ -292,6 +295,15 @@ impl MappedTable {
                 (self.verdict_at(idx), self.dtw_at(idx))
             }
             MappedBackend::V2Sparse { offsets_ptr, n_rank_w, entries_ptr, is_esc, entry_stride } => {
+                // ESC + BTM: color-swap to WTM at the canonical of (cb, cw)
+                // before doing the binary search.
+                let (lcw, lcb, lstm) = if *is_esc && stm == 2 {
+                    let (sw, sb) = canonicalize(cb, cw);
+                    (sw, sb, 1u8)
+                } else {
+                    (cw, cb, stm)
+                };
+                let cw = lcw; let cb = lcb; let stm = lstm;
                 let rank_w = rank_subset(cw);
                 debug_assert!(rank_w < *n_rank_w,
                     "rank_w {} >= n_rank_w {}", rank_w, n_rank_w);
