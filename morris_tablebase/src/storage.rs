@@ -320,8 +320,12 @@ where
     let n_rank_b = BINOM[(24 - w_count) as usize][b_count as usize];
 
     // Pass 1: count canonical entries per rank_w in parallel.
+    // with_min_len batches consecutive rank_w into one rayon task —
+    // critical for large subspaces (e.g. (8,8) has n_rank_w=735k) where
+    // per-rank_w task overhead would otherwise dominate.
     let rank_w_counts: Vec<u64> = (0..n_rank_w)
         .into_par_iter()
+        .with_min_len(4096)
         .map(|rank_w| {
             let wbb = unrank_subset(rank_w, 24, w_count);
             let mut cnt = 0u64;
@@ -382,42 +386,58 @@ where
         file.write_at(&offset_buf, header_bytes as u64)?;
     }
 
-    // Pass 2: build per-rank_w entry buffers in parallel and pwrite each
-    // to its computed offset within the entries section.
+    // Pass 2: build per-chunk entry buffers in parallel and pwrite each
+    // chunk's concatenated buffer in a single syscall. Chunking rank_w
+    // (rather than one task per rank_w) cuts both rayon scheduling
+    // overhead and pwrite syscalls by ~1000× on large subspaces. Each
+    // chunk is contiguous in rank_w so the v1 mmap reads stay sequential
+    // within a chunk, friendly to the kernel's readahead.
     let file_arc = Arc::new(file);
-    let offsets_arc = Arc::new(offsets);
-    let result: io::Result<()> = (0..n_rank_w)
-        .into_par_iter()
-        .try_for_each(|rank_w| {
-            let wbb = unrank_subset(rank_w, 24, w_count);
-            let count = rank_w_counts[rank_w as usize] as usize;
-            if count == 0 {
+    let chunk_size: u32 = (n_rank_w / 128).max(4096).min(n_rank_w.max(1));
+    let chunk_ranges: Vec<(u32, u32)> = (0..n_rank_w)
+        .step_by(chunk_size as usize)
+        .map(|start| (start, (start + chunk_size).min(n_rank_w)))
+        .collect();
+    let result: io::Result<()> = chunk_ranges
+        .par_iter()
+        .try_for_each(|&(start, end)| {
+            let chunk_entry_count: u64 = rank_w_counts[start as usize..end as usize]
+                .iter()
+                .sum();
+            if chunk_entry_count == 0 {
                 return Ok(());
             }
-            let mut local_buf: Vec<u8> = Vec::with_capacity(count * entry_stride);
-            for rank_b in 0..n_rank_b {
-                let compact_b = unrank_subset(rank_b, 24 - w_count, b_count);
-                let bbb = expand_against(compact_b, wbb);
-                let (cw, cb) = canonicalize(wbb, bbb);
-                if (cw, cb) != (wbb, bbb) {
-                    continue;
-                }
-                local_buf.extend_from_slice(&rank_b.to_le_bytes());
-                let (v_w, d_w) = get(cw, cb, 1);
-                local_buf.push(v_w);
-                local_buf.extend_from_slice(&d_w.to_le_bytes());
-                if !is_esc {
-                    let (v_b, d_b) = get(cw, cb, 2);
-                    local_buf.push(v_b);
-                    local_buf.extend_from_slice(&d_b.to_le_bytes());
+            let mut chunk_buf: Vec<u8> = Vec::with_capacity(
+                chunk_entry_count as usize * entry_stride,
+            );
+            for rank_w in start..end {
+                let wbb = unrank_subset(rank_w, 24, w_count);
+                for rank_b in 0..n_rank_b {
+                    let compact_b = unrank_subset(rank_b, 24 - w_count, b_count);
+                    let bbb = expand_against(compact_b, wbb);
+                    let (cw, cb) = canonicalize(wbb, bbb);
+                    if (cw, cb) != (wbb, bbb) {
+                        continue;
+                    }
+                    chunk_buf.extend_from_slice(&rank_b.to_le_bytes());
+                    let (v_w, d_w) = get(cw, cb, 1);
+                    chunk_buf.push(v_w);
+                    chunk_buf.extend_from_slice(&d_w.to_le_bytes());
+                    if !is_esc {
+                        let (v_b, d_b) = get(cw, cb, 2);
+                        chunk_buf.push(v_b);
+                        chunk_buf.extend_from_slice(&d_b.to_le_bytes());
+                    }
                 }
             }
-            let file_offset = entries_section_offset + offsets_arc[rank_w as usize];
-            file_arc.write_at(&local_buf, file_offset)?;
+            let file_offset = entries_section_offset + offsets[start as usize];
+            file_arc.write_at(&chunk_buf, file_offset)?;
             Ok(())
         });
     result?;
-    Arc::try_unwrap(file_arc).map_err(|_| io::Error::new(io::ErrorKind::Other, "file Arc still shared"))?.sync_all()?;
+    Arc::try_unwrap(file_arc)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "file Arc still shared"))?
+        .sync_all()?;
     Ok(())
 }
 
