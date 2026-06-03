@@ -22,6 +22,10 @@
 //! At this stage we implement the bookkeeping primitives; full integration
 //! into the cross-subspace driver lives in `bin/compute_gevay.rs`.
 
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering};
+
+use rayon::prelude::*;
+
 use crate::board::{ADJACENCY, NUM_POSITIONS};
 use crate::rules::{is_mill_through, legal_capture_targets, popcount};
 use crate::subspace::{Subspace, Tablebase};
@@ -346,148 +350,82 @@ pub fn solve_esc_work_unit(
     let mut first_key: Vec<i16> = vec![0; n];
     let mut dtw: Vec<i16> = vec![0; n];
     let mut count: Vec<u32> = vec![0; n];
-    // Cells whose verdict is finalised; redundant with first_key != UNRESOLVED but explicit.
     let mut resolved: Vec<bool> = vec![false; n];
     // has_draw_for_q tracks whether ANY child (cross-subspace at init, or
     // intra-subspace during wave) yielded a DRAW-class option. Used at the
     // count==0 transition to choose between DRAW and LOSS classification.
-    // Phase 1 stashes this via a high bit on `count`; we keep it explicit
-    // for readability since multi-value already needs extra arrays.
     let mut has_draw_for_q: Vec<bool> = vec![false; n];
-    let mut queue: std::collections::BinaryHeap<QueueEntry> = std::collections::BinaryHeap::new();
 
-    // Phase 0 — init: enumerate canonical positions, classify each STM.
-    sub.enumerate_positions(|wbb, bbb| {
-        for stm in [STM_WHITE, 2u8] {
-            let idx = sub.state_index_canonical(wbb, bbb, stm) as usize;
-            let mut best_win_key: Option<(i16, i16)> = None; // (rel_first_key, signed_dtw)
-            let mut max_lose_rel: Option<(i16, i16)> = None;
-            let mut has_draw = false;
-            let mut any_move = false;
-            // Dedup intra children by canonical state index — same rationale
-            // as Phase 1: multiple raw (src,dst) moves can collapse to the
-            // same orbit child, but count(p) must reflect orbit-distinct
-            // children.
-            let mut intra_children: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Phase 0 — init pass in parallel via rayon. Each canonical position
+    // is independent: its writes go to a unique pair of state-array
+    // indices (WTM + BTM) determined by the canonical (cw, cb), so
+    // different threads writing to different positions never collide.
+    //
+    // We expose the plain Vec<i16>/Vec<u32>/Vec<bool> as atomic-typed
+    // slices via std::slice::from_raw_parts for the duration of the
+    // parallel pass. AtomicI16/AtomicU32/AtomicBool are repr(transparent)
+    // over their plain types so the layouts match; we use Relaxed
+    // ordering since each cell is written by exactly one thread and
+    // there are no read-modify-write cycles within the init.
+    //
+    // Queue entries are collected via rayon's fold/reduce so per-thread
+    // partial heaps merge once into the final BinaryHeap. This avoids a
+    // global mutex on the queue during init.
+    let canonical_positions: Vec<(u32, u32)> = {
+        let mut v = Vec::with_capacity(n / 16);
+        sub.enumerate_positions(|w, b| v.push((w, b)));
+        v
+    };
 
-            forward_moves(sub, wbb, bbb, stm, variant, |mv| {
-                any_move = true;
-                if mv.target_sub == sub {
-                    let child_idx = sub.state_index_canonical(mv.new_wbb, mv.new_bbb, mv.new_stm);
-                    intra_children.insert(child_idx);
-                    return;
-                }
-                // Cross-subspace child.
-                let (rel_key, child_signed_dtw) = if mv.opp_below_three {
-                    // The CHILD position has opp's STM, with opp at <3 pieces
-                    // = terminal LOSS from the child STM's perspective. So
-                    // child's first_key absolute = LOSS_ABS. We then adjust
-                    // to OUR perspective at p; the negation built into
-                    // adjust_first_key flips this to WIN-class for us.
-                    let (adj, _sign_flip) = adjust_first_key(LOSS_ABS, 0, rank);
-                    (adj, 0i16) // terminal DTW at child = 0
-                } else {
-                    // Look up in secondary subspace (Phase 1 for now).
-                    let secondary_rank = *ranks.get(&mv.target_sub).unwrap_or(&0);
-                    match query_secondary_adjusted(
-                        phase1_tb,
-                        secondary_rank,
-                        rank,
-                        mv.target_sub,
-                        mv.new_wbb,
-                        mv.new_bbb,
-                        mv.new_stm,
-                    ) {
-                        Some(v) => v,
-                        None => return, // secondary not loaded - skip (caller invariant)
+    let queue_entries: Vec<QueueEntry> = {
+        // SAFETY: AtomicI16 / AtomicU32 / AtomicBool are repr(transparent)
+        // over i16 / u32 / bool, so a &[Atomic*] over the same memory is
+        // sound. The atomic borrows live only for the duration of this
+        // scope; afterwards the plain Vec<...> is the unique borrow.
+        let first_key_atomic: &[AtomicI16] = unsafe {
+            std::slice::from_raw_parts(first_key.as_ptr() as *const AtomicI16, n)
+        };
+        let dtw_atomic: &[AtomicI16] = unsafe {
+            std::slice::from_raw_parts(dtw.as_ptr() as *const AtomicI16, n)
+        };
+        let count_atomic: &[AtomicU32] = unsafe {
+            std::slice::from_raw_parts(count.as_ptr() as *const AtomicU32, n)
+        };
+        let resolved_atomic: &[AtomicBool] = unsafe {
+            std::slice::from_raw_parts(resolved.as_ptr() as *const AtomicBool, n)
+        };
+        let has_draw_atomic: &[AtomicBool] = unsafe {
+            std::slice::from_raw_parts(has_draw_for_q.as_ptr() as *const AtomicBool, n)
+        };
+
+        canonical_positions
+            .par_iter()
+            .fold(
+                Vec::<QueueEntry>::new,
+                |mut acc, &(wbb, bbb)| {
+                    for stm in [STM_WHITE, 2u8] {
+                        if let Some(entry) = init_one_position_atomic(
+                            sub, rank, variant, phase1_tb, ranks,
+                            wbb, bbb, stm,
+                            first_key_atomic, dtw_atomic, count_atomic,
+                            resolved_atomic, has_draw_atomic,
+                        ) {
+                            acc.push(entry);
+                        }
                     }
-                };
-                // From the perspective of the moving player, we want to maximise
-                // first_key. The child's first_key is from the opponent's POV
-                // (negated already by adjust_first_key). So:
-                //   child first_key > 0 (=> child is LOSS-class for opp): good move for us
-                //   child first_key < 0 (=> WIN-class for opp): bad move for us
-                //   child first_key = 0: draw-class
-                if rel_key > 0 {
-                    let candidate_dtw = propagate_dtw(child_signed_dtw, rel_key)
-                        .saturating_add(if rel_key > 0 { 1 } else { -1 });
-                    let curr = best_win_key.unwrap_or((i16::MIN, i16::MAX));
-                    // Prefer larger first_key (closer to WIN), then smaller DTW
-                    // (faster victory) when first key is positive.
-                    if rel_key > curr.0 || (rel_key == curr.0 && candidate_dtw < curr.1) {
-                        best_win_key = Some((rel_key, candidate_dtw));
-                    }
-                } else if rel_key < 0 {
-                    let candidate_dtw =
-                        propagate_dtw(child_signed_dtw, rel_key).saturating_sub(1);
-                    let curr = max_lose_rel.unwrap_or((i16::MAX, i16::MIN));
-                    // For LOSS direction, track LEAST bad (closest to 0) and longest DTW.
-                    if rel_key > curr.0 || (rel_key == curr.0 && candidate_dtw > curr.1) {
-                        max_lose_rel = Some((rel_key, candidate_dtw));
-                    }
-                } else {
-                    has_draw = true;
+                    acc
+                },
+            )
+            .reduce(Vec::<QueueEntry>::new, |mut a, mut b| {
+                if a.capacity() < b.capacity() {
+                    std::mem::swap(&mut a, &mut b);
                 }
-            });
+                a.extend(b);
+                a
+            })
+    };
 
-            if !any_move {
-                // Stalemate: STM has no legal move, terminal LOSS at DTW=0.
-                let (rel, _) = adjust_first_key(LOSS_ABS, 0, rank);
-                first_key[idx] = rel;
-                dtw[idx] = 0;
-                resolved[idx] = true;
-                queue.push(QueueEntry {
-                    key: QueueKey { neg_abs_value: -(rel.abs()), dtw: 0 },
-                    sub_idx: 0,
-                    state_idx: idx as u64,
-                });
-                continue;
-            }
-
-            if let Some((rel, d)) = best_win_key {
-                first_key[idx] = rel;
-                dtw[idx] = d;
-                resolved[idx] = true;
-                queue.push(QueueEntry {
-                    key: QueueKey { neg_abs_value: -(rel.abs()), dtw: d },
-                    sub_idx: 0,
-                    state_idx: idx as u64,
-                });
-            } else if intra_children.is_empty() {
-                if has_draw {
-                    // No winning move, no unresolved children, has a draw option.
-                    first_key[idx] = 0;
-                    dtw[idx] = 0;
-                    resolved[idx] = true;
-                } else if let Some((rel, d)) = max_lose_rel {
-                    first_key[idx] = rel;
-                    dtw[idx] = d.saturating_add(1);
-                    resolved[idx] = true;
-                    queue.push(QueueEntry {
-                        key: QueueKey { neg_abs_value: -(rel.abs()), dtw: dtw[idx] },
-                        sub_idx: 0,
-                        state_idx: idx as u64,
-                    });
-                }
-            } else {
-                count[idx] = intra_children.len() as u32;
-                // Stash the init-time cross-subspace flags for the wave's
-                // count==0 transition. Without this, a position that
-                // had a DRAW cross-child but is still waiting on intra-
-                // children would forget the DRAW option and fall through
-                // to LOSS instead.
-                if has_draw {
-                    has_draw_for_q[idx] = true;
-                }
-                if let Some((_rel, d)) = max_lose_rel {
-                    // Stash max LOSS-class DTW into dtw[idx]. Wave updates
-                    // will take max(dtw[idx], child_dtw) on each LOSS-
-                    // direction arrival so the stash survives until count==0.
-                    dtw[idx] = d;
-                }
-            }
-        }
-    });
+    let mut queue: std::collections::BinaryHeap<QueueEntry> = queue_entries.into_iter().collect();
 
     // Phase 1 — wave propagation through intra-WU parents.
     // Approximate first-arrival heuristic (mirrors the Phase 1 wave's
@@ -544,6 +482,122 @@ pub fn solve_pair_work_unit(
         wu.primary[1], -rank_primary_0, variant, phase1_tb, ranks,
     );
     vec![(fk0, dtw0), (fk1, dtw1)]
+}
+
+/// Per-position init pass for one `(wbb, bbb, stm)` triple. Writes
+/// directly to atomic slices (each canonical position's writes go to
+/// disjoint indices, so Relaxed ordering is sufficient) and returns the
+/// optional queue entry to push for the wave's BFS seed set.
+#[inline]
+fn init_one_position_atomic(
+    sub: Subspace,
+    rank: Rank,
+    variant: crate::wave::Variant,
+    phase1_tb: &Tablebase,
+    ranks: &std::collections::HashMap<Subspace, Rank>,
+    wbb: u32,
+    bbb: u32,
+    stm: u8,
+    first_key: &[AtomicI16],
+    dtw: &[AtomicI16],
+    count: &[AtomicU32],
+    resolved: &[AtomicBool],
+    has_draw_for_q: &[AtomicBool],
+) -> Option<QueueEntry> {
+    let idx = sub.state_index_canonical(wbb, bbb, stm) as usize;
+    let mut best_win_key: Option<(i16, i16)> = None;
+    let mut max_lose_rel: Option<(i16, i16)> = None;
+    let mut has_draw = false;
+    let mut any_move = false;
+    let mut intra_children: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    forward_moves(sub, wbb, bbb, stm, variant, |mv| {
+        any_move = true;
+        if mv.target_sub == sub {
+            let child_idx = sub.state_index_canonical(mv.new_wbb, mv.new_bbb, mv.new_stm);
+            intra_children.insert(child_idx);
+            return;
+        }
+        let (rel_key, child_signed_dtw) = if mv.opp_below_three {
+            let (adj, _sign_flip) = adjust_first_key(LOSS_ABS, 0, rank);
+            (adj, 0i16)
+        } else {
+            let secondary_rank = *ranks.get(&mv.target_sub).unwrap_or(&0);
+            match query_secondary_adjusted(
+                phase1_tb, secondary_rank, rank,
+                mv.target_sub, mv.new_wbb, mv.new_bbb, mv.new_stm,
+            ) {
+                Some(v) => v,
+                None => return,
+            }
+        };
+        if rel_key > 0 {
+            let candidate_dtw = propagate_dtw(child_signed_dtw, rel_key)
+                .saturating_add(if rel_key > 0 { 1 } else { -1 });
+            let curr = best_win_key.unwrap_or((i16::MIN, i16::MAX));
+            if rel_key > curr.0 || (rel_key == curr.0 && candidate_dtw < curr.1) {
+                best_win_key = Some((rel_key, candidate_dtw));
+            }
+        } else if rel_key < 0 {
+            let candidate_dtw = propagate_dtw(child_signed_dtw, rel_key).saturating_sub(1);
+            let curr = max_lose_rel.unwrap_or((i16::MAX, i16::MIN));
+            if rel_key > curr.0 || (rel_key == curr.0 && candidate_dtw > curr.1) {
+                max_lose_rel = Some((rel_key, candidate_dtw));
+            }
+        } else {
+            has_draw = true;
+        }
+    });
+
+    if !any_move {
+        let (rel, _) = adjust_first_key(LOSS_ABS, 0, rank);
+        first_key[idx].store(rel, Ordering::Relaxed);
+        // dtw stays 0 (already zero-initialized).
+        resolved[idx].store(true, Ordering::Relaxed);
+        return Some(QueueEntry {
+            key: QueueKey { neg_abs_value: -(rel.abs()), dtw: 0 },
+            sub_idx: 0,
+            state_idx: idx as u64,
+        });
+    }
+
+    if let Some((rel, d)) = best_win_key {
+        first_key[idx].store(rel, Ordering::Relaxed);
+        dtw[idx].store(d, Ordering::Relaxed);
+        resolved[idx].store(true, Ordering::Relaxed);
+        Some(QueueEntry {
+            key: QueueKey { neg_abs_value: -(rel.abs()), dtw: d },
+            sub_idx: 0,
+            state_idx: idx as u64,
+        })
+    } else if intra_children.is_empty() {
+        if has_draw {
+            // first_key stays 0; dtw stays 0.
+            resolved[idx].store(true, Ordering::Relaxed);
+            None
+        } else if let Some((rel, d)) = max_lose_rel {
+            let new_dtw = d.saturating_add(1);
+            first_key[idx].store(rel, Ordering::Relaxed);
+            dtw[idx].store(new_dtw, Ordering::Relaxed);
+            resolved[idx].store(true, Ordering::Relaxed);
+            Some(QueueEntry {
+                key: QueueKey { neg_abs_value: -(rel.abs()), dtw: new_dtw },
+                sub_idx: 0,
+                state_idx: idx as u64,
+            })
+        } else {
+            None
+        }
+    } else {
+        count[idx].store(intra_children.len() as u32, Ordering::Relaxed);
+        if has_draw {
+            has_draw_for_q[idx].store(true, Ordering::Relaxed);
+        }
+        if let Some((_rel, d)) = max_lose_rel {
+            dtw[idx].store(d, Ordering::Relaxed);
+        }
+        None
+    }
 }
 
 /// Adjacency bitmask of a board position (mirror of `wave::adjacency_mask`).

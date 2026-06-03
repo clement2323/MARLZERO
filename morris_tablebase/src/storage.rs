@@ -44,6 +44,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::hash::{unrank_subset, expand_against, BINOM};
 use crate::subspace::{Subspace, SubspaceTable};
 use crate::symmetry::canonicalize;
@@ -287,6 +289,135 @@ where
     }
 
     w.flush()?;
+    Ok(())
+}
+
+/// Parallel variant of `save_v2_with` — uses rayon to canonicalize and
+/// encode entries across rank_w buckets in parallel, then writes each
+/// thread's local byte buffer to its computed file offset via `pwrite`
+/// (no global mutex on the file handle). For larger subspaces this is
+/// ~N× faster on a multi-core machine.
+///
+/// The `get` closure must be `Fn + Sync` (e.g. reads from a mmap'd V1
+/// MappedTable, which is `Sync` by its manual impl).
+pub fn save_v2_par_with<F>(
+    sub: Subspace,
+    variant: Variant,
+    path: &Path,
+    get: F,
+) -> io::Result<()>
+where
+    F: Fn(u32, u32, u8) -> (u8, u16) + Sync,
+{
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+
+    let is_esc = sub.w_board == sub.b_board;
+    let entry_stride: usize = if is_esc { 7 } else { 10 };
+    let w_count = sub.w_board as u32;
+    let b_count = sub.b_board as u32;
+    let n_rank_w = BINOM[24][w_count as usize];
+    let n_rank_b = BINOM[(24 - w_count) as usize][b_count as usize];
+
+    // Pass 1: count canonical entries per rank_w in parallel.
+    let rank_w_counts: Vec<u64> = (0..n_rank_w)
+        .into_par_iter()
+        .map(|rank_w| {
+            let wbb = unrank_subset(rank_w, 24, w_count);
+            let mut cnt = 0u64;
+            for rank_b in 0..n_rank_b {
+                let compact_b = unrank_subset(rank_b, 24 - w_count, b_count);
+                let bbb = expand_against(compact_b, wbb);
+                let (cw, cb) = canonicalize(wbb, bbb);
+                if (cw, cb) == (wbb, bbb) {
+                    cnt += 1;
+                }
+            }
+            cnt
+        })
+        .collect();
+
+    let mut offsets: Vec<u64> = Vec::with_capacity(n_rank_w as usize + 1);
+    offsets.push(0);
+    let mut cum: u64 = 0;
+    for &c in &rank_w_counts {
+        cum += c * entry_stride as u64;
+        offsets.push(cum);
+    }
+    let n_canonical_entries: u64 = rank_w_counts.iter().sum();
+    let entries_total_bytes = cum;
+
+    // Header + offsets section.
+    let header_bytes = 32usize;
+    let offsets_bytes = (n_rank_w as usize + 1) * 8;
+    let entries_section_offset = (header_bytes + offsets_bytes) as u64;
+    let total_file_bytes = entries_section_offset + entries_total_bytes;
+
+    // Pre-allocate file and write header + offsets sequentially.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.set_len(total_file_bytes)?;
+    {
+        let mut hdr = [0u8; 32];
+        hdr[0..4].copy_from_slice(&MAGIC);
+        hdr[4..6].copy_from_slice(&VERSION_V2.to_le_bytes());
+        hdr[6] = variant_byte(variant);
+        hdr[7] = PAYLOAD_PHASE1_V2;
+        hdr[8] = sub.w_board;
+        hdr[9] = sub.b_board;
+        hdr[10] = sub.w_to_place;
+        hdr[11] = sub.b_to_place;
+        hdr[12] = if is_esc { 1u8 } else { 0u8 };
+        hdr[16..24].copy_from_slice(&n_canonical_entries.to_le_bytes());
+        hdr[24..28].copy_from_slice(&n_rank_w.to_le_bytes());
+        file.write_at(&hdr, 0)?;
+
+        let mut offset_buf = Vec::with_capacity(offsets_bytes);
+        for &off in &offsets {
+            offset_buf.extend_from_slice(&off.to_le_bytes());
+        }
+        file.write_at(&offset_buf, header_bytes as u64)?;
+    }
+
+    // Pass 2: build per-rank_w entry buffers in parallel and pwrite each
+    // to its computed offset within the entries section.
+    let file_arc = Arc::new(file);
+    let offsets_arc = Arc::new(offsets);
+    let result: io::Result<()> = (0..n_rank_w)
+        .into_par_iter()
+        .try_for_each(|rank_w| {
+            let wbb = unrank_subset(rank_w, 24, w_count);
+            let count = rank_w_counts[rank_w as usize] as usize;
+            if count == 0 {
+                return Ok(());
+            }
+            let mut local_buf: Vec<u8> = Vec::with_capacity(count * entry_stride);
+            for rank_b in 0..n_rank_b {
+                let compact_b = unrank_subset(rank_b, 24 - w_count, b_count);
+                let bbb = expand_against(compact_b, wbb);
+                let (cw, cb) = canonicalize(wbb, bbb);
+                if (cw, cb) != (wbb, bbb) {
+                    continue;
+                }
+                local_buf.extend_from_slice(&rank_b.to_le_bytes());
+                let (v_w, d_w) = get(cw, cb, 1);
+                local_buf.push(v_w);
+                local_buf.extend_from_slice(&d_w.to_le_bytes());
+                if !is_esc {
+                    let (v_b, d_b) = get(cw, cb, 2);
+                    local_buf.push(v_b);
+                    local_buf.extend_from_slice(&d_b.to_le_bytes());
+                }
+            }
+            let file_offset = entries_section_offset + offsets_arc[rank_w as usize];
+            file_arc.write_at(&local_buf, file_offset)?;
+            Ok(())
+        });
+    result?;
+    Arc::try_unwrap(file_arc).map_err(|_| io::Error::new(io::ErrorKind::Other, "file Arc still shared"))?.sync_all()?;
     Ok(())
 }
 

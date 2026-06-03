@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use morris_tablebase::storage::{save_v2, parse_header, VERSION_V2, PAYLOAD_PHASE1_V2};
+use morris_tablebase::storage::{save_v2, save_v2_par_with, parse_header, VERSION_V2, PAYLOAD_PHASE1_V2};
 use morris_tablebase::subspace::{MappedTable, Subspace, SubspaceTable, Tablebase};
 use morris_tablebase::symmetry::canonicalize;
 use morris_tablebase::wave::Variant;
@@ -203,6 +203,36 @@ fn tablebase_query_missing_subspace_returns_none() {
     assert!(had_any);
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn save_v2_par_matches_save_v2_byte_for_byte() {
+    // Verify the parallel writer produces byte-identical output to the
+    // sequential one. Critical for the migration tool's validation
+    // pass (which compares aggregate totals — but byte equivalence is
+    // stronger).
+    for sub in [Subspace::movement(3, 3), Subspace::movement(4, 3), Subspace::movement(3, 4)] {
+        let table = build_synthetic(sub);
+        let path_seq = temp_path(&format!("seq_{}_{}", sub.w_board, sub.b_board));
+        let path_par = temp_path(&format!("par_{}_{}", sub.w_board, sub.b_board));
+
+        save_v2(&table, Variant::Flying, &path_seq).expect("save_v2 seq");
+        save_v2_par_with(sub, Variant::Flying, &path_par, |cw, cb, stm| {
+            let idx = sub.state_index_canonical(cw, cb, stm) as usize;
+            (table.verdict[idx], table.dtw[idx])
+        }).expect("save_v2_par");
+
+        let bytes_seq = std::fs::read(&path_seq).expect("read seq");
+        let bytes_par = std::fs::read(&path_par).expect("read par");
+        assert_eq!(bytes_seq.len(), bytes_par.len(),
+            "size mismatch for ({}, {}): seq={} par={}",
+            sub.w_board, sub.b_board, bytes_seq.len(), bytes_par.len());
+        assert_eq!(bytes_seq, bytes_par,
+            "byte content mismatch for ({}, {})", sub.w_board, sub.b_board);
+
+        let _ = std::fs::remove_file(&path_seq);
+        let _ = std::fs::remove_file(&path_par);
+    }
 }
 
 #[test]

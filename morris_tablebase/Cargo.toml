@@ -13,6 +13,7 @@ path = "src/lib.rs"
 indicatif = "0.17"
 memmap2 = "0.9"
 libc = "0.2"
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3

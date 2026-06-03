@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use morris_tablebase::storage::{
-    default_filename, parse_header, save_v2_with, PAYLOAD_PHASE1, PAYLOAD_PHASE1_V2,
+    default_filename, parse_header, save_v2_par_with, PAYLOAD_PHASE1, PAYLOAD_PHASE1_V2,
     VERSION_V1, VERSION_V2,
 };
 use morris_tablebase::subspace::{MappedTable, Subspace};
@@ -249,12 +249,14 @@ fn main() {
         }
         println!("  open v1 in {:.2}s", t_open.elapsed().as_secs_f64());
 
-        // Stream v1 → v2 tmp.
+        // Stream v1 → v2 tmp using the parallel writer. `verdict_at`/
+        // `dtw_at` on a MappedTable are inherently thread-safe (mmap
+        // reads, no shared mutable state).
         let t_write = Instant::now();
-        save_v2_with(*sub, Variant::Flying, &tmp_path, |cw, cb, stm| {
+        save_v2_par_with(*sub, Variant::Flying, &tmp_path, |cw, cb, stm| {
             let idx = sub.state_index_canonical(cw, cb, stm);
             (v1_mapped.verdict_at(idx), v1_mapped.dtw_at(idx))
-        }).expect("save_v2");
+        }).expect("save_v2_par");
         let v2_tmp_size = std::fs::metadata(&tmp_path).unwrap().len();
         println!("  v2.tmp written in {:.1}s ({:.2} GB, {:.1}× reduction)",
             t_write.elapsed().as_secs_f64(),
