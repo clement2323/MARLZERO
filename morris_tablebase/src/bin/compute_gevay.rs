@@ -97,18 +97,23 @@ struct Args {
     phase1_dir: PathBuf,
     save_to: Option<PathBuf>,
     max_total: u8,
+    quick: bool,
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: compute_gevay <PHASE1_DIR> [--save-to <DIR>] [--max-total N]");
+        eprintln!("usage: compute_gevay <PHASE1_DIR> [--save-to <DIR>] [--max-total N] [--quick]");
+        eprintln!("  --quick: skip stats loading for subspaces with total > max_total + 2");
+        eprintln!("           (ranks shown will be partial; useful when running in parallel with");
+        eprintln!("            convert_to_v2 or testing a single small WU).");
         std::process::exit(1);
     }
     let mut out = Args {
         phase1_dir: PathBuf::from(&args[1]),
         save_to: None,
         max_total: 6,
+        quick: false,
     };
     let mut i = 2;
     while i < args.len() {
@@ -120,6 +125,10 @@ fn parse_args() -> Args {
             "--max-total" => {
                 out.max_total = args[i + 1].parse().expect("--max-total wants u8");
                 i += 2;
+            }
+            "--quick" => {
+                out.quick = true;
+                i += 1;
             }
             other => panic!("unknown arg: {}", other),
         }
@@ -139,17 +148,35 @@ fn main() {
     println!("max_total        : {} (filters which WUs actually solve)", cli.max_total);
     println!("total WUs        : {}", all_wus.len());
 
-    // Step 2 — load Phase 1 mmap tables and compute per-subspace stats.
-    println!("\nLoading Phase 1 (mmap) + computing W/D/L stats...");
+    // Step 2 — decide which subspaces to load. Default = all 49. With
+    // --quick, restrict to subspaces involved in WUs <= max_total + 2,
+    // which avoids the ~10-30 min sweep through the huge V1 files
+    // (typically wanted when running parallel to convert_to_v2 or for a
+    // single-WU smoke test).
+    let stats_total_cap = if cli.quick {
+        cli.max_total.saturating_add(2)
+    } else {
+        18
+    };
     let mut mapped_tables: HashMap<Subspace, MappedTable> = HashMap::new();
     let mut wtm_counts: HashMap<Subspace, StmCounts> = HashMap::new();
     let mut all_subs: Vec<Subspace> = Vec::new();
     for wu in &all_wus {
+        if wu.total_pieces() > stats_total_cap {
+            continue;
+        }
         for &p in &wu.primary {
             if !all_subs.contains(&p) {
                 all_subs.push(p);
             }
         }
+    }
+    if cli.quick {
+        println!("\n[--quick] Loading Phase 1 stats only for subspaces with total <= {}.", stats_total_cap);
+        println!("           Ranks shown will be partial — the global ordinal");
+        println!("           ranking requires stats for all 49 subspaces.");
+    } else {
+        println!("\nLoading Phase 1 (mmap) + computing W/D/L stats for all subspaces...");
     }
     for sub in &all_subs {
         let path = cli.phase1_dir.join(default_filename(*sub, variant));
@@ -180,16 +207,22 @@ fn main() {
     let ranks = assign_ranks(&all_wus, &wtm_counts, &overrides);
 
     println!("\n=== Subspace ranks (Section IV-A) ===");
-    println!("{:>3} {:>3}  {:>7}  {:>5}", "w", "b", "val_s", "rank");
+    println!("{:>3} {:>3}  {:>7}  {:>5}{}", "w", "b", "val_s", "rank",
+        if cli.quick { "  [* = stats unloaded, val/rank not meaningful]" } else { "" });
     println!("{}", "-".repeat(28));
-    let mut display: Vec<(Subspace, f64, i16)> = ranks
+    let loaded: std::collections::HashSet<Subspace> = wtm_counts.keys().copied().collect();
+    let mut display: Vec<(Subspace, f64, i16, bool)> = ranks
         .iter()
-        .map(|(s, &r)| (*s, *val_per_primary.get(s).unwrap_or(&0.5), r))
+        .map(|(s, &r)| {
+            let is_loaded = loaded.contains(s) || loaded.contains(&negate(*s));
+            (*s, *val_per_primary.get(s).unwrap_or(&0.5), r, is_loaded)
+        })
         .collect();
     display.sort_by(|a, b| a.2.cmp(&b.2));
-    for (s, v, r) in display {
-        println!("{:>3} {:>3}  {:>7.4}  {:>+5}",
-            s.w_board, s.b_board, v, r);
+    for (s, v, r, is_loaded) in display {
+        let marker = if cli.quick && !is_loaded { " *" } else { "" };
+        println!("{:>3} {:>3}  {:>7.4}  {:>+5}{}",
+            s.w_board, s.b_board, v, r, marker);
     }
 
     // Step 4 — solve each WU in topological order (filtered by --max-total).
