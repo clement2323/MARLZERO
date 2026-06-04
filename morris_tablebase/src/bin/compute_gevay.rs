@@ -178,6 +178,14 @@ fn main() {
     } else {
         println!("\nLoading Phase 1 (mmap) + computing W/D/L stats for all subspaces...");
     }
+    let pb = indicatif::ProgressBar::new(all_subs.len() as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "  [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>3}/{len:>3} {wide_msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
     for sub in &all_subs {
         let path = cli.phase1_dir.join(default_filename(*sub, variant));
         if !path.exists() {
@@ -185,13 +193,18 @@ fn main() {
                 sub.w_board, sub.b_board, path.display());
             std::process::exit(1);
         }
+        let file_size_gb = std::fs::metadata(&path)
+            .map(|m| m.len() as f64 / 1e9)
+            .unwrap_or(0.0);
+        pb.set_message(format!("({}, {}) [{:.2} GB]", sub.w_board, sub.b_board, file_size_gb));
         let table = MappedTable::open(&path).expect("mmap Phase 1 table");
         let stats = count_stats_mapped(*sub, &table);
         wtm_counts.insert(*sub, stats.white_to_move);
         wtm_counts.insert(negate(*sub), stats.black_to_move);
         mapped_tables.insert(*sub, table);
+        pb.inc(1);
     }
-    println!("  stats loaded for {} subspaces.", all_subs.len());
+    pb.finish_with_message(format!("stats loaded for {} subspaces.", all_subs.len()));
 
     // Step 3 — val_s + ranks (paper Section IV-A).
     println!("\nComputing val_s + ordinal ranks...");
