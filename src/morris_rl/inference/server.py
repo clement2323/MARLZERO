@@ -34,18 +34,21 @@ from pydantic import BaseModel
 
 from morris_rl.env.rules import (
     GameState,
+    Variant,
     apply_action,
     compute_aux_features,
     get_legal_actions,
     is_terminal,
 )
 from morris_rl.eval.baselines import MinimaxAgent
+from morris_rl.inference.hybrid_agent import HybridAgent
 from morris_rl.inference.play import (
     IllegalActionError,
     describe_action,
     reconstruct_state,
     run_mcts_analysis,
 )
+from morris_rl.inference.tablebase_client import TablebaseClient
 from morris_rl.network.factory import build_network
 from morris_rl.network.resnet import MorrisResNet  # noqa: F401  (kept for backward compat / type hints)
 from morris_rl.utils.checkpoints import load_checkpoint
@@ -65,9 +68,29 @@ _default_agent_id: str = "minimax-5"
 _network_type: str | None = None
 _encode_fn = None  # Callable[[GameState], torch.Tensor] | None
 
+# Lazy-loaded tablebase client + hybrid agent for the Flying variant. Only
+# instantiated when TABLEBASE_DIR env var points to a Phase 1 tablebase dir.
+_tb_client: TablebaseClient | None = None
+_hybrid_agent: HybridAgent | None = None
+
 _AGENT_CHECKPOINT = "checkpoint"
 _AGENT_MINIMAX_3 = "minimax-3"
 _AGENT_MINIMAX_5 = "minimax-5"
+_AGENT_HYBRID = "hybrid"
+
+
+def _parse_variant(s: str | None) -> Variant:
+    """Map an API-side variant string to the Variant enum.
+
+    Accepts ``"flying"`` / ``"no-flying"`` (default ``"flying"`` since the
+    web demo's primary target now is the Flying variant). Anything else
+    raises HTTPException 400.
+    """
+    if s is None or s == "flying":
+        return Variant.FLYING
+    if s == "no-flying":
+        return Variant.NO_FLYING
+    raise HTTPException(status_code=400, detail=f"Unknown variant: {s!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +103,12 @@ class PlayRequest(BaseModel):
 
     actions: list[int]
     # Which adversary to run for this turn. None falls back to the server's
-    # default (checkpoint when loaded, otherwise minimax-5).
+    # default (hybrid when TB + flying, else checkpoint or minimax-5).
     agent: str | None = None
+    # Variant for the rules engine. Defaults to "flying" so the web demo's
+    # primary variant doesn't require every client to opt in. Pass
+    # "no-flying" for the legacy training variant.
+    variant: str | None = None
 
 
 class MoveInfo(BaseModel):
@@ -187,10 +214,43 @@ def _load_network() -> None:
         logger.info("No checkpoint found — defaulting to Minimax depth=5")
 
 
+def _load_tablebase() -> None:
+    """Spawn the Rust ``play_tb --serve`` subprocess if TABLEBASE_DIR points
+    to a Phase 1 tablebase. Failure is non-fatal — Hybrid simply won't be
+    advertised in /agents and won't be selectable.
+
+    When loaded, the default agent flips to ``hybrid`` (overriding the
+    checkpoint default) since hybrid > network for the Flying variant.
+    """
+    global _tb_client, _hybrid_agent, _default_agent_id
+
+    tb_dir = os.getenv("TABLEBASE_DIR", "")
+    if not tb_dir:
+        logger.info("TABLEBASE_DIR not set — hybrid agent unavailable")
+        return
+    tb_path = Path(tb_dir)
+    if not tb_path.exists():
+        logger.warning(f"TABLEBASE_DIR={tb_dir} does not exist — hybrid agent unavailable")
+        return
+    try:
+        _tb_client = TablebaseClient(tb_path)
+        _hybrid_agent = HybridAgent(_tb_client, minimax_depth=4)
+    except Exception as exc:  # noqa: BLE001 — load failure should not crash the server
+        logger.warning(f"Failed to load tablebase: {exc}. Hybrid agent unavailable.")
+        _tb_client = None
+        _hybrid_agent = None
+        return
+    _default_agent_id = _AGENT_HYBRID
+    logger.info(f"Loaded tablebase from {tb_dir} — hybrid agent ready (default)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     _load_network()
+    _load_tablebase()
     yield
+    if _tb_client is not None:
+        _tb_client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +304,11 @@ def list_agents() -> AgentsResponse:
     """Return the agents the client can pick from, plus the server default."""
     options = [
         AgentOption(
+            id=_AGENT_HYBRID,
+            label="Hybrid (heuristic d=4 + Gasser TB)",
+            available=_hybrid_agent is not None,
+        ),
+        AgentOption(
             id=_AGENT_CHECKPOINT,
             label=_checkpoint_label or "Trained checkpoint",
             available=_network is not None,
@@ -255,11 +320,14 @@ def list_agents() -> AgentsResponse:
 
 
 @app.get("/new-game", response_model=BoardState)
-def new_game() -> BoardState:
-    """Return the initial board state so the client can bootstrap."""
+def new_game(variant: str | None = None) -> BoardState:
+    """Return the initial board state so the client can bootstrap.
+
+    The variant query param controls the rules variant (default ``flying``).
+    """
     from morris_rl.env.rules import initial_state
 
-    state = initial_state()
+    state = initial_state(variant=_parse_variant(variant))
     return _state_to_board(state, game_over=False, winner=None)
 
 
@@ -273,7 +341,7 @@ def get_state(request: PlayRequest) -> BoardState:
     that would let the agent pick the human's capture target.
     """
     try:
-        state = reconstruct_state(request.actions)
+        state = reconstruct_state(request.actions, variant=_parse_variant(request.variant))
     except IllegalActionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     done, outcome = is_terminal(state)
@@ -291,7 +359,7 @@ def play(request: PlayRequest) -> PlayResponse:
     The reconstructed state must NOT be terminal; if it is, a 400 is returned.
     """
     try:
-        state = reconstruct_state(request.actions)
+        state = reconstruct_state(request.actions, variant=_parse_variant(request.variant))
     except IllegalActionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -306,7 +374,24 @@ def play(request: PlayRequest) -> PlayResponse:
     # Pick the agent for this turn.
     agent_id = request.agent or _default_agent_id
 
-    if agent_id == _AGENT_CHECKPOINT:
+    if agent_id == _AGENT_HYBRID:
+        if _hybrid_agent is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Hybrid agent requested but tablebase is not loaded",
+            )
+        action, top_moves_raw, value = _hybrid_agent.analyze(state)
+        top_moves = [
+            MoveInfo(
+                action=a,
+                visit_prob=p,
+                description=describe_action(a, state.must_capture),
+            )
+            for a, p in top_moves_raw
+        ]
+        using_network = False
+        agent_label = "Hybrid (heuristic d=4 + Gasser TB)"
+    elif agent_id == _AGENT_CHECKPOINT:
         if _network is None:
             raise HTTPException(
                 status_code=400,

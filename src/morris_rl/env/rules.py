@@ -20,6 +20,7 @@ import numpy as np
 from morris_rl.env.board import (
     ADJACENCY,
     EDGE_INDEX,
+    FLY_ACTION_BASE,
     MILLS,
     MILLS_BY_POSITION,
     MOVE_EDGES,
@@ -52,8 +53,22 @@ THREEFOLD_LIMIT: Final[int] = 3
 class Phase(IntEnum):
     PLACING = 0
     MOVING = 1
-    # No FLYING phase: this variant keeps the adjacency constraint even at 3
-    # pieces. A player with no legal move (blocked by adjacency) loses.
+    # No FLYING phase enum value: flying is a per-variant rule modifier on
+    # MOVING, not a separate phase. See Variant below.
+
+
+class Variant(IntEnum):
+    """Rules variant.
+
+    NO_FLYING: standard "Mills" variant used for training — adjacency is
+        always enforced. A player with no adjacent move loses on their turn.
+    FLYING: classical variant — once a player is reduced to exactly 3
+        pieces, they may move from any own piece to any empty position.
+        Above 3 pieces, adjacency still applies.
+    """
+
+    NO_FLYING = 0
+    FLYING = 1
 
 
 class Outcome(IntEnum):
@@ -73,6 +88,9 @@ class GameState:
     halfmove_clock: int  # resets on placement or capture; kept for legacy metrics
     total_halfmoves: int = 0  # absolute game length — never reset; cap at MAX_TOTAL_HALFMOVES
     position_counts: dict[tuple[int, ...], int] = field(default_factory=dict)
+    # Variant defaults to NO_FLYING so existing tests, training, and any
+    # caller that didn't know about Variant keep their current behavior.
+    variant: Variant = Variant.NO_FLYING
 
     def copy(self) -> GameState:
         """Deep copy — board array and position_counts dict are duplicated."""
@@ -84,6 +102,7 @@ class GameState:
             halfmove_clock=self.halfmove_clock,
             total_halfmoves=self.total_halfmoves,
             position_counts=dict(self.position_counts),
+            variant=self.variant,
         )
 
 
@@ -142,14 +161,21 @@ def forms_mill(board: np.ndarray, position: int, player: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def initial_state() -> GameState:
-    """Return a fresh game state at the very start of a game."""
+def initial_state(variant: Variant = Variant.NO_FLYING) -> GameState:
+    """Return a fresh game state at the very start of a game.
+
+    Args:
+        variant: rules variant. Defaults to NO_FLYING so existing callers
+            (training, tests) keep their current behavior. The web demo
+            passes FLYING explicitly when the user toggles it on.
+    """
     state = GameState(
         board=np.zeros(NUM_POSITIONS, dtype=np.int8),
         current_player=PLAYER_1,
         pieces_in_hand=(NUM_PIECES_PER_PLAYER, NUM_PIECES_PER_PLAYER),
         must_capture=False,
         halfmove_clock=0,
+        variant=variant,
     )
     _register_position(state)
     return state
@@ -159,6 +185,7 @@ def random_late_game_state(
     rng: np.random.Generator,
     pieces_per_player: int = 6,
     max_attempts: int = 100,
+    variant: Variant = Variant.NO_FLYING,
 ) -> GameState:
     """Return a random mid/late-game position with both hands empty.
 
@@ -201,6 +228,7 @@ def random_late_game_state(
             pieces_in_hand=(0, 0),
             must_capture=False,
             halfmove_clock=0,
+            variant=variant,
         )
         # Reject states where the mover has no legal action — that would be
         # an immediate terminal (loss by no_legal_moves), 0-ply game.
@@ -208,7 +236,7 @@ def random_late_game_state(
             continue
         _register_position(candidate)
         return candidate
-    return initial_state()
+    return initial_state(variant=variant)
 
 
 def get_legal_actions(state: GameState) -> list[int]:
@@ -342,6 +370,23 @@ def _legal_capture_actions(state: GameState) -> list[int]:
 
 def _legal_move_actions(state: GameState) -> list[int]:
     player = state.current_player
+    # Flying activates when the player is at exactly 3 pieces under the
+    # FLYING variant — they may move from any own piece to any empty
+    # position. Encoded outside the network's compact action space via
+    # FLY_ACTION_BASE so existing checkpoints / training are unaffected.
+    if (
+        state.variant == Variant.FLYING
+        and pieces_on_board(state.board, player) == 3
+    ):
+        actions: list[int] = []
+        for src in range(NUM_POSITIONS):
+            if state.board[src] != player:
+                continue
+            for dst in range(NUM_POSITIONS):
+                if state.board[dst] == EMPTY:
+                    actions.append(FLY_ACTION_BASE + src * NUM_POSITIONS + dst)
+        return actions
+
     actions = []
     for src in range(NUM_POSITIONS):
         if state.board[src] != player:
@@ -373,7 +418,15 @@ def _apply_placement(state: GameState, position: int) -> None:
 
 def _apply_move(state: GameState, action: int) -> None:
     player = state.current_player
-    src, dst = MOVE_EDGES[action - NUM_PLACE_CAPTURE_ACTIONS]
+    if action >= FLY_ACTION_BASE:
+        # Fly action: decode as FLY_ACTION_BASE + src * 24 + dst. Only
+        # generated by _legal_move_actions when state.variant == FLYING
+        # and the mover has exactly 3 pieces.
+        rel = action - FLY_ACTION_BASE
+        src = rel // NUM_POSITIONS
+        dst = rel % NUM_POSITIONS
+    else:
+        src, dst = MOVE_EDGES[action - NUM_PLACE_CAPTURE_ACTIONS]
     state.board[src] = EMPTY
     state.board[dst] = player
     state.halfmove_clock += 1

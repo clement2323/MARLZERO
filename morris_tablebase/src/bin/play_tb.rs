@@ -339,22 +339,146 @@ fn parse_start_spec(spec: &str, stm: u8, seed: u64) -> Result<State, String> {
                Examples: '3-3', '9-9', 'a7,d7,g7,b6,d6,f6,c5,d5,e5/a1,d1,g1,b2,d2,f2,c3,d3,e3'", spec))
 }
 
+/// JSONL `--serve` mode for Python wrappers.
+///
+/// Reads one request per line on stdin and writes one response per line on
+/// stdout. Designed to be spawned once by Python and kept alive — mmap'd
+/// tablebases stay hot across queries (~1 ms per query end-to-end).
+///
+/// Request:  `{"wbb":<u32>,"bbb":<u32>,"stm":<1|2>}\n`
+/// Response: `{"verdict":<u8>,"dtw":<u16>,"best_action":{"src":<u8>,"dst":<u8>,"cap":<u8>|null}|null,"top_moves":[{"src":<u8>,"dst":<u8>,"cap":<u8>|null,"verdict":<u8>,"dtw":<u16>}]}\n`
+///
+/// On parse error: `{"error":"<msg>"}\n`. On EOF: exit cleanly.
+fn serve_loop(tb: &Tablebase) {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let resp = match serve_handle(tb, line.trim()) {
+            Ok(json) => json,
+            Err(msg) => format!("{{\"error\":\"{}\"}}", msg.replace('"', "'")),
+        };
+        let _ = writeln!(stdout, "{}", resp);
+        let _ = stdout.flush();
+    }
+}
+
+/// Parse a `{"wbb":N,"bbb":N,"stm":N}` line. Returns Err on any malformed
+/// input — we don't need a full JSON parser here, just three named integers.
+fn parse_serve_request(s: &str) -> Result<State, String> {
+    let extract = |key: &str| -> Result<u64, String> {
+        let needle = format!("\"{}\"", key);
+        let i = s.find(&needle).ok_or_else(|| format!("missing key {}", key))?;
+        let after = &s[i + needle.len()..];
+        let colon = after.find(':').ok_or_else(|| format!("no ':' after {}", key))?;
+        let rest = &after[colon + 1..];
+        let bytes = rest.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') { start += 1; }
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_digit()) { end += 1; }
+        if end == start { return Err(format!("no digits after {}", key)); }
+        std::str::from_utf8(&bytes[start..end])
+            .map_err(|_| "utf8 error".to_string())?
+            .parse::<u64>()
+            .map_err(|e| format!("parse {}: {}", key, e))
+    };
+    let wbb = extract("wbb")?;
+    let bbb = extract("bbb")?;
+    let stm = extract("stm")?;
+    if wbb > u32::MAX as u64 || bbb > u32::MAX as u64 {
+        return Err("wbb/bbb > u32::MAX".to_string());
+    }
+    if stm != 1 && stm != 2 {
+        return Err(format!("stm must be 1 or 2, got {}", stm));
+    }
+    let wbb = wbb as u32;
+    let bbb = bbb as u32;
+    if wbb & bbb != 0 {
+        return Err("wbb and bbb overlap".to_string());
+    }
+    Ok(State { wbb, bbb, stm: stm as u8 })
+}
+
+fn format_move(mv: (u8, u8, Option<u8>)) -> String {
+    let (src, dst, cap) = mv;
+    match cap {
+        Some(c) => format!("{{\"src\":{},\"dst\":{},\"cap\":{}}}", src, dst, c),
+        None => format!("{{\"src\":{},\"dst\":{},\"cap\":null}}", src, dst),
+    }
+}
+
+fn serve_handle(tb: &Tablebase, line: &str) -> Result<String, String> {
+    if line.is_empty() { return Err("empty request".to_string()); }
+    let state = parse_serve_request(line)?;
+    let w = popcount(state.wbb) as u8;
+    let b = popcount(state.bbb) as u8;
+    if w < 3 || b < 3 || w > 9 || b > 9 {
+        return Err(format!("piece counts ({},{}) out of [3,9]", w, b));
+    }
+    let curr_sub = Subspace::movement(w, b);
+    let (verdict, dtw) = match tb.query(curr_sub, state.wbb, state.bbb, state.stm) {
+        Some(v) => v,
+        None => return Err(format!("subspace ({},{}) not loaded", w, b)),
+    };
+    // Build top-3 ranked moves + best action via the same scoring as
+    // computer_pick_move, then serialize.
+    let moves = legal_moves(state);
+    let mut scored: Vec<((u8, u8, Option<u8>), MoveScore, u8, u16)> = Vec::with_capacity(moves.len());
+    for mv in moves {
+        let child = apply_move(state, mv);
+        let (cv, cd, score) = match child_subspace(child) {
+            None => (LOSS, 1u16, MoveScore::terminal_win()),
+            Some(target_sub) => match tb.query(target_sub, child.wbb, child.bbb, child.stm) {
+                Some((v, d)) => (v, d, MoveScore::from_child(v, d)),
+                None => (255u8, 0u16, MoveScore { bucket: 3, dtw_signed: 0 }),
+            },
+        };
+        scored.push((mv, score, cv, cd));
+    }
+    scored.sort_by(|a, b| a.1.cmp(&b.1));
+    let best_action = scored.first().map(|(mv, _, _, _)| format_move(*mv))
+        .unwrap_or_else(|| "null".to_string());
+    let top_n = scored.iter().take(3)
+        .map(|(mv, _, cv, cd)| {
+            let m = format_move(*mv);
+            // Strip trailing '}' from move json to merge verdict+dtw in.
+            let core = &m[..m.len() - 1];
+            // verdict/dtw at the child state — caller can interpret WIN/LOSS
+            // (these are child-STM verdicts, NOT this-STM).
+            format!("{},\"verdict\":{},\"dtw\":{}}}", core, cv, cd)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "{{\"verdict\":{},\"dtw\":{},\"best_action\":{},\"top_moves\":[{}]}}",
+        verdict, dtw, best_action, top_n
+    ))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: play_tb <PHASE1_DIR> [--side white|black] [--start <SPEC>] [--seed N]");
+        eprintln!("usage: play_tb <PHASE1_DIR> [--side white|black] [--start <SPEC>] [--seed N] [--serve]");
         eprintln!();
         eprintln!("  --start SPEC : starting position. Two forms:");
         eprintln!("    'w-b'      : random (w whites, b blacks) movement position, e.g. '9-9'");
         eprintln!("    'W_list/B_list' : explicit pieces, e.g. 'a7,d7,g7/a1,d1,g1'");
         eprintln!("    default    : '3-3' with a fixed configuration");
         eprintln!("  --seed N     : RNG seed for random positions (default 42)");
+        eprintln!("  --serve      : JSONL stdio mode for Python wrappers (see serve_loop docs)");
         std::process::exit(1);
     }
     let phase1_dir = PathBuf::from(&args[1]);
     let mut human_side = STM_WHITE;
     let mut start_spec: Option<String> = None;
     let mut seed: u64 = 42;
+    let mut serve = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -370,12 +494,22 @@ fn main() {
                 seed = args[i + 1].parse().unwrap_or(42);
                 i += 2;
             }
+            "--serve" => {
+                serve = true;
+                i += 1;
+            }
             _ => { i += 1; }
         }
     }
 
     // Load Phase 1 tablebase: every movement .bin in the directory.
-    println!("Loading Phase 1 tablebase from {} ...", phase1_dir.display());
+    // In --serve mode we log to stderr instead of stdout (stdout is the JSONL
+    // response channel).
+    if serve {
+        eprintln!("Loading Phase 1 tablebase from {} ...", phase1_dir.display());
+    } else {
+        println!("Loading Phase 1 tablebase from {} ...", phase1_dir.display());
+    }
     let mut tb = Tablebase::new();
     let mut loaded = 0;
     for w in 3..=9u8 {
@@ -388,6 +522,11 @@ fn main() {
                 loaded += 1;
             }
         }
+    }
+    if serve {
+        eprintln!("Loaded {} subspaces. Entering --serve loop.", loaded);
+        serve_loop(&tb);
+        return;
     }
     println!("Loaded {} subspaces.\n", loaded);
 

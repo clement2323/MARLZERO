@@ -63,10 +63,26 @@ export const MOVE_EDGES: readonly (readonly [number, number])[] = _MOVE_EDGES;
 export const NUM_MOVE_ACTIONS = _MOVE_EDGES.length;
 export const ACTION_SPACE_SIZE = NUM_PLACE_CAPTURE_ACTIONS + NUM_MOVE_ACTIONS;
 
+// Fly action range — mirrors morris_rl/env/board.py FLY_ACTION_BASE.
+// Only used in the Flying variant when a player is down to 3 pieces and may
+// jump from any own piece to any empty cell. Encoded ABOVE ACTION_SPACE_SIZE
+// so the network's policy head (no-flying-only) is unaffected.
+export const FLY_ACTION_BASE = ACTION_SPACE_SIZE;
+export const NUM_FLY_ACTIONS = NUM_POSITIONS * NUM_POSITIONS;
+export const EXTENDED_ACTION_SPACE_SIZE = ACTION_SPACE_SIZE + NUM_FLY_ACTIONS;
+
 /** Decode a movement action index back to (src, dst). Returns null for
- *  non-movement actions (placement / capture range). */
+ *  non-movement actions (placement / capture range). Handles both the
+ *  packed adjacency range and the extended fly range. */
 export function decodeMoveAction(action: number): [number, number] | null {
   if (action < NUM_PLACE_CAPTURE_ACTIONS) return null;
+  if (action >= FLY_ACTION_BASE) {
+    const rel = action - FLY_ACTION_BASE;
+    const src = Math.floor(rel / NUM_POSITIONS);
+    const dst = rel % NUM_POSITIONS;
+    if (src >= NUM_POSITIONS || dst >= NUM_POSITIONS) return null;
+    return [src, dst];
+  }
   const idx = action - NUM_PLACE_CAPTURE_ACTIONS;
   if (idx < 0 || idx >= _MOVE_EDGES.length) return null;
   return _MOVE_EDGES[idx] as [number, number];
@@ -79,4 +95,13 @@ export function encodeMoveAction(src: number, dst: number): number {
     return -1;
   }
   return _EDGE_INDEX[src][dst];
+}
+
+/** Encode a flying move (any (src, dst), src != dst). The Python rules
+ *  engine accepts this in FLYING variant when the mover has 3 pieces. */
+export function encodeFlyAction(src: number, dst: number): number {
+  if (src < 0 || src >= NUM_POSITIONS || dst < 0 || dst >= NUM_POSITIONS) {
+    return -1;
+  }
+  return FLY_ACTION_BASE + src * NUM_POSITIONS + dst;
 }

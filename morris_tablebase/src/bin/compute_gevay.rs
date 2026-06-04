@@ -98,15 +98,21 @@ struct Args {
     save_to: Option<PathBuf>,
     max_total: u8,
     quick: bool,
+    /// RAM budget per WU in GB. Anything that would exceed this is skipped
+    /// rather than allocated — prevents OOM kills on (≥6,≥6) subspaces
+    /// where dense wave Vecs blow up to 50+ GB. Default: MemAvailable - 4 GB.
+    max_ram_gb: Option<f64>,
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: compute_gevay <PHASE1_DIR> [--save-to <DIR>] [--max-total N] [--quick]");
+        eprintln!("usage: compute_gevay <PHASE1_DIR> [--save-to <DIR>] [--max-total N] [--quick] [--max-ram-gb F]");
         eprintln!("  --quick: skip stats loading for subspaces with total > max_total + 2");
         eprintln!("           (ranks shown will be partial; useful when running in parallel with");
         eprintln!("            convert_to_v2 or testing a single small WU).");
+        eprintln!("  --max-ram-gb: WU RAM budget in GB. WUs whose dense Vecs would exceed");
+        eprintln!("                this are SKIPPED (logged, not solved). Default: MemAvailable - 4 GB.");
         std::process::exit(1);
     }
     let mut out = Args {
@@ -114,6 +120,7 @@ fn parse_args() -> Args {
         save_to: None,
         max_total: 6,
         quick: false,
+        max_ram_gb: None,
     };
     let mut i = 2;
     while i < args.len() {
@@ -130,10 +137,49 @@ fn parse_args() -> Args {
                 out.quick = true;
                 i += 1;
             }
+            "--max-ram-gb" => {
+                out.max_ram_gb = Some(args[i + 1].parse().expect("--max-ram-gb wants f64"));
+                i += 2;
+            }
             other => panic!("unknown arg: {}", other),
         }
     }
     out
+}
+
+/// Read /proc/meminfo `MemAvailable:` and return it in GB. Returns 0.0 on
+/// any parse error (the caller treats that as "no budget known" and falls
+/// back to a conservative default).
+fn read_mem_available_gb() -> f64 {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0.0; };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().split_whitespace().next()
+                .and_then(|t| t.parse().ok()).unwrap_or(0);
+            return (kb as f64) / 1e6;  // kB → GB
+        }
+    }
+    0.0
+}
+
+/// Estimate peak RAM (in GB) `solve_esc_work_unit` / `solve_pair_work_unit`
+/// will allocate on top of whatever's already live.
+///
+/// Per primary, solve_esc allocates 5 dense Vecs of length n_states:
+/// first_key:i16 (2) + dtw:i16 (2) + count:u32 (4) + resolved:bool (1) +
+/// has_draw_for_q:bool (1) = 10 bytes/slot. Pair WUs solve the two primaries
+/// sequentially; between calls only the returned (fk, dtw) = 4 bytes/slot
+/// for the first primary remains live, so peak = max(10·n1, 4·n1 + 10·n2).
+fn estimate_wu_ram_gb(wu: &morris_tablebase::work_unit::WorkUnit) -> f64 {
+    let n0 = wu.primary[0].n_states() as f64;
+    if wu.is_esc {
+        10.0 * n0 / 1e9
+    } else {
+        let n1 = wu.primary[1].n_states() as f64;
+        let peak_first = 10.0 * n0;
+        let peak_second = 4.0 * n0 + 10.0 * n1;
+        peak_first.max(peak_second) / 1e9
+    }
 }
 
 fn main() {
@@ -238,11 +284,19 @@ fn main() {
             s.w_board, s.b_board, v, r, marker);
     }
 
-    // Step 4 — solve each WU in topological order (filtered by --max-total).
+    // Step 4 — solve each WU in topological order (filtered by --max-total
+    // and the RAM budget). Resolve the budget once up front so the loop
+    // doesn't re-read /proc/meminfo per WU (which could flap as pages free).
+    let ram_budget_gb = cli.max_ram_gb.unwrap_or_else(|| {
+        let avail = read_mem_available_gb();
+        if avail <= 0.0 { 20.0 } else { (avail - 4.0).max(4.0) }
+    });
+    println!("\nRAM budget per WU: {:.1} GB (override with --max-ram-gb)", ram_budget_gb);
+
     let to_solve: Vec<&WorkUnit> = all_wus.iter()
         .filter(|wu| wu.total_pieces() <= cli.max_total)
         .collect();
-    println!("\n=== Solving {} WUs (total_pieces <= {}) ===\n",
+    println!("=== Solving {} WUs (total_pieces <= {}) ===\n",
         to_solve.len(), cli.max_total);
 
     // Build a Tablebase from the mmap tables that the wave will use for
@@ -254,6 +308,7 @@ fn main() {
     }
 
     let total_t = std::time::Instant::now();
+    let mut skipped_for_ram: Vec<String> = Vec::new();
     for (i, wu) in to_solve.iter().enumerate() {
         let wu_label = if wu.is_esc {
             format!("ESC ({}, {})", wu.primary[0].w_board, wu.primary[0].b_board)
@@ -262,8 +317,22 @@ fn main() {
                 wu.primary[0].w_board, wu.primary[0].b_board,
                 wu.primary[1].w_board, wu.primary[1].b_board)
         };
+
+        // Pre-check the RAM budget. The wave allocates 10 bytes/slot ×
+        // n_states dense Vecs per primary; for big subspaces this dwarfs
+        // physical RAM and triggers the OOM-killer mid-WU. Skipping here
+        // lets compute_gevay finish all the smaller WUs cleanly.
+        let need_gb = estimate_wu_ram_gb(wu);
+        if need_gb > ram_budget_gb {
+            println!("[{}/{}] {} — SKIP (estimated {:.1} GB > budget {:.1} GB)",
+                i + 1, to_solve.len(), wu_label, need_gb, ram_budget_gb);
+            skipped_for_ram.push(format!("{} ({:.1} GB)", wu_label, need_gb));
+            continue;
+        }
+
         let t_wu = std::time::Instant::now();
-        println!("[{}/{}] {} — solving...", i + 1, to_solve.len(), wu_label);
+        println!("[{}/{}] {} — solving (est. {:.1} GB)...",
+            i + 1, to_solve.len(), wu_label, need_gb);
 
         let results: Vec<(Vec<i16>, Vec<i16>)> = if wu.is_esc {
             let rank0 = *ranks.get(&wu.primary[0]).unwrap_or(&0);
@@ -300,6 +369,15 @@ fn main() {
         }
     }
 
+    let solved = to_solve.len() - skipped_for_ram.len();
     println!("\n=== complete: {} WUs solved in {:.1}s ===",
-        to_solve.len(), total_t.elapsed().as_secs_f64());
+        solved, total_t.elapsed().as_secs_f64());
+    if !skipped_for_ram.is_empty() {
+        println!("\nSkipped for RAM budget ({} WUs):", skipped_for_ram.len());
+        for s in &skipped_for_ram {
+            println!("  {}", s);
+        }
+        println!("\nRe-run with --max-ram-gb to raise the budget if you have more RAM,");
+        println!("or wait until the wave is rewritten to stream by rank_w bucket.");
+    }
 }

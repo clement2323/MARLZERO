@@ -90,6 +90,15 @@ for _k, (_src, _dst) in enumerate(MOVE_EDGES):
     EDGE_INDEX[_src, _dst] = NUM_PLACE_CAPTURE_ACTIONS + _k
 EDGE_INDEX.setflags(write=False)
 
+# Fly action range — only used in the Flying variant when a player is down
+# to 3 pieces. Indices ABOVE ACTION_SPACE_SIZE so the network's policy head
+# (sized to ACTION_SPACE_SIZE) is unaffected: no-flying training never emits
+# fly actions, and the FlyingHybrid agent that does bypasses the network
+# anyway. encode_fly_action(src, dst) = FLY_ACTION_BASE + src*24 + dst.
+FLY_ACTION_BASE: Final[int] = ACTION_SPACE_SIZE
+NUM_FLY_ACTIONS: Final[int] = NUM_POSITIONS * NUM_POSITIONS  # 576
+EXTENDED_ACTION_SPACE_SIZE: Final[int] = ACTION_SPACE_SIZE + NUM_FLY_ACTIONS  # 656
+
 # Source / destination arrays for vectorised symmetry remapping.
 _EDGE_SRC: Final[npt.NDArray[np.intp]] = np.array(
     [e[0] for e in MOVE_EDGES], dtype=np.intp

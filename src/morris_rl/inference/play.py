@@ -12,9 +12,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from morris_rl.env.board import ACTION_SPACE_SIZE, MOVE_EDGES, NUM_PLACE_CAPTURE_ACTIONS
+from morris_rl.env.board import (
+    ACTION_SPACE_SIZE,
+    FLY_ACTION_BASE,
+    MOVE_EDGES,
+    NUM_PLACE_CAPTURE_ACTIONS,
+    NUM_POSITIONS,
+)
 from morris_rl.env.rules import (
     GameState,
+    Variant,
     apply_action,
     get_legal_actions,
     initial_state,
@@ -55,19 +62,31 @@ def describe_action(action: int, must_capture: bool) -> str:
         if must_capture:
             return f"Capture {label}"
         return f"Place at {label}"
+    if action >= FLY_ACTION_BASE:
+        rel = action - FLY_ACTION_BASE
+        src = rel // NUM_POSITIONS
+        dst = rel % NUM_POSITIONS
+        return f"Fly {POSITION_LABELS[src]} → {POSITION_LABELS[dst]}"
     src, dst = MOVE_EDGES[action - NUM_PLACE_CAPTURE_ACTIONS]
     return f"Move {POSITION_LABELS[src]} → {POSITION_LABELS[dst]}"
 
 
-def reconstruct_state(actions: list[int]) -> GameState:
+def reconstruct_state(
+    actions: list[int],
+    variant: Variant = Variant.NO_FLYING,
+) -> GameState:
     """Replay *actions* from the initial state and return the resulting state.
 
     Each action is validated against the legal set at its turn. An invalid move
     (e.g. capturing a piece protected by a mill while non-mill targets exist)
     raises :class:`IllegalActionError` with the offending action index. Stops
     early if the game ends before all actions are consumed.
+
+    *variant* controls the rules variant: pass ``Variant.FLYING`` for the
+    classical fly-at-3-pieces variant. The web demo plumbs this through
+    based on a user toggle.
     """
-    state = initial_state()
+    state = initial_state(variant=variant)
     for i, action in enumerate(actions):
         done, _ = is_terminal(state)
         if done:

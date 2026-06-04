@@ -40,6 +40,12 @@ function statusMessage(
 
 export default function App() {
   const { gs, legalActions, handlePositionClick, resetGame, setSelectedAgent } = useGame();
+
+  const handleVariantChange = (newVariant: "flying" | "no-flying") => {
+    if (newVariant === gs.variant) return;
+    // Variant changes restart the game — different rules from move 1.
+    resetGame(gs.humanPlayer, newVariant);
+  };
   const { jitter, trigger: triggerShake } = useShake();
   const [loserKey, setLoserKey] = useState(0);
   const losingValueStreakRef = useRef(0);
@@ -154,6 +160,24 @@ export default function App() {
               className={`btn${gs.humanPlayer === 2 ? " is-active-black" : ""}`}
             >
               ● Black
+            </button>
+          </div>
+
+          <div className="controls">
+            <span className="controls-label">Variant</span>
+            <button
+              onClick={() => handleVariantChange("flying")}
+              className={`btn${gs.variant === "flying" ? " is-active-white" : ""}`}
+              title="Classical: at 3 pieces a player may fly to any empty cell"
+            >
+              ✈ Flying
+            </button>
+            <button
+              onClick={() => handleVariantChange("no-flying")}
+              className={`btn${gs.variant === "no-flying" ? " is-active-white" : ""}`}
+              title="Strict: adjacency-only even at 3 pieces"
+            >
+              → No-Flying
             </button>
           </div>
 

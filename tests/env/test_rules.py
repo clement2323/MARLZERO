@@ -561,3 +561,117 @@ def test_random_late_game_state_rejects_invalid_piece_counts() -> None:
         random_late_game_state(rng, pieces_per_player=2)
     with pytest.raises(ValueError):
         random_late_game_state(rng, pieces_per_player=NUM_POSITIONS)
+
+
+# ---------------------------------------------------------------------------
+# Flying variant
+# ---------------------------------------------------------------------------
+
+
+def _three_pieces_flying_state(white_positions: list[int], black_positions: list[int],
+                                stm: int = PLAYER_1) -> "GameState":
+    from morris_rl.env.rules import GameState, Variant
+    board = np.zeros(NUM_POSITIONS, dtype=np.int8)
+    for p in white_positions:
+        board[p] = PLAYER_1
+    for p in black_positions:
+        board[p] = PLAYER_2
+    return GameState(
+        board=board,
+        current_player=stm,
+        pieces_in_hand=(0, 0),
+        must_capture=False,
+        halfmove_clock=0,
+        variant=Variant.FLYING,
+    )
+
+
+def test_no_flying_variant_at_3_pieces_uses_adjacency() -> None:
+    """In NO_FLYING (default), 3 pieces still only allows adjacency moves."""
+    from morris_rl.env.rules import GameState
+    # White: a7, d7, g7 (top outer row). Black: a1, d1, g1 (bottom outer row).
+    # The middle of the board is empty. White at d7=1 can only move to
+    # adjacent empty: 0 (a7 occupied), 2 (g7 occupied), 9 (d6). So d7→d6.
+    board = np.zeros(NUM_POSITIONS, dtype=np.int8)
+    board[0] = board[1] = board[2] = PLAYER_1
+    board[4] = board[5] = board[6] = PLAYER_2
+    state = GameState(
+        board=board,
+        current_player=PLAYER_1,
+        pieces_in_hand=(0, 0),
+        must_capture=False,
+        halfmove_clock=0,
+    )
+    actions = get_legal_actions(state)
+    # All actions must be in the adjacency range, none in the fly range.
+    from morris_rl.env.board import FLY_ACTION_BASE
+    assert all(a < FLY_ACTION_BASE for a in actions)
+    assert actions, "should still have at least some adjacency moves"
+
+
+def test_flying_variant_at_3_pieces_allows_any_to_any() -> None:
+    """In FLYING with exactly 3 own pieces, returns FLY_ACTION_BASE-encoded
+    moves from every own piece to every empty position."""
+    from morris_rl.env.board import FLY_ACTION_BASE
+    # White at corners 0, 2, 6. Black at 4, 5, 13. STM = white.
+    state = _three_pieces_flying_state([0, 2, 6], [4, 5, 13])
+    actions = get_legal_actions(state)
+    # All actions must use the fly encoding.
+    assert all(a >= FLY_ACTION_BASE for a in actions), (
+        f"some non-fly actions leaked: {[a for a in actions if a < FLY_ACTION_BASE]}"
+    )
+    # Count: 3 own pieces × (24 - 6 occupied) = 3 × 18 = 54 fly actions.
+    expected = 3 * (NUM_POSITIONS - 6)
+    assert len(actions) == expected, f"expected {expected}, got {len(actions)}"
+    # Decode all and verify each is (own_piece -> empty).
+    for a in actions:
+        rel = a - FLY_ACTION_BASE
+        src = rel // NUM_POSITIONS
+        dst = rel % NUM_POSITIONS
+        assert state.board[src] == PLAYER_1
+        assert state.board[dst] == 0
+
+
+def test_flying_variant_above_3_pieces_still_uses_adjacency() -> None:
+    """Flying only triggers at exactly 3 pieces. With 4+ pieces adjacency wins."""
+    from morris_rl.env.board import FLY_ACTION_BASE
+    from morris_rl.env.rules import GameState, Variant
+    board = np.zeros(NUM_POSITIONS, dtype=np.int8)
+    # White: 4 pieces. Black: 4 pieces.
+    for p in [0, 1, 2, 3]:
+        board[p] = PLAYER_1
+    for p in [4, 5, 6, 7]:
+        board[p] = PLAYER_2
+    state = GameState(
+        board=board,
+        current_player=PLAYER_1,
+        pieces_in_hand=(0, 0),
+        must_capture=False,
+        halfmove_clock=0,
+        variant=Variant.FLYING,
+    )
+    actions = get_legal_actions(state)
+    # With 4 pieces under flying, adjacency still applies.
+    assert all(a < FLY_ACTION_BASE for a in actions)
+
+
+def test_flying_apply_action_roundtrip() -> None:
+    """A fly action applied to a state must produce the correct board change."""
+    from morris_rl.env.board import FLY_ACTION_BASE
+    state = _three_pieces_flying_state([0, 2, 6], [4, 5, 13])
+    # Fly white from 0 to 12 (non-adjacent — would be illegal under no-flying).
+    fly_action = FLY_ACTION_BASE + 0 * NUM_POSITIONS + 12
+    assert fly_action in get_legal_actions(state)
+    next_state = apply_action(state, fly_action)
+    assert next_state.board[0] == 0
+    assert next_state.board[12] == PLAYER_1
+    assert next_state.variant == state.variant  # propagated through copy()
+
+
+def test_initial_state_propagates_variant() -> None:
+    """initial_state(variant=FLYING) must put FLYING into the state."""
+    from morris_rl.env.rules import Variant, initial_state
+    s_default = initial_state()
+    assert s_default.variant == Variant.NO_FLYING
+    s_flying = initial_state(variant=Variant.FLYING)
+    assert s_flying.variant == Variant.FLYING

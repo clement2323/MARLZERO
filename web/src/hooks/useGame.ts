@@ -1,12 +1,28 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { fetchAgents, fetchNewGame, fetchPlay, fetchState } from "../api/client";
+import type { Variant } from "../api/client";
 import type { AgentOption, BoardState, MoveInfo, PlayResponse } from "../types/game";
 import {
   ADJACENCY,
   EDGE_INDEX,
+  FLY_ACTION_BASE,
   NUM_PLACE_CAPTURE_ACTIONS,
   decodeMoveAction,
+  encodeFlyAction,
 } from "../utils/actions";
+
+const VARIANT_STORAGE_KEY = "morris.variant";
+
+function loadVariant(): Variant {
+  if (typeof window === "undefined") return "flying";
+  const v = window.localStorage.getItem(VARIANT_STORAGE_KEY);
+  return v === "no-flying" ? "no-flying" : "flying";
+}
+
+function saveVariant(v: Variant): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(VARIANT_STORAGE_KEY, v);
+}
 
 // Must stay in sync with morris_rl/inference/play.py POSITION_LABELS
 const POSITION_LABELS: string[] = [
@@ -33,7 +49,8 @@ function describeAction(action: number, mustCapture: boolean): string {
   const decoded = decodeMoveAction(action);
   if (decoded) {
     const [src, dst] = decoded;
-    return `${POSITION_LABELS[src]} → ${POSITION_LABELS[dst]}`;
+    const arrow = action >= FLY_ACTION_BASE ? "✈" : "→";
+    return `${POSITION_LABELS[src]} ${arrow} ${POSITION_LABELS[dst]}`;
   }
   return `move ${action}`;
 }
@@ -67,6 +84,7 @@ export interface GameState {
   agentDescription: string;
   agentName: string;
   humanPlayer: 1 | 2;   // 1 = white (moves first), 2 = black
+  variant: Variant;     // "flying" allows fly-at-3-pieces; "no-flying" is adjacency-only
   status: "idle" | "thinking" | "waiting_human" | "game_over" | "error";
   errorMsg: string;
   serverReady: boolean;
@@ -91,7 +109,7 @@ function findNewlyOccupied(prev: number[], next: number[]): number | null {
 
 const INITIAL_BOARD = Array<number>(24).fill(0);
 
-function initialState(humanPlayer: 1 | 2 = 1): GameState {
+function initialState(humanPlayer: 1 | 2 = 1, variant: Variant = "flying"): GameState {
   return {
     board: INITIAL_BOARD,
     currentPlayer: 1,
@@ -111,6 +129,7 @@ function initialState(humanPlayer: 1 | 2 = 1): GameState {
     agentDescription: "",
     agentName: "",
     humanPlayer,
+    variant,
     status: "idle",
     errorMsg: "",
     serverReady: false,
@@ -135,11 +154,14 @@ function applyBoardState(gs: GameState, bs: BoardState): GameState {
 }
 
 export function useGame() {
-  const [gs, setGs] = useState<GameState>(() => initialState(1));
+  const [gs, setGs] = useState<GameState>(() => initialState(1, loadVariant()));
   // Latest selected agent for in-flight network calls. Mirrors gs.selectedAgent
   // so the long-lived useCallbacks below can read the freshest value without
   // having to be re-created on every state change.
   const selectedAgentRef = useRef<string | null>(null);
+  // Latest variant — same pattern as selectedAgentRef so the network callbacks
+  // can read it without being recreated when it changes.
+  const variantRef = useRef<Variant>(gs.variant);
 
   // The agent runs on the post-action state; it must continue while it's still
   // its turn (e.g. it just formed a mill and now owes a capture).
@@ -149,7 +171,7 @@ export function useGame() {
     // so the loser overlay fires close to the game-ending move instead of
     // lagging by most of a second.
     const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 280));
-    Promise.all([fetchPlay(actions, selectedAgentRef.current), minDelay])
+    Promise.all([fetchPlay(actions, selectedAgentRef.current, variantRef.current), minDelay])
       .then(([resp]: [PlayResponse, void]) => {
         const newActions = [...actions, resp.action];
         const agentPlayer = humanPlayer === 1 ? 2 : 1;
@@ -196,7 +218,7 @@ export function useGame() {
   // the human's capture target. Only call the agent when control has passed.
   const proceedAfterHuman = useCallback(
     (actions: number[], humanPlayer: 1 | 2) => {
-      fetchState(actions)
+      fetchState(actions, variantRef.current)
         .then((bs) => {
           if (bs.game_over) {
             setGs((prev) => ({
@@ -228,14 +250,16 @@ export function useGame() {
   );
 
   const startGame = useCallback(
-    (humanPlayer: 1 | 2) => {
-      fetchNewGame()
+    (humanPlayer: 1 | 2, variant: Variant = variantRef.current) => {
+      variantRef.current = variant;
+      fetchNewGame(variant)
         .then((bs) => {
-          const fresh = initialState(humanPlayer);
+          const fresh = initialState(humanPlayer, variant);
           setGs({
             ...fresh,
             ...applyBoardState(fresh, bs),
             humanPlayer,
+            variant,
             status: humanPlayer === 1 ? "waiting_human" : "thinking",
             serverReady: true,
           });
@@ -259,7 +283,7 @@ export function useGame() {
   );
 
   useEffect(() => {
-    startGame(1);
+    startGame(1, loadVariant());
   }, [startGame]);
 
   // Fetch the agent catalog once and seed the default selection.
@@ -285,8 +309,9 @@ export function useGame() {
   }, []);
 
   const resetGame = useCallback(
-    (humanPlayer: 1 | 2 = gs.humanPlayer) => {
-      startGame(humanPlayer);
+    (humanPlayer: 1 | 2 = gs.humanPlayer, variant: Variant = variantRef.current) => {
+      saveVariant(variant);
+      startGame(humanPlayer, variant);
     },
     [startGame, gs.humanPlayer]
   );
@@ -359,14 +384,23 @@ export function useGame() {
         return;
       }
 
-      // Commit movement — use the packed edge encoding so it matches the
-      // backend's MOVE_EDGES table (not the legacy 24×24 dense layout).
-      const action = EDGE_INDEX[selectedPos][pos];
+      // Commit movement. Adjacent moves use the packed edge encoding
+      // (matches the backend's MOVE_EDGES table). When flying is active
+      // (variant=flying, mover has 3 pieces) we fall back to the extended
+      // fly encoding above ACTION_SPACE_SIZE so non-adjacent moves are also
+      // representable.
+      const ownPieces = board.filter((x) => x === currentPlayer).length;
+      const isFlying = gs.variant === "flying" && ownPieces === 3;
+      let action = EDGE_INDEX[selectedPos][pos];
       if (action < 0) {
-        // Not an adjacent position — bail out instead of sending a bogus
-        // action the server will reject.
-        return;
+        if (isFlying) {
+          action = encodeFlyAction(selectedPos, pos);
+        } else {
+          // Not an adjacent position and we're not flying — bail out.
+          return;
+        }
       }
+      if (action < 0) return;
       const newActions = [...actions, action];
       const newBoard = [...board];
       newBoard[selectedPos] = 0;
@@ -387,7 +421,7 @@ export function useGame() {
 
   const legalActions: number[] = gs.status === "waiting_human"
     ? (() => {
-        const { mustCapture, piecesInHand, currentPlayer, selectedPos, board, serverLegalActions } = gs;
+        const { mustCapture, piecesInHand, currentPlayer, selectedPos, board, serverLegalActions, variant } = gs;
         // Capture is rule-heavy (mill protection); always trust the server.
         if (mustCapture) {
           return serverLegalActions;
@@ -395,10 +429,15 @@ export function useGame() {
         if (piecesInHand[currentPlayer - 1] > 0) {
           return board.map((owner, i) => (owner === 0 ? i : -1)).filter((i) => i >= 0);
         }
+        const ownPieces = board.filter((x) => x === currentPlayer).length;
+        const isFlying = variant === "flying" && ownPieces === 3;
         if (selectedPos !== null) {
-          // Only adjacent EMPTY squares are legal destinations. EDGE_INDEX
-          // gives -1 for non-adjacent pairs so we filter both conditions in
-          // one pass — keeps the legal set aligned with the backend.
+          if (isFlying) {
+            // Fly mode: any empty cell is a legal destination from any own piece.
+            return board
+              .map((owner, dst) => (owner === 0 ? encodeFlyAction(selectedPos, dst) : -1))
+              .filter((a) => a >= 0);
+          }
           return ADJACENCY[selectedPos]
             .filter((dst) => board[dst] === 0)
             .map((dst) => EDGE_INDEX[selectedPos][dst]);
