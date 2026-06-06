@@ -58,6 +58,10 @@ pub const VERSION_V2: u16 = 2;
 pub const PAYLOAD_PHASE1: u8 = 0;
 pub const PAYLOAD_GEVAY: u8 = 1;
 pub const PAYLOAD_PHASE1_V2: u8 = 10;
+/// Phase 2 V_Gévay stored in canonical-only layout (one slot per D4 orbit
+/// × WTM/BTM). Length = `2 × n_canonical_entries`, indexed by
+/// [`crate::gevay::canonical_indexer::CanonicalIndexer::canonical_index`].
+pub const PAYLOAD_GEVAY_CANONICAL: u8 = 11;
 
 /// Parsed header. Field interpretation depends on (`version`, `payload_type`).
 pub struct Header {
@@ -555,6 +559,69 @@ pub fn load_gevay(path: &Path) -> io::Result<(Vec<i16>, Vec<i16>, Variant, Subsp
 
     let first_key = read_i16_le_vec(&mut r, n_states)?;
     let dtw = read_i16_le_vec(&mut r, n_states)?;
+    Ok((first_key, dtw, h.variant, h.subspace))
+}
+
+/// Phase 2 V_Gévay save (canonical-only layout).
+///
+/// The Phase 2 wave produces `first_key` / `dtw` arrays sized to
+/// `n_states_canonical = 2 × n_canonical_entries` (one slot per D4 orbit
+/// × WTM/BTM), indexed by [`CanonicalIndexer::canonical_index`]. This
+/// writer persists exactly that — no dense expansion. Readers reconstruct
+/// the index by calling `CanonicalIndexer::build(subspace)` from the
+/// header's subspace field.
+///
+/// Payload format (payload_type = [`PAYLOAD_GEVAY_CANONICAL`] = 11):
+/// - Header: same 32-byte layout as save_gevay. Bytes 12..20 hold
+///   `n_states_canonical` u64 LE (= length of each array).
+/// - Body: `first_key i16 LE[n] || dtw i16 LE[n]` where n = n_states_canonical.
+pub fn save_gevay_canonical(
+    subspace: Subspace,
+    variant: Variant,
+    first_key: &[i16],
+    dtw: &[i16],
+    path: &Path,
+) -> io::Result<()> {
+    assert_eq!(first_key.len(), dtw.len(), "first_key/dtw length mismatch");
+    let f = File::create(path)?;
+    let mut w = BufWriter::new(f);
+
+    let n_states_canonical = first_key.len() as u64;
+    let mut header = [0u8; 32];
+    header[0..4].copy_from_slice(&MAGIC);
+    header[4..6].copy_from_slice(&VERSION_V1.to_le_bytes());
+    header[6] = variant_byte(variant);
+    header[7] = PAYLOAD_GEVAY_CANONICAL;
+    header[8] = subspace.w_board;
+    header[9] = subspace.b_board;
+    header[10] = subspace.w_to_place;
+    header[11] = subspace.b_to_place;
+    header[12..20].copy_from_slice(&n_states_canonical.to_le_bytes());
+    w.write_all(&header)?;
+
+    write_i16_le_chunked(&mut w, first_key)?;
+    write_i16_le_chunked(&mut w, dtw)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Counterpart of [`save_gevay_canonical`]. Returns `(first_key, dtw, variant, subspace)`
+/// where the arrays are indexed by `CanonicalIndexer::build(subspace).canonical_index(..)`.
+pub fn load_gevay_canonical(path: &Path) -> io::Result<(Vec<i16>, Vec<i16>, Variant, Subspace)> {
+    let f = File::open(path)?;
+    let mut r = BufReader::new(f);
+
+    let mut header = [0u8; 32];
+    r.read_exact(&mut header)?;
+    let h = parse_header(&header)?;
+    if h.payload_type != PAYLOAD_GEVAY_CANONICAL {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("expected payload_type={} (Gévay canonical), got {}",
+                PAYLOAD_GEVAY_CANONICAL, h.payload_type)));
+    }
+    let n = h.n_primary as usize;
+    let first_key = read_i16_le_vec(&mut r, n)?;
+    let dtw = read_i16_le_vec(&mut r, n)?;
     Ok((first_key, dtw, h.variant, h.subspace))
 }
 

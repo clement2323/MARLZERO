@@ -8,5 +8,6 @@
 //! - `multi_value` (TODO) : Section IV-B multi-valued retrograde wave.
 //! - `dtw_adjusted` (TODO) : Section IV-B-2 DTW direction by first-key sign.
 
+pub mod canonical_indexer;
 pub mod multi_value;
 pub mod subspace_rank;

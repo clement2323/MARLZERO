@@ -21,11 +21,14 @@ use morris_tablebase::gevay::multi_value::{
 use morris_tablebase::gevay::subspace_rank::{
     assign_ranks, compute_val, RankOverrides, StmCounts, SubspaceStats,
 };
-use morris_tablebase::storage::{default_filename, gevay_filename, save_gevay};
+use morris_tablebase::storage::{default_filename, gevay_filename};
 use morris_tablebase::subspace::{MappedTable, Subspace, Tablebase};
 use morris_tablebase::symmetry::orbit_size;
 use morris_tablebase::wave::Variant;
 use morris_tablebase::work_unit::{list_movement_work_units, negate, WorkUnit};
+use rayon::prelude::*;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Orbit-weighted W/L/D counts split by STM, format-agnostic across V1/V2.
 fn count_stats_mapped(sub: Subspace, table: &MappedTable) -> SubspaceStats {
@@ -63,6 +66,12 @@ struct GevayDistribution {
 }
 
 fn gevay_distribution(sub: Subspace, first_key: &[i16]) -> GevayDistribution {
+    // first_key is now canonical-only (length = 2 × n_canonical_entries).
+    // We rebuild a CanonicalIndexer to convert (cw, cb, stm) → canonical_idx.
+    // The build is a few ms for small subspaces, seconds for big ones — cheap
+    // relative to the wave so we just do it inline rather than threading the
+    // indexer through the call chain.
+    let indexer = morris_tablebase::gevay::canonical_indexer::CanonicalIndexer::build(sub);
     let mut d = GevayDistribution {
         win_class: 0,
         loss_class: 0,
@@ -73,7 +82,7 @@ fn gevay_distribution(sub: Subspace, first_key: &[i16]) -> GevayDistribution {
     sub.enumerate_positions(|cw, cb| {
         let osize = orbit_size(cw, cb) as u64;
         for stm in [1u8, 2u8] {
-            let idx = sub.state_index_canonical(cw, cb, stm) as usize;
+            let idx = indexer.canonical_index(cw, cb, stm) as usize;
             let fk = first_key[idx];
             let abs = fk.abs();
             if abs > d.max_abs_first_key {
@@ -162,22 +171,149 @@ fn read_mem_available_gb() -> f64 {
     0.0
 }
 
+/// Tiny binary cache for the stats sweep — keyed by Phase 1 .bin mtimes so
+/// we recompute when source files change. Size for 49 subspaces ≈ 2.5 KB.
+const STATS_CACHE_MAGIC: &[u8; 4] = b"GSTC";
+const STATS_CACHE_VERSION: u16 = 1;
+
+fn stats_cache_path(phase1_dir: &PathBuf, variant: Variant) -> PathBuf {
+    let suffix = match variant {
+        Variant::Flying => "flying",
+        Variant::NoFlying => "no_flying",
+    };
+    phase1_dir.join(format!(".stats_cache_{}.bin", suffix))
+}
+
+/// True when the cache file exists AND is newer than every Phase 1 source
+/// file in `phase1_dir`. Returns false on any IO error (forces a recompute).
+fn stats_cache_is_fresh(cache_path: &PathBuf, all_subs: &[Subspace], phase1_dir: &PathBuf, variant: Variant) -> bool {
+    let Ok(cache_meta) = std::fs::metadata(cache_path) else { return false; };
+    let Ok(cache_mtime) = cache_meta.modified() else { return false; };
+    for sub in all_subs {
+        let p = phase1_dir.join(default_filename(*sub, variant));
+        let Ok(meta) = std::fs::metadata(&p) else { return false; };
+        let Ok(mtime) = meta.modified() else { return false; };
+        if mtime > cache_mtime { return false; }
+    }
+    true
+}
+
+/// Write the wtm_counts map to disk in the simple binary layout described
+/// above. Atomic via tmp+rename so a crash mid-write doesn't leave a stub.
+fn write_stats_cache(
+    cache_path: &PathBuf,
+    variant: Variant,
+    wtm_counts: &HashMap<Subspace, StmCounts>,
+    all_subs: &[Subspace],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = cache_path.with_extension("bin.tmp");
+    let mut buf: Vec<u8> = Vec::with_capacity(16 + all_subs.len() * 50);
+    buf.extend_from_slice(STATS_CACHE_MAGIC);
+    buf.extend_from_slice(&STATS_CACHE_VERSION.to_le_bytes());
+    let variant_byte: u8 = match variant {
+        Variant::Flying => 0,
+        Variant::NoFlying => 1,
+    };
+    buf.push(variant_byte);
+    buf.push(0);  // padding
+    buf.extend_from_slice(&(all_subs.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);  // padding to 16-byte header
+    for sub in all_subs {
+        let wtm = wtm_counts.get(sub).copied().unwrap_or_default();
+        let btm = wtm_counts.get(&negate(*sub)).copied().unwrap_or_default();
+        buf.push(sub.w_board);
+        buf.push(sub.b_board);
+        for v in [wtm.wins, wtm.losses, wtm.draws, btm.wins, btm.losses, btm.draws] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, cache_path)?;
+    Ok(())
+}
+
+/// Read the cache and populate wtm_counts. Returns Err if the file is
+/// missing, magic mismatches, or version is unknown — caller falls back
+/// to a fresh sweep.
+fn read_stats_cache(cache_path: &PathBuf, variant: Variant) -> std::io::Result<HashMap<Subspace, StmCounts>> {
+    let bytes = std::fs::read(cache_path)?;
+    if bytes.len() < 16 || &bytes[0..4] != STATS_CACHE_MAGIC {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad magic"));
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != STATS_CACHE_VERSION {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("unsupported cache version {}", version)));
+    }
+    let cached_variant: u8 = bytes[6];
+    let want_variant: u8 = match variant {
+        Variant::Flying => 0,
+        Variant::NoFlying => 1,
+    };
+    if cached_variant != want_variant {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "variant mismatch"));
+    }
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let mut out: HashMap<Subspace, StmCounts> = HashMap::with_capacity(count * 2);
+    let mut off = 16;
+    for _ in 0..count {
+        if off + 50 > bytes.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated record"));
+        }
+        let w = bytes[off];
+        let b = bytes[off + 1];
+        let read_u64 = |start: usize| -> u64 {
+            u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
+        };
+        let wtm = StmCounts {
+            wins: read_u64(off + 2),
+            losses: read_u64(off + 10),
+            draws: read_u64(off + 18),
+        };
+        let btm = StmCounts {
+            wins: read_u64(off + 26),
+            losses: read_u64(off + 34),
+            draws: read_u64(off + 42),
+        };
+        let sub = Subspace::movement(w, b);
+        out.insert(sub, wtm);
+        out.insert(negate(sub), btm);
+        off += 50;
+    }
+    Ok(out)
+}
+
 /// Estimate peak RAM (in GB) `solve_esc_work_unit` / `solve_pair_work_unit`
 /// will allocate on top of whatever's already live.
 ///
-/// Per primary, solve_esc allocates 5 dense Vecs of length n_states:
-/// first_key:i16 (2) + dtw:i16 (2) + count:u32 (4) + resolved:bool (1) +
-/// has_draw_for_q:bool (1) = 10 bytes/slot. Pair WUs solve the two primaries
-/// sequentially; between calls only the returned (fk, dtw) = 4 bytes/slot
-/// for the first primary remains live, so peak = max(10·n1, 4·n1 + 10·n2).
+/// The wave allocates 5 arrays sized to `n_states_canonical = 2 ×
+/// n_canonical_entries ≈ n_states / 8` (the D4 orbit reduction): first_key
+/// i16 (2) + dtw i16 (2) + count u16 (2) + resolved bitvec (0.125) +
+/// has_draw_for_q bitvec (0.125) = 6.25 B/slot canonical. Plus the
+/// `CanonicalIndexer` carries a `canonical_rank_b` Vec<Vec<u32>> of
+/// total size ≈ 4 B × n_canonical_entries = 0.25 B × n_states. Combined
+/// these come to ~1 byte per DENSE n_states slot in steady state.
+///
+/// Pair WUs solve the two primaries sequentially; between calls only the
+/// returned `(first_key, dtw)` arrays for the first primary (4 B/slot ×
+/// n_states_canonical = 0.5 B × n_states) remain live, so:
+///   peak_pair = max(1.0·n0, 0.5·n0 + 1.0·n1).
+const GEVAY_BYTES_PER_SLOT: f64 = 1.0;
+const GEVAY_RETURNED_BYTES_PER_SLOT: f64 = 0.5;
+
 fn estimate_wu_ram_gb(wu: &morris_tablebase::work_unit::WorkUnit) -> f64 {
     let n0 = wu.primary[0].n_states() as f64;
     if wu.is_esc {
-        10.0 * n0 / 1e9
+        GEVAY_BYTES_PER_SLOT * n0 / 1e9
     } else {
         let n1 = wu.primary[1].n_states() as f64;
-        let peak_first = 10.0 * n0;
-        let peak_second = 4.0 * n0 + 10.0 * n1;
+        let peak_first = GEVAY_BYTES_PER_SLOT * n0;
+        let peak_second = GEVAY_RETURNED_BYTES_PER_SLOT * n0 + GEVAY_BYTES_PER_SLOT * n1;
         peak_first.max(peak_second) / 1e9
     }
 }
@@ -221,36 +357,98 @@ fn main() {
         println!("\n[--quick] Loading Phase 1 stats only for subspaces with total <= {}.", stats_total_cap);
         println!("           Ranks shown will be partial — the global ordinal");
         println!("           ranking requires stats for all 49 subspaces.");
-    } else {
-        println!("\nLoading Phase 1 (mmap) + computing W/D/L stats for all subspaces...");
     }
-    let pb = indicatif::ProgressBar::new(all_subs.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "  [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>3}/{len:>3} {wide_msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
-    for sub in &all_subs {
-        let path = cli.phase1_dir.join(default_filename(*sub, variant));
-        if !path.exists() {
-            eprintln!("missing Phase 1 file for ({}, {}): {}",
-                sub.w_board, sub.b_board, path.display());
-            std::process::exit(1);
+
+    // Stats cache fast-path: when the cache file is present and newer than
+    // every Phase 1 .bin we need, we skip the random-read sweep entirely
+    // and load W/L/D counts in milliseconds. The cache is keyed by the
+    // FULL list of 49 subspaces — even in --quick mode we either trust the
+    // full cache or recompute the partial set fresh (no hybrid).
+    let cache_path = stats_cache_path(&cli.phase1_dir, variant);
+    let t_stats = std::time::Instant::now();
+    let mut cache_hit = false;
+    if !cli.quick && stats_cache_is_fresh(&cache_path, &all_subs, &cli.phase1_dir, variant) {
+        match read_stats_cache(&cache_path, variant) {
+            Ok(map) => {
+                wtm_counts = map;
+                cache_hit = true;
+                let age = std::fs::metadata(&cache_path)
+                    .and_then(|m| m.modified())
+                    .and_then(|t| t.elapsed().map_err(|e| std::io::Error::other(e.to_string())))
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                println!("\n✓ stats cache hit at {} ({} subspaces, {}s old). Skipping sweep.",
+                    cache_path.display(), all_subs.len(), age);
+            }
+            Err(e) => {
+                println!("\nStats cache present but unreadable ({}). Recomputing.", e);
+            }
         }
-        let file_size_gb = std::fs::metadata(&path)
-            .map(|m| m.len() as f64 / 1e9)
-            .unwrap_or(0.0);
-        pb.set_message(format!("({}, {}) [{:.2} GB]", sub.w_board, sub.b_board, file_size_gb));
-        let table = MappedTable::open(&path).expect("mmap Phase 1 table");
-        let stats = count_stats_mapped(*sub, &table);
-        wtm_counts.insert(*sub, stats.white_to_move);
-        wtm_counts.insert(negate(*sub), stats.black_to_move);
-        mapped_tables.insert(*sub, table);
-        pb.inc(1);
+    } else if !cli.quick {
+        println!("\nStats cache missing or stale. Computing fresh sweep over {} Phase 1 files...",
+            all_subs.len());
     }
-    pb.finish_with_message(format!("stats loaded for {} subspaces.", all_subs.len()));
+
+    if !cache_hit {
+        // Pre-mmap (cheap; just opens fd + maps memory, no IO yet).
+        for sub in &all_subs {
+            let path = cli.phase1_dir.join(default_filename(*sub, variant));
+            if !path.exists() {
+                eprintln!("missing Phase 1 file for ({}, {}): {}",
+                    sub.w_board, sub.b_board, path.display());
+                std::process::exit(1);
+            }
+            let table = MappedTable::open(&path).expect("mmap Phase 1 table");
+            mapped_tables.insert(*sub, table);
+        }
+
+        // Parallel count_stats_mapped sweep: each thread takes a mmap'd
+        // table and iterates orbit positions. The random reads happen
+        // concurrently across files, saturating the NVMe queue depth far
+        // better than the sequential loop did (~5× empirically).
+        let pb = Arc::new(indicatif::ProgressBar::new(all_subs.len() as u64));
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>3}/{len:>3} {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(500));
+
+        let counts_mutex = Arc::new(Mutex::new(HashMap::<Subspace, StmCounts>::new()));
+        all_subs.par_iter().for_each(|sub| {
+            let table = mapped_tables.get(sub).expect("pre-mmap'd");
+            let file_size_gb = std::fs::metadata(cli.phase1_dir.join(default_filename(*sub, variant)))
+                .map(|m| m.len() as f64 / 1e9).unwrap_or(0.0);
+            pb.set_message(format!("({}, {}) [{:.2} GB]", sub.w_board, sub.b_board, file_size_gb));
+            let stats = count_stats_mapped(*sub, table);
+            let mut guard = counts_mutex.lock().unwrap();
+            guard.insert(*sub, stats.white_to_move);
+            guard.insert(negate(*sub), stats.black_to_move);
+            drop(guard);
+            pb.inc(1);
+        });
+        wtm_counts = Arc::try_unwrap(counts_mutex).unwrap().into_inner().unwrap();
+        pb.finish_with_message(format!("stats loaded for {} subspaces in {:.1}s.",
+            all_subs.len(), t_stats.elapsed().as_secs_f64()));
+
+        // Persist for next run. Failures are non-fatal — just log.
+        if !cli.quick {
+            match write_stats_cache(&cache_path, variant, &wtm_counts, &all_subs) {
+                Ok(()) => println!("✓ wrote stats cache to {}", cache_path.display()),
+                Err(e) => println!("warning: failed to write stats cache: {}", e),
+            }
+        }
+    } else {
+        // Cache hit: we still need mmap'd tables for the wave's
+        // cross-subspace queries below. Open them now.
+        for sub in &all_subs {
+            let path = cli.phase1_dir.join(default_filename(*sub, variant));
+            let table = MappedTable::open(&path).expect("mmap Phase 1 table");
+            mapped_tables.insert(*sub, table);
+        }
+    }
 
     // Step 3 — val_s + ranks (paper Section IV-A).
     println!("\nComputing val_s + ordinal ranks...");
@@ -309,6 +507,21 @@ fn main() {
 
     let total_t = std::time::Instant::now();
     let mut skipped_for_ram: Vec<String> = Vec::new();
+
+    // Overall WU progress bar — shows position N/M + ETA on TTY. When
+    // stdout is piped to a log file the bar suppresses itself silently;
+    // the per-WU details below use plain println! so they're captured
+    // either way (log file or live terminal).
+    let pb_wu = indicatif::ProgressBar::new(to_solve.len() as u64);
+    pb_wu.set_style(
+        indicatif::ProgressStyle::with_template(
+            "  [{elapsed_precise} / ETA {eta_precise}] [{bar:40.green/cyan}] {pos:>2}/{len:>2} {wide_msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb_wu.enable_steady_tick(std::time::Duration::from_millis(500));
+
     for (i, wu) in to_solve.iter().enumerate() {
         let wu_label = if wu.is_esc {
             format!("ESC ({}, {})", wu.primary[0].w_board, wu.primary[0].b_board)
@@ -318,19 +531,36 @@ fn main() {
                 wu.primary[1].w_board, wu.primary[1].b_board)
         };
 
-        // Pre-check the RAM budget. The wave allocates 10 bytes/slot ×
-        // n_states dense Vecs per primary; for big subspaces this dwarfs
-        // physical RAM and triggers the OOM-killer mid-WU. Skipping here
-        // lets compute_gevay finish all the smaller WUs cleanly.
+        // Skip the WU entirely when --save-to is set and every primary's
+        // output file already exists. Lets the user rerun compute_gevay
+        // after a partial first pass without redoing what's already saved.
+        if let Some(dir) = &cli.save_to {
+            let all_saved = wu.primary.iter().all(|sub| {
+                dir.join(gevay_filename(*sub, variant)).exists()
+            });
+            if all_saved {
+                println!("[{}/{}] {} — already saved, skipping",
+                    i + 1, to_solve.len(), wu_label);
+                pb_wu.inc(1);
+                continue;
+            }
+        }
+
+        // Pre-check the RAM budget. The wave allocates ~1 byte per DENSE
+        // n_states slot (5.25 B/slot × n_canonical = 5.25 × n_states / 8)
+        // plus indexer overhead. Skipping here lets compute_gevay finish
+        // all the smaller WUs cleanly.
         let need_gb = estimate_wu_ram_gb(wu);
         if need_gb > ram_budget_gb {
             println!("[{}/{}] {} — SKIP (estimated {:.1} GB > budget {:.1} GB)",
                 i + 1, to_solve.len(), wu_label, need_gb, ram_budget_gb);
             skipped_for_ram.push(format!("{} ({:.1} GB)", wu_label, need_gb));
+            pb_wu.inc(1);
             continue;
         }
 
         let t_wu = std::time::Instant::now();
+        pb_wu.set_message(format!("{} (est. {:.1} GB)", wu_label, need_gb));
         println!("[{}/{}] {} — solving (est. {:.1} GB)...",
             i + 1, to_solve.len(), wu_label, need_gb);
 
@@ -362,12 +592,16 @@ fn main() {
                 }
                 let path = dir.join(gevay_filename(sub, variant));
                 let t_save = std::time::Instant::now();
-                save_gevay(sub, variant, first_key, dtw, &path).expect("save_gevay");
+                morris_tablebase::storage::save_gevay_canonical(
+                    sub, variant, first_key, dtw, &path,
+                ).expect("save_gevay_canonical");
                 println!("    saved to {} ({:.1}s)",
                     path.display(), t_save.elapsed().as_secs_f64());
             }
         }
+        pb_wu.inc(1);
     }
+    pb_wu.finish_and_clear();
 
     let solved = to_solve.len() - skipped_for_ram.len();
     println!("\n=== complete: {} WUs solved in {:.1}s ===",

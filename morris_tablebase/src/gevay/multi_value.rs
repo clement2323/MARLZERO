@@ -22,7 +22,35 @@
 //! At this stage we implement the bookkeeping primitives; full integration
 //! into the cross-subspace driver lives in `bin/compute_gevay.rs`.
 
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI16, AtomicU16, AtomicU64, Ordering};
+
+/// Pack-aware helpers for boolean state arrays. We store one bit per
+/// canonical state in a `Vec<u64>` instead of `Vec<bool>` (×8 RAM saving)
+/// — the wave only needs `is_set`, `set_true`, and an atomic `fetch_or`
+/// during the parallel init pass.
+///
+/// The atomic variant uses `&[AtomicU64]` over the same underlying memory;
+/// `AtomicU64::fetch_or` makes concurrent bit-sets safe even when multiple
+/// threads target distinct bits of the same word.
+#[inline]
+fn bit_get(words: &[u64], i: usize) -> bool {
+    (words[i >> 6] >> (i & 63)) & 1 != 0
+}
+
+#[inline]
+fn bit_set_true(words: &mut [u64], i: usize) {
+    words[i >> 6] |= 1u64 << (i & 63);
+}
+
+#[inline]
+fn bit_atomic_set_true_relaxed(words: &[AtomicU64], i: usize) {
+    words[i >> 6].fetch_or(1u64 << (i & 63), Ordering::Relaxed);
+}
+
+#[inline]
+fn bit_words_for(n: usize) -> usize {
+    (n + 63) >> 6
+}
 
 use rayon::prelude::*;
 
@@ -346,15 +374,29 @@ pub fn solve_esc_work_unit(
     phase1_tb: &Tablebase,
     ranks: &std::collections::HashMap<Subspace, Rank>,
 ) -> (Vec<i16>, Vec<i16>) {
-    let n = sub.n_states() as usize;
+    // Canonical-only indexing: ×8 smaller allocation than the dense
+    // state_index_canonical layout used by Phase 1. The wave never touches
+    // non-canonical orbit representatives, so the dense layout was 7/8 dead
+    // slots — building a CanonicalIndexer lets us allocate just the live ones.
+    // Cost: O(log bucket_size) per state lookup vs O(1) for state_index_canonical.
+    // For (9,9) bucket_size <= 5005 → ~12 comparisons per access; not the
+    // bottleneck. See [crate::gevay::canonical_indexer].
+    let indexer = crate::gevay::canonical_indexer::CanonicalIndexer::build(sub);
+    let n = indexer.n_states_canonical() as usize;
     let mut first_key: Vec<i16> = vec![0; n];
     let mut dtw: Vec<i16> = vec![0; n];
-    let mut count: Vec<u32> = vec![0; n];
-    let mut resolved: Vec<bool> = vec![false; n];
-    // has_draw_for_q tracks whether ANY child (cross-subspace at init, or
-    // intra-subspace during wave) yielded a DRAW-class option. Used at the
-    // count==0 transition to choose between DRAW and LOSS classification.
-    let mut has_draw_for_q: Vec<bool> = vec![false; n];
+    // count: parent-update remaining-children counter. Bounded by the
+    // number of intra-WU forward moves from any single position — empirically
+    // < 500 across all Morris boards. u16 fits with 130× headroom and halves
+    // the per-slot RAM cost.
+    let mut count: Vec<u16> = vec![0; n];
+    // resolved / has_draw_for_q : bit-packed booleans (1 bit/slot, 1/8 the RAM
+    // of Vec<bool>). has_draw_for_q tracks whether ANY child (cross-subspace
+    // at init, or intra-subspace during wave) yielded a DRAW-class option.
+    // Used at the count==0 transition to choose between DRAW and LOSS.
+    let words = bit_words_for(n);
+    let mut resolved: Vec<u64> = vec![0; words];
+    let mut has_draw_for_q: Vec<u64> = vec![0; words];
 
     // Phase 0 — init pass in parallel via rayon. Each canonical position
     // is independent: its writes go to a unique pair of state-array
@@ -378,24 +420,28 @@ pub fn solve_esc_work_unit(
     };
 
     let queue_entries: Vec<QueueEntry> = {
-        // SAFETY: AtomicI16 / AtomicU32 / AtomicBool are repr(transparent)
-        // over i16 / u32 / bool, so a &[Atomic*] over the same memory is
+        // SAFETY: AtomicI16 / AtomicU16 / AtomicU64 are repr(transparent)
+        // over i16 / u16 / u64, so a &[Atomic*] over the same memory is
         // sound. The atomic borrows live only for the duration of this
         // scope; afterwards the plain Vec<...> is the unique borrow.
+        // The resolved / has_draw_for_q bitvecs are 1 bit per state; their
+        // atomic slice has length = number of u64 words, and bit-level
+        // updates use fetch_or so concurrent threads targeting different
+        // bits of the same word never collide.
         let first_key_atomic: &[AtomicI16] = unsafe {
             std::slice::from_raw_parts(first_key.as_ptr() as *const AtomicI16, n)
         };
         let dtw_atomic: &[AtomicI16] = unsafe {
             std::slice::from_raw_parts(dtw.as_ptr() as *const AtomicI16, n)
         };
-        let count_atomic: &[AtomicU32] = unsafe {
-            std::slice::from_raw_parts(count.as_ptr() as *const AtomicU32, n)
+        let count_atomic: &[AtomicU16] = unsafe {
+            std::slice::from_raw_parts(count.as_ptr() as *const AtomicU16, n)
         };
-        let resolved_atomic: &[AtomicBool] = unsafe {
-            std::slice::from_raw_parts(resolved.as_ptr() as *const AtomicBool, n)
+        let resolved_atomic: &[AtomicU64] = unsafe {
+            std::slice::from_raw_parts(resolved.as_ptr() as *const AtomicU64, words)
         };
-        let has_draw_atomic: &[AtomicBool] = unsafe {
-            std::slice::from_raw_parts(has_draw_for_q.as_ptr() as *const AtomicBool, n)
+        let has_draw_atomic: &[AtomicU64] = unsafe {
+            std::slice::from_raw_parts(has_draw_for_q.as_ptr() as *const AtomicU64, words)
         };
 
         canonical_positions
@@ -405,7 +451,7 @@ pub fn solve_esc_work_unit(
                 |mut acc, &(wbb, bbb)| {
                     for stm in [STM_WHITE, 2u8] {
                         if let Some(entry) = init_one_position_atomic(
-                            sub, rank, variant, phase1_tb, ranks,
+                            sub, rank, variant, phase1_tb, ranks, &indexer,
                             wbb, bbb, stm,
                             first_key_atomic, dtw_atomic, count_atomic,
                             resolved_atomic, has_draw_atomic,
@@ -437,7 +483,7 @@ pub fn solve_esc_work_unit(
     while let Some(entry) = queue.pop() {
         let p_idx = entry.state_idx;
         propagate_to_parents_gevay(
-            sub, rank, variant, p_idx,
+            sub, rank, variant, &indexer, p_idx,
             &mut first_key, &mut dtw, &mut count,
             &mut resolved, &mut has_draw_for_q, &mut queue,
         );
@@ -452,7 +498,7 @@ pub fn solve_esc_work_unit(
     // approximation for now; refining the wave to track per-position
     // multi-valued maxima is a future improvement.
     for i in 0..n {
-        if !resolved[i] {
+        if !bit_get(&resolved, i) {
             first_key[i] = 0;
             dtw[i] = 0;
         }
@@ -495,16 +541,17 @@ fn init_one_position_atomic(
     variant: crate::wave::Variant,
     phase1_tb: &Tablebase,
     ranks: &std::collections::HashMap<Subspace, Rank>,
+    indexer: &crate::gevay::canonical_indexer::CanonicalIndexer,
     wbb: u32,
     bbb: u32,
     stm: u8,
     first_key: &[AtomicI16],
     dtw: &[AtomicI16],
-    count: &[AtomicU32],
-    resolved: &[AtomicBool],
-    has_draw_for_q: &[AtomicBool],
+    count: &[AtomicU16],
+    resolved: &[AtomicU64],
+    has_draw_for_q: &[AtomicU64],
 ) -> Option<QueueEntry> {
-    let idx = sub.state_index_canonical(wbb, bbb, stm) as usize;
+    let idx = indexer.canonical_index(wbb, bbb, stm) as usize;
     let mut best_win_key: Option<(i16, i16)> = None;
     let mut max_lose_rel: Option<(i16, i16)> = None;
     let mut has_draw = false;
@@ -514,7 +561,9 @@ fn init_one_position_atomic(
     forward_moves(sub, wbb, bbb, stm, variant, |mv| {
         any_move = true;
         if mv.target_sub == sub {
-            let child_idx = sub.state_index_canonical(mv.new_wbb, mv.new_bbb, mv.new_stm);
+            // forward_moves returns raw (wbb, bbb); canonicalize before
+            // indexing so the canonical-only layout receives an orbit rep.
+            let child_idx = indexer.index(mv.new_wbb, mv.new_bbb, mv.new_stm);
             intra_children.insert(child_idx);
             return;
         }
@@ -553,7 +602,7 @@ fn init_one_position_atomic(
         let (rel, _) = adjust_first_key(LOSS_ABS, 0, rank);
         first_key[idx].store(rel, Ordering::Relaxed);
         // dtw stays 0 (already zero-initialized).
-        resolved[idx].store(true, Ordering::Relaxed);
+        bit_atomic_set_true_relaxed(resolved, idx);
         return Some(QueueEntry {
             key: QueueKey { neg_abs_value: -(rel.abs()), dtw: 0 },
             sub_idx: 0,
@@ -564,7 +613,7 @@ fn init_one_position_atomic(
     if let Some((rel, d)) = best_win_key {
         first_key[idx].store(rel, Ordering::Relaxed);
         dtw[idx].store(d, Ordering::Relaxed);
-        resolved[idx].store(true, Ordering::Relaxed);
+        bit_atomic_set_true_relaxed(resolved, idx);
         Some(QueueEntry {
             key: QueueKey { neg_abs_value: -(rel.abs()), dtw: d },
             sub_idx: 0,
@@ -573,13 +622,13 @@ fn init_one_position_atomic(
     } else if intra_children.is_empty() {
         if has_draw {
             // first_key stays 0; dtw stays 0.
-            resolved[idx].store(true, Ordering::Relaxed);
+            bit_atomic_set_true_relaxed(resolved, idx);
             None
         } else if let Some((rel, d)) = max_lose_rel {
             let new_dtw = d.saturating_add(1);
             first_key[idx].store(rel, Ordering::Relaxed);
             dtw[idx].store(new_dtw, Ordering::Relaxed);
-            resolved[idx].store(true, Ordering::Relaxed);
+            bit_atomic_set_true_relaxed(resolved, idx);
             Some(QueueEntry {
                 key: QueueKey { neg_abs_value: -(rel.abs()), dtw: new_dtw },
                 sub_idx: 0,
@@ -589,9 +638,9 @@ fn init_one_position_atomic(
             None
         }
     } else {
-        count[idx].store(intra_children.len() as u32, Ordering::Relaxed);
+        count[idx].store(intra_children.len() as u16, Ordering::Relaxed);
         if has_draw {
-            has_draw_for_q[idx].store(true, Ordering::Relaxed);
+            bit_atomic_set_true_relaxed(has_draw_for_q, idx);
         }
         if let Some((_rel, d)) = max_lose_rel {
             dtw[idx].store(d, Ordering::Relaxed);
@@ -624,18 +673,19 @@ fn adjacency_mask(pos: u8) -> u32 {
 /// - When count reaches 0: finalize q as DRAW (if any draw child) or as
 ///   LOSS with the stashed max DTW.
 fn propagate_to_parents_gevay(
-    sub: Subspace,
+    _sub: Subspace,
     _rank: Rank,
     variant: crate::wave::Variant,
+    indexer: &crate::gevay::canonical_indexer::CanonicalIndexer,
     p_idx: u64,
     first_key: &mut [i16],
     dtw: &mut [i16],
-    count: &mut [u32],
-    resolved: &mut [bool],
-    has_draw_for_q: &mut [bool],
+    count: &mut [u16],
+    resolved: &mut [u64],
+    has_draw_for_q: &mut [u64],
     queue: &mut std::collections::BinaryHeap<QueueEntry>,
 ) {
-    let (wbb, bbb, stm_p) = sub.decode_state(p_idx);
+    let (wbb, bbb, stm_p) = indexer.decode(p_idx);
     let p_fk = first_key[p_idx as usize];
     let p_dtw = dtw[p_idx as usize];
     let mover_stm = 3 - stm_p;
@@ -667,16 +717,16 @@ fn propagate_to_parents_gevay(
             } else {
                 (fixed_bb, new_mover)
             };
-            let q_idx = sub.state_index(new_wbb, new_bbb, mover_stm);
+            let q_idx = indexer.index(new_wbb, new_bbb, mover_stm);
             if !seen_parents.insert(q_idx) { continue; }
             let q_i = q_idx as usize;
-            if resolved[q_i] { continue; }
+            if bit_get(resolved, q_i) { continue; }
             let p_from_q = -p_fk;
             if p_from_q > 0 {
                 // q can WIN through this child — first arrival commits.
                 first_key[q_i] = p_from_q;
                 dtw[q_i] = p_dtw.saturating_add(1);
-                resolved[q_i] = true;
+                bit_set_true(resolved, q_i);
                 queue.push(QueueEntry {
                     key: QueueKey {
                         neg_abs_value: -(p_from_q.abs()),
@@ -690,7 +740,7 @@ fn propagate_to_parents_gevay(
                 if p_dtw > dtw[q_i] { dtw[q_i] = p_dtw; }
                 if count[q_i] > 0 { count[q_i] -= 1; }
                 if count[q_i] == 0 {
-                    if has_draw_for_q[q_i] {
+                    if bit_get(has_draw_for_q, q_i) {
                         // Resolve as DRAW but do NOT push — DRAW resolutions
                         // do not need to propagate (parents see them via their
                         // own init's has_draw flag if applicable, and intra-
@@ -699,11 +749,11 @@ fn propagate_to_parents_gevay(
                         // finalize). Mirrors Phase 1.
                         first_key[q_i] = 0;
                         dtw[q_i] = 0;
-                        resolved[q_i] = true;
+                        bit_set_true(resolved, q_i);
                     } else {
                         first_key[q_i] = p_from_q;
                         dtw[q_i] = dtw[q_i].saturating_add(1);
-                        resolved[q_i] = true;
+                        bit_set_true(resolved, q_i);
                         queue.push(QueueEntry {
                             key: QueueKey {
                                 neg_abs_value: -(first_key[q_i].abs()),

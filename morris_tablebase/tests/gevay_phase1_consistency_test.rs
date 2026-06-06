@@ -37,11 +37,15 @@ fn phase1_totals(t: &morris_tablebase::subspace::SubspaceTable, sub: Subspace) -
 }
 
 fn gevay_totals(first_key: &[i16], sub: Subspace) -> (u64, u64, u64) {
+    // Phase 2 wave now stores first_key in canonical-only layout (1 slot per
+    // D4 orbit × 2 STMs), not dense by state_index_canonical. We rebuild a
+    // CanonicalIndexer to walk the same enumeration order.
+    let indexer = morris_tablebase::gevay::canonical_indexer::CanonicalIndexer::build(sub);
     let (mut w, mut l, mut d) = (0u64, 0u64, 0u64);
     sub.enumerate_positions(|cw, cb| {
         let osize = orbit_size(cw, cb) as u64;
         for stm in [1u8, 2u8] {
-            let idx = sub.state_index_canonical(cw, cb, stm) as usize;
+            let idx = indexer.canonical_index(cw, cb, stm) as usize;
             let f = first_key[idx];
             if f > 0 { w += osize; }
             else if f < 0 { l += osize; }

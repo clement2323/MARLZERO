@@ -18,10 +18,17 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use morris_tablebase::board::{ADJACENCY, NUM_POSITIONS};
+use morris_tablebase::gevay::canonical_indexer::CanonicalIndexer;
+use morris_tablebase::gevay::multi_value::WIN_ABS;
 use morris_tablebase::rules::{is_mill_through, legal_capture_targets, popcount};
-use morris_tablebase::storage::default_filename;
+use morris_tablebase::storage::{default_filename, gevay_filename, load_gevay_canonical};
 use morris_tablebase::subspace::{MappedTable, Subspace, Tablebase};
 use morris_tablebase::wave::{DRAW, LOSS, Variant, WIN};
+
+/// Loaded V_Gévay tables for the JSONL `--gevay-dir` query mode. Keyed by
+/// movement subspace; each value bundles the per-subspace CanonicalIndexer
+/// with the `first_key` / `dtw` arrays read from disk.
+type GevayStore = std::collections::HashMap<Subspace, (CanonicalIndexer, Vec<i16>, Vec<i16>)>;
 
 const POSITION_LABELS: [&str; 24] = [
     "a7", "d7", "g7", "g4", "g1", "d1", "a1", "a4",
@@ -349,7 +356,7 @@ fn parse_start_spec(spec: &str, stm: u8, seed: u64) -> Result<State, String> {
 /// Response: `{"verdict":<u8>,"dtw":<u16>,"best_action":{"src":<u8>,"dst":<u8>,"cap":<u8>|null}|null,"top_moves":[{"src":<u8>,"dst":<u8>,"cap":<u8>|null,"verdict":<u8>,"dtw":<u16>}]}\n`
 ///
 /// On parse error: `{"error":"<msg>"}\n`. On EOF: exit cleanly.
-fn serve_loop(tb: &Tablebase) {
+fn serve_loop(tb: &Tablebase, gevay: &GevayStore) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut line = String::new();
@@ -359,13 +366,49 @@ fn serve_loop(tb: &Tablebase) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
-        let resp = match serve_handle(tb, line.trim()) {
-            Ok(json) => json,
-            Err(msg) => format!("{{\"error\":\"{}\"}}", msg.replace('"', "'")),
+        let trimmed = line.trim();
+        // Cheap discriminator: any request containing `"gevay":true` (with
+        // or without internal whitespace) routes to the Gévay handler.
+        // Full JSON parse stays in the per-handler functions.
+        let resp = if trimmed.contains("\"gevay\"") && trimmed.contains("true") {
+            match serve_handle_gevay(gevay, trimmed) {
+                Ok(json) => json,
+                Err(msg) => format!("{{\"error\":\"{}\"}}", msg.replace('"', "'")),
+            }
+        } else {
+            match serve_handle(tb, trimmed) {
+                Ok(json) => json,
+                Err(msg) => format!("{{\"error\":\"{}\"}}", msg.replace('"', "'")),
+            }
         };
         let _ = writeln!(stdout, "{}", resp);
         let _ = stdout.flush();
     }
+}
+
+/// JSONL Gévay query handler. Request: `{"gevay":true,"wbb":N,"bbb":N,"stm":<1|2>}`.
+/// Response: `{"first_key":<i16>,"dtw":<i16>,"normalized":<f32>}` where
+/// `normalized = first_key / WIN_ABS` (∈ [-1, +1] approximately). Errors
+/// when the corresponding (w, b) gevay file wasn't loaded at startup.
+fn serve_handle_gevay(gevay: &GevayStore, line: &str) -> Result<String, String> {
+    if line.is_empty() { return Err("empty request".to_string()); }
+    let state = parse_serve_request(line)?;
+    let w = popcount(state.wbb) as u8;
+    let b = popcount(state.bbb) as u8;
+    if w < 3 || b < 3 || w > 9 || b > 9 {
+        return Err(format!("piece counts ({},{}) out of [3,9]", w, b));
+    }
+    let sub = Subspace::movement(w, b);
+    let (indexer, first_key, dtw) = gevay.get(&sub)
+        .ok_or_else(|| format!("gevay subspace ({},{}) not loaded", w, b))?;
+    let idx = indexer.index(state.wbb, state.bbb, state.stm) as usize;
+    let fk = first_key[idx];
+    let d = dtw[idx];
+    let normalized = (fk as f32) / (WIN_ABS as f32);
+    Ok(format!(
+        "{{\"first_key\":{},\"dtw\":{},\"normalized\":{:.6}}}",
+        fk, d, normalized
+    ))
 }
 
 /// Parse a `{"wbb":N,"bbb":N,"stm":N}` line. Returns Err on any malformed
@@ -464,7 +507,7 @@ fn serve_handle(tb: &Tablebase, line: &str) -> Result<String, String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: play_tb <PHASE1_DIR> [--side white|black] [--start <SPEC>] [--seed N] [--serve]");
+        eprintln!("usage: play_tb <PHASE1_DIR> [--side white|black] [--start <SPEC>] [--seed N] [--serve] [--gevay-dir <DIR>]");
         eprintln!();
         eprintln!("  --start SPEC : starting position. Two forms:");
         eprintln!("    'w-b'      : random (w whites, b blacks) movement position, e.g. '9-9'");
@@ -472,6 +515,8 @@ fn main() {
         eprintln!("    default    : '3-3' with a fixed configuration");
         eprintln!("  --seed N     : RNG seed for random positions (default 42)");
         eprintln!("  --serve      : JSONL stdio mode for Python wrappers (see serve_loop docs)");
+        eprintln!("  --gevay-dir DIR : load Phase 2 V_Gévay canonical tables for the");
+        eprintln!("                    'gevay':true JSONL query path in --serve mode.");
         std::process::exit(1);
     }
     let phase1_dir = PathBuf::from(&args[1]);
@@ -479,6 +524,7 @@ fn main() {
     let mut start_spec: Option<String> = None;
     let mut seed: u64 = 42;
     let mut serve = false;
+    let mut gevay_dir: Option<PathBuf> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -497,6 +543,10 @@ fn main() {
             "--serve" => {
                 serve = true;
                 i += 1;
+            }
+            "--gevay-dir" if i + 1 < args.len() => {
+                gevay_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
             }
             _ => { i += 1; }
         }
@@ -523,9 +573,44 @@ fn main() {
             }
         }
     }
+    // If --gevay-dir was passed, load any V_Gévay canonical tables found
+    // there. Missing files are silently skipped — the JSONL handler will
+    // return a clean per-query error for those subspaces.
+    let mut gevay_store: GevayStore = std::collections::HashMap::new();
+    if let Some(dir) = &gevay_dir {
+        if serve {
+            eprintln!("Loading V_Gévay canonical tables from {} ...", dir.display());
+        } else {
+            println!("Loading V_Gévay canonical tables from {} ...", dir.display());
+        }
+        let mut g_loaded = 0;
+        for w in 3..=9u8 {
+            for b in 3..=9u8 {
+                let sub = Subspace::movement(w, b);
+                let path = dir.join(gevay_filename(sub, Variant::Flying));
+                if !path.exists() { continue; }
+                match load_gevay_canonical(&path) {
+                    Ok((fk, dtw_arr, _variant, sub_back)) => {
+                        let indexer = CanonicalIndexer::build(sub_back);
+                        gevay_store.insert(sub_back, (indexer, fk, dtw_arr));
+                        g_loaded += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  skip {} : {}", path.display(), e);
+                    }
+                }
+            }
+        }
+        if serve {
+            eprintln!("Loaded {} V_Gévay subspaces.", g_loaded);
+        } else {
+            println!("Loaded {} V_Gévay subspaces.", g_loaded);
+        }
+    }
+
     if serve {
-        eprintln!("Loaded {} subspaces. Entering --serve loop.", loaded);
-        serve_loop(&tb);
+        eprintln!("Loaded {} Phase 1 subspaces. Entering --serve loop.", loaded);
+        serve_loop(&tb, &gevay_store);
         return;
     }
     println!("Loaded {} subspaces.\n", loaded);
