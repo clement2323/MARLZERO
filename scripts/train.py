@@ -343,6 +343,28 @@ def main(cfg: DictConfig) -> None:
             f"random_opening={asymmetric_config.prob_random_opening} "
             f"(K={asymmetric_config.random_opening_k})"
         )
+    # Opening-only training: when self_play.terminate_at_ply is set, each
+    # game stops after that many half-moves and the post-placement value is
+    # read from V_Gévay (gevay.enabled=true) instead of the natural game
+    # outcome. Falls back to the hybrid outcome target whenever the Gévay
+    # query is unavailable (missing dir, miss, subprocess error).
+    terminate_at_ply = cfg.self_play.get("terminate_at_ply", None)
+    if terminate_at_ply is not None:
+        terminate_at_ply = int(terminate_at_ply)
+    self_play_variant = cfg.self_play.get("variant", "no_flying")
+    gevay_cfg = cfg.get("gevay", None)
+    gevay_dir = None
+    phase1_dir = None
+    if gevay_cfg is not None and bool(gevay_cfg.get("enabled", False)):
+        gevay_dir = str(gevay_cfg.get("dir", ""))
+        phase1_dir = str(gevay_cfg.get("phase1_dir", ""))
+        if not gevay_dir or not phase1_dir:
+            logger.warning(
+                "gevay.enabled=true but dir/phase1_dir missing; falling back to hybrid value targets."
+            )
+            gevay_dir = None
+            phase1_dir = None
+
     manager = SelfPlayManager(
         network=network,
         network_cfg=_network_cfg_dict(cfg),
@@ -365,6 +387,10 @@ def main(cfg: DictConfig) -> None:
         asymmetric_config=asymmetric_config,
         discard_timeout_games=bool(cfg.self_play.get("discard_timeout_games", False)),
         game_name=cfg.get("game", "morris"),
+        terminate_at_ply=terminate_at_ply,
+        variant=self_play_variant,
+        gevay_dir=gevay_dir,
+        phase1_dir=phase1_dir,
     )
 
     logger.info(

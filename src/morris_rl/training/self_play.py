@@ -377,18 +377,34 @@ def _assign_value_targets(
     outcome: Outcome | None,
     term_reason: str = "unknown",
     final_pieces_diff: int = 0,
+    gevay_terminal_value: float | None = None,
+    gevay_perspective_player: int | None = None,
 ) -> list[SampleRecord]:
     """Convert per-step tuples into SampleRecords with hybrid value targets.
 
     See :func:`_hybrid_value_target` for the value-blending rationale.
     Fast-sim plies (was_full_sim=False, playout cap) are skipped so they
     don't pollute the buffer.
+
+    When ``gevay_terminal_value`` is provided, it OVERRIDES the hybrid
+    formula for every sample. The value is interpreted from
+    ``gevay_perspective_player``'s point of view: samples by the same
+    player keep the same sign, the opponent's samples flip. This is the
+    code path the 18-ply self-play config takes: V_Gévay(state_at_ply_18)
+    is the single ground-truth signal used to score the whole game.
     """
     records: list[SampleRecord] = []
     for encoded, policy, player, mask, was_full_sim, mill_diff, pieces_diff in steps:
         if not was_full_sim:
             continue
-        v = _hybrid_value_target(outcome, player, final_pieces_diff)
+        if gevay_terminal_value is not None and gevay_perspective_player is not None:
+            v = (
+                gevay_terminal_value
+                if player == gevay_perspective_player
+                else -gevay_terminal_value
+            )
+        else:
+            v = _hybrid_value_target(outcome, player, final_pieces_diff)
         records.append(
             SampleRecord(
                 encoded_state=encoded,
@@ -443,6 +459,8 @@ def _play_game(
     game_fns: dict | None = None,
     asymmetric_config: "AsymmetricConfig | None" = None,
     search_high_noise: "MorrisSearch | None" = None,
+    terminate_at_ply: int | None = None,
+    gevay_client: Any = None,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data.
 
@@ -558,9 +576,21 @@ def _play_game(
     # else falls back to the Morris constant from board.py.
     _action_space_n = _fns.get("action_space_size", ACTION_SPACE_SIZE)
 
+    # If `terminate_at_ply` is set, the loop also ends as soon as the
+    # half-move counter reaches that ply count. This is the 18-ply
+    # opening-only regime: stop right after the placement phase, evaluate
+    # the post-placement position with V_Gévay, and use that as the
+    # ground-truth terminal value for every sample in the game.
+    early_stop_at_ply = False
     while True:
         done, _ = _is_terminal(state)
         if done:
+            break
+        if (
+            terminate_at_ply is not None
+            and getattr(state, "total_halfmoves", 0) >= terminate_at_ply
+        ):
+            early_stop_at_ply = True
             break
 
         # Temperature per regime:
@@ -712,10 +742,32 @@ def _play_game(
     # Halfmove-cap games produce value=0 on non-draw positions → draw attractor
     # fuel. When the flag is set, drop their samples from the buffer entirely.
     timeout_discarded = discard_timeout_games and term_reason == "halfmove_cap"
+
+    # 18-ply opening regime: when we hit the ply cutoff (not a natural
+    # terminal), use V_Gévay(post-placement state) as the ground-truth
+    # value target. The query returns normalized first_key ∈ [-1, +1] from
+    # state.current_player's POV — the perspective we pass to
+    # _assign_value_targets so it flips signs across plies correctly.
+    gevay_terminal_value: float | None = None
+    gevay_perspective_player: int | None = None
+    if early_stop_at_ply and gevay_client is not None:
+        try:
+            gv = gevay_client.query(state)
+        except Exception:  # noqa: BLE001 — query failures must not crash self-play
+            gv = None
+        if gv is not None:
+            gevay_terminal_value = float(gv["normalized"])
+            gevay_perspective_player = int(state.current_player)
+            term_reason = "ply_cutoff_gevay"
+
     samples = (
         []
         if timeout_discarded
-        else _assign_value_targets(steps, outcome, term_reason, final_pieces_diff)
+        else _assign_value_targets(
+            steps, outcome, term_reason, final_pieces_diff,
+            gevay_terminal_value=gevay_terminal_value,
+            gevay_perspective_player=gevay_perspective_player,
+        )
     )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(
@@ -892,6 +944,10 @@ def _worker_fn(
     asymmetric_config: AsymmetricConfig | None = None,
     discard_timeout_games: bool = False,
     game_name: str = "morris",
+    terminate_at_ply: int | None = None,
+    variant: str = "no_flying",
+    gevay_dir: str | None = None,
+    phase1_dir: str | None = None,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -941,9 +997,17 @@ def _worker_fn(
         # Aux head targets are Morris-specific (mill_diff, pieces_diff). Wire
         # the helper here so _play_game can compute them per ply. For other
         # games this stays unset → NaN aux targets → aux loss masked out.
-        from morris_rl.env.rules import compute_aux_features as _morris_aux
+        from morris_rl.env.rules import (
+            compute_aux_features as _morris_aux,
+            initial_state as _morris_initial_state,
+            Variant as _MorrisVariant,
+        )
+        _variant_enum = (
+            _MorrisVariant.FLYING if variant == "flying" else _MorrisVariant.NO_FLYING
+        )
         _game_fns = {
             "compute_aux_features": _morris_aux,
+            "initial_state": (lambda v=_variant_enum: _morris_initial_state(variant=v)),
         }
         # When the network is the GraphNet backbone, swap in the graph-aware
         # encoder (11 planes including threats/degree/ring). Everything else
@@ -1017,6 +1081,22 @@ def _worker_fn(
     games_played = 0
     rng = np.random.default_rng(worker_seed)
 
+    # Spawn the per-worker GevayClient when configured. Each worker runs
+    # its own play_tb subprocess (~200 MB RSS for the mmap'd Phase 1 tables,
+    # negligible for the small canonical Gévay files). We do this lazily
+    # here rather than in __init__ so workers without a Gévay config aren't
+    # forced to fork the binary.
+    gevay_client: Any = None
+    if gevay_dir and phase1_dir and game_name == "morris":
+        try:
+            from morris_rl.inference.gevay_client import GevayClient
+            from pathlib import Path as _Path
+            gevay_client = GevayClient(_Path(gevay_dir), _Path(phase1_dir))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(f"[worker {worker_id}] GevayClient init failed: {exc}. "
+                         "Falling back to hybrid value targets.")
+            gevay_client = None
+
     while True:
         # Non-blocking check for updated weights or shutdown.
         try:
@@ -1041,6 +1121,8 @@ def _worker_fn(
                 game_fns=_game_fns,
                 asymmetric_config=asymmetric_config,
                 search_high_noise=search_high_noise,
+                terminate_at_ply=terminate_at_ply,
+                gevay_client=gevay_client,
             )
             _maybe_log_trace(game, worker_id, game=game_name)
             results_queue.put(game)
@@ -1235,6 +1317,10 @@ class SelfPlayManager:
         asymmetric_config: AsymmetricConfig | None = None,
         discard_timeout_games: bool = False,
         game_name: str = "morris",
+        terminate_at_ply: int | None = None,
+        variant: str = "no_flying",
+        gevay_dir: str | None = None,
+        phase1_dir: str | None = None,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -1260,6 +1346,14 @@ class SelfPlayManager:
         self._asymmetric_config = asymmetric_config
         self._discard_timeout_games = discard_timeout_games
         self._game_name = game_name
+        # Opening-only training fields. terminate_at_ply caps the per-game
+        # halfmove count (so games stop after the placement phase); the
+        # GevayClient subprocess then scores the post-placement position.
+        # `variant` is forwarded to initial_state() in each worker.
+        self._terminate_at_ply = terminate_at_ply
+        self._variant = variant
+        self._gevay_dir = gevay_dir
+        self._phase1_dir = phase1_dir
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -1367,6 +1461,10 @@ class SelfPlayManager:
                     self._asymmetric_config,
                     self._discard_timeout_games,
                     self._game_name,
+                    self._terminate_at_ply,
+                    self._variant,
+                    self._gevay_dir,
+                    self._phase1_dir,
                 ),
                 daemon=True,
             )

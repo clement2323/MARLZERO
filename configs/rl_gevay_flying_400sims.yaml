@@ -1,0 +1,51 @@
+# First simple AlphaZero self-play training in FLYING variant.
+# Games stop at ply 18 (end of placement); the post-placement position is
+# scored via V_Gévay, and that normalized first_key serves as the terminal
+# value target for every sample in the game.
+#
+# Usage (assumes Phase 2 V_Gévay files are saved at GEVAY_DIR):
+#   GEVAY_DIR=$(pwd)/data/tablebase/gevay python scripts/train.py \
+#       --config-name rl_gevay_flying_400sims
+
+defaults:
+  - default
+  - _self_
+
+# GraphNet backbone (11 planes: 7 legacy + 4 structural).
+# ~300 k params; tested fast on the target RTX 4070.
+network:
+  type: graphnet
+  num_blocks: 4
+  num_channels: 128
+  policy_head_hidden: 64
+  value_head_hidden: 64
+
+input_encoding:
+  num_planes: 11
+
+# 400 MCTS sims per ply per the user's spec.
+mcts:
+  num_simulations_train: 400
+
+self_play:
+  num_workers: 8
+  # Hard stop at ply 18: the placement phase ends exactly here when no
+  # captures occurred earlier, and the placement-only opening is the scope
+  # of this first run.
+  terminate_at_ply: 18
+  # Activates the Flying variant (3-piece fly rule) in the rules engine
+  # used by self-play. Has no observable effect during placement (fly only
+  # kicks in at 3 pieces in movement phase, which we never reach), but it
+  # matches the variant the Gévay tablebase was computed for so the value
+  # signal lines up semantically.
+  variant: flying
+
+# V_Gévay reward configuration. When `dir` resolves to a directory with
+# valid `gevay_flying_w{w}_b{b}_wp0_bp0.bin` files, each self-play worker
+# spawns its own `play_tb --serve --gevay-dir` subprocess and uses it to
+# score the post-placement position. Missing files fall back to the
+# existing hybrid outcome target.
+gevay:
+  enabled: true
+  dir: ${oc.env:GEVAY_DIR,${oc.env:HOME}/projets/MARL/data/tablebase/gevay}
+  phase1_dir: ${oc.env:TABLEBASE_DIR,${oc.env:HOME}/projets/MARL/data/tablebase/flying}
