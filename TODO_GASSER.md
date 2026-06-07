@@ -51,4 +51,14 @@ Si un sample ply-18 tombe sur un sous-espace que Gévay n'a pas (rare en placeme
 revoir le papier
 
 # santorini oithello finir crquage fanoroonan
-# entrainer lordi a finir la partie  aussi comme ca le reseau fait totut
+# entrainer lordi a finir la partie  aussi comme ca le reseau fait totut et pas besoin de stocker la table ? 
+contrative learning ? goal for the head M
+
+3 contrattive learning for guided opening
+3 learn opening against guevay RL puis i;itation perfecti play zith netzork 
+@ position zith eaulql vaqlue has to be differenciate by depth to zin m value += value + depth tozin function betzeen )m1 mdependingm draz you want  to stay long in unstable state andDTW est la longueur du te;ps a attendre tout riche le stable donc DTZ gros plus gross evalue for the zwin tu veux shorten the DTW
+
+comparer result obtenu avec gasser guevaym +
+variante avec defait bloquante valorisee etc
+
+re[passer du te;ps a comprendr dannerm les value le DTZ draw]
