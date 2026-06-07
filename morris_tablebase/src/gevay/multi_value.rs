@@ -413,13 +413,18 @@ pub fn solve_esc_work_unit(
     // Queue entries are collected via rayon's fold/reduce so per-thread
     // partial heaps merge once into the final BinaryHeap. This avoids a
     // global mutex on the queue during init.
-    let canonical_positions: Vec<(u32, u32)> = {
-        let mut v = Vec::with_capacity(n / 16);
-        sub.enumerate_positions(|w, b| v.push((w, b)));
-        v
-    };
-
-    let queue_entries: Vec<QueueEntry> = {
+    //
+    // STREAMED ENUMERATION: instead of materializing the full canonical
+    // position list (8 bytes × n_canonical_entries — up to 8-17 GB for the
+    // biggest pair WUs (7,8)/(8,7), (8,9)/(9,8)), we interleave the
+    // enumerate_positions callback with chunked par_iter inits.
+    // Caps the temporary buffer at INIT_CHUNK_SIZE × 8 bytes ≈ 8 MB
+    // regardless of subspace size. Without this, on a 30 GB machine the
+    // wave arrays + indexer + canonical_positions + queue could collide
+    // and OOM the process mid-init.
+    const INIT_CHUNK_SIZE: usize = 1 << 20; // 1M canonical positions per batch
+    let mut queue_entries: Vec<QueueEntry> = Vec::new();
+    {
         // SAFETY: AtomicI16 / AtomicU16 / AtomicU64 are repr(transparent)
         // over i16 / u16 / u64, so a &[Atomic*] over the same memory is
         // sound. The atomic borrows live only for the duration of this
@@ -444,32 +449,72 @@ pub fn solve_esc_work_unit(
             std::slice::from_raw_parts(has_draw_for_q.as_ptr() as *const AtomicU64, words)
         };
 
-        canonical_positions
-            .par_iter()
-            .fold(
-                Vec::<QueueEntry>::new,
-                |mut acc, &(wbb, bbb)| {
-                    for stm in [STM_WHITE, 2u8] {
-                        if let Some(entry) = init_one_position_atomic(
-                            sub, rank, variant, phase1_tb, ranks, &indexer,
-                            wbb, bbb, stm,
-                            first_key_atomic, dtw_atomic, count_atomic,
-                            resolved_atomic, has_draw_atomic,
-                        ) {
-                            acc.push(entry);
+        let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(INIT_CHUNK_SIZE);
+        let process_chunk = |chunk: &Vec<(u32, u32)>| -> Vec<QueueEntry> {
+            chunk
+                .par_iter()
+                .fold(
+                    Vec::<QueueEntry>::new,
+                    |mut acc, &(wbb, bbb)| {
+                        for stm in [STM_WHITE, 2u8] {
+                            if let Some(entry) = init_one_position_atomic(
+                                sub, rank, variant, phase1_tb, ranks, &indexer,
+                                wbb, bbb, stm,
+                                first_key_atomic, dtw_atomic, count_atomic,
+                                resolved_atomic, has_draw_atomic,
+                            ) {
+                                acc.push(entry);
+                            }
                         }
+                        acc
+                    },
+                )
+                .reduce(Vec::<QueueEntry>::new, |mut a, mut b| {
+                    if a.capacity() < b.capacity() {
+                        std::mem::swap(&mut a, &mut b);
                     }
-                    acc
-                },
-            )
-            .reduce(Vec::<QueueEntry>::new, |mut a, mut b| {
-                if a.capacity() < b.capacity() {
-                    std::mem::swap(&mut a, &mut b);
+                    a.extend(b);
+                    a
+                })
+        };
+
+        // Init pass progress: each chunk = 1M canonical positions. Print
+        // every ~10s so the user knows it's progressing during the silent
+        // phase before the wave loop starts (for big WUs the init can
+        // take 1-3 min).
+        let t_init = std::time::Instant::now();
+        let n_canonical_total = indexer.n_canonical_entries() as u64;
+        let n_chunks_est = (n_canonical_total + INIT_CHUNK_SIZE as u64 - 1) / INIT_CHUNK_SIZE as u64;
+        // eprintln! goes to stderr which Rust leaves UNBUFFERED — visible
+        // immediately through `2>&1 | tee` even when stdout is fully block
+        // buffered. Same trick used for the wave progress below.
+        eprintln!("    init: starting ({} chunks of {}M positions each)",
+            n_chunks_est, INIT_CHUNK_SIZE / 1_000_000);
+        let mut chunks_done: u64 = 0;
+        let mut last_init_println = std::time::Instant::now();
+        sub.enumerate_positions(|w, b| {
+            chunk.push((w, b));
+            if chunk.len() >= INIT_CHUNK_SIZE {
+                queue_entries.extend(process_chunk(&chunk));
+                chunk.clear();
+                chunks_done += 1;
+                if last_init_println.elapsed().as_secs() >= 10 {
+                    let pct = (chunks_done as f64 / n_chunks_est as f64 * 100.0).min(100.0);
+                    eprintln!(
+                        "    init: {:>5.1}% ({:>5}/{:>5} chunks) elapsed {:>5.0}s",
+                        pct, chunks_done, n_chunks_est, t_init.elapsed().as_secs_f64(),
+                    );
+                    last_init_println = std::time::Instant::now();
                 }
-                a.extend(b);
-                a
-            })
-    };
+            }
+        });
+        if !chunk.is_empty() {
+            queue_entries.extend(process_chunk(&chunk));
+            chunks_done += 1;
+        }
+        eprintln!("    init: done ({} chunks, {:.1}s, {} queue seeds)",
+            chunks_done, t_init.elapsed().as_secs_f64(), queue_entries.len());
+    }
 
     let mut queue: std::collections::BinaryHeap<QueueEntry> = queue_entries.into_iter().collect();
 
@@ -480,6 +525,25 @@ pub fn solve_esc_work_unit(
     // path, we commit to that classification rather than tracking the
     // multi-valued maximum exactly. Adequate for V_Gévay rank
     // computation since per-position DTW is not the primary signal.
+    //
+    // Progress bar: total = n_states_canonical (the BFS resolves each
+    // canonical state at most once). Updates every 256k pops to keep
+    // overhead negligible; the bar is rendered live on TTY and silently
+    // suppressed when stdout is piped (the wave still prints its
+    // "wave done in X" summary line either way).
+    // Indicatif bar for interactive TTY runs (auto-suppressed when piped).
+    let pb_wave = indicatif::ProgressBar::new(n as u64);
+    pb_wave.set_style(
+        indicatif::ProgressStyle::with_template(
+            "    wave [{elapsed_precise} / ETA {eta_precise}] [{bar:30.cyan/blue}] {pos:>11}/{len:>11} queue={msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb_wave.enable_steady_tick(std::time::Duration::from_millis(500));
+    let t_wave = std::time::Instant::now();
+    let mut pops: u64 = 0;
+    let mut last_println = std::time::Instant::now();
     while let Some(entry) = queue.pop() {
         let p_idx = entry.state_idx;
         propagate_to_parents_gevay(
@@ -487,7 +551,26 @@ pub fn solve_esc_work_unit(
             &mut first_key, &mut dtw, &mut count,
             &mut resolved, &mut has_draw_for_q, &mut queue,
         );
+        pops += 1;
+        // Fast path: bump the bar every ~256k pops (a few times/sec on TTY).
+        // Cheaper than calling Instant::now() every iteration.
+        if pops & 0x3FFFF == 0 {
+            pb_wave.set_position(pops);
+            pb_wave.set_message(format!("{}", queue.len()));
+            // Slow path: dump a plain println every ~10s for log/pipe
+            // consumers — indicatif bar is auto-hidden behind `| tee`,
+            // but stdout text comes through.
+            if last_println.elapsed().as_secs() >= 10 {
+                let pct = (pops as f64 / n as f64 * 100.0).min(100.0);
+                eprintln!(
+                    "    wave: {:>5.1}% ({:>11}/{:>11}) elapsed {:>5.0}s queue={:>10}",
+                    pct, pops, n, t_wave.elapsed().as_secs_f64(), queue.len(),
+                );
+                last_println = std::time::Instant::now();
+            }
+        }
     }
+    pb_wave.finish_and_clear();
 
     // Phase 2 — finalize: unresolved cells default to value 0 (= rank of this WU).
     // Note: the approximate first-arrival wave heuristic can leave a small

@@ -1,7 +1,9 @@
 # First simple AlphaZero self-play training in FLYING variant.
-# Games stop at ply 18 (end of placement); the post-placement position is
-# scored via V_Gévay, and that normalized first_key serves as the terminal
-# value target for every sample in the game.
+# Games run until the Gévay tablebase covers the current movement
+# position (≥ ply terminate_at_ply, hands empty, not must_capture). The
+# normalized first_key at that moment serves as the terminal value
+# target for every sample in the game. PURE Gévay — no hybrid fallback:
+# games that don't hit Gévay by ply gevay.max_total_plies are dropped.
 #
 # Usage (assumes Phase 2 V_Gévay files are saved at GEVAY_DIR):
 #   GEVAY_DIR=$(pwd)/data/tablebase/gevay python scripts/train.py \
@@ -29,23 +31,31 @@ mcts:
 
 self_play:
   num_workers: 8
-  # Hard stop at ply 18: the placement phase ends exactly here when no
-  # captures occurred earlier, and the placement-only opening is the scope
-  # of this first run.
+  # Minimum ply count before we START polling Gévay for coverage. Below
+  # this ply hands aren't empty so Gévay never covers — polling earlier
+  # is pure subprocess overhead.
   terminate_at_ply: 18
   # Activates the Flying variant (3-piece fly rule) in the rules engine
   # used by self-play. Has no observable effect during placement (fly only
-  # kicks in at 3 pieces in movement phase, which we never reach), but it
-  # matches the variant the Gévay tablebase was computed for so the value
-  # signal lines up semantically.
+  # kicks in at 3 pieces in movement phase, which we never reach during
+  # placement), but it matches the variant the Gévay tablebase was
+  # computed for so the value signal lines up semantically.
   variant: flying
 
 # V_Gévay reward configuration. When `dir` resolves to a directory with
 # valid `gevay_flying_w{w}_b{b}_wp0_bp0.bin` files, each self-play worker
-# spawns its own `play_tb --serve --gevay-dir` subprocess and uses it to
-# score the post-placement position. Missing files fall back to the
-# existing hybrid outcome target.
+# spawns its own `play_tb --serve --gevay-dir` subprocess. Every ply ≥
+# terminate_at_ply checks if Gévay covers the current position; on the
+# first hit the game stops and the normalized first_key becomes the value
+# target. If the game reaches `max_total_plies` without ever seeing a
+# hit, OR terminates naturally (someone <3 pieces, blocked, etc) without
+# a hit, the WHOLE game is dropped from the buffer.
 gevay:
   enabled: true
   dir: ${oc.env:GEVAY_DIR,${oc.env:HOME}/projets/MARL/data/tablebase/gevay}
   phase1_dir: ${oc.env:TABLEBASE_DIR,${oc.env:HOME}/projets/MARL/data/tablebase/flying}
+  # Hard upper bound on game length when Gévay polling is active. Any
+  # game that reaches this ply count without ever seeing a Gévay hit is
+  # DROPPED — no samples added to the buffer. There is no hybrid value
+  # fallback by design: the training signal must be pure Gévay.
+  max_total_plies: 60

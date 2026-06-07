@@ -461,6 +461,7 @@ def _play_game(
     search_high_noise: "MorrisSearch | None" = None,
     terminate_at_ply: int | None = None,
     gevay_client: Any = None,
+    gevay_max_total_plies: int | None = None,
 ) -> GameRecord:
     """Play one complete self-play game and return its training data.
 
@@ -576,21 +577,54 @@ def _play_game(
     # else falls back to the Morris constant from board.py.
     _action_space_n = _fns.get("action_space_size", ACTION_SPACE_SIZE)
 
-    # If `terminate_at_ply` is set, the loop also ends as soon as the
-    # half-move counter reaches that ply count. This is the 18-ply
-    # opening-only regime: stop right after the placement phase, evaluate
-    # the post-placement position with V_Gévay, and use that as the
-    # ground-truth terminal value for every sample in the game.
-    early_stop_at_ply = False
+    # Gévay-gated early stop (opening-only regime). Two parameters drive it:
+    #   - `terminate_at_ply` (≥ 18): minimum ply count at which we start
+    #     polling the Gévay tablebase for coverage of the current position.
+    #     Below this ply we're still in placement phase — Gévay never covers
+    #     hand-nonzero states, so polling earlier is pointless.
+    #   - `gevay_max_total_plies` (e.g. 60): hard upper bound. If we reach
+    #     this ply without ever seeing a Gévay hit, the whole game is
+    #     DROPPED (no samples added to the buffer) — the user's requirement
+    #     is a pure-Gévay value target with NO hybrid fallback, so any
+    #     game that doesn't get one is wasted compute, but at least the
+    #     buffer stays clean.
+    # On a Gévay hit: stop the loop, stash the normalized value + the
+    # perspective player, and emit samples with that as their value target.
+    early_stop_gevay = False
+    early_stop_cap_no_hit = False
+    gevay_hit_value: float | None = None
+    gevay_hit_perspective: int | None = None
     while True:
         done, _ = _is_terminal(state)
         if done:
             break
+        # Gévay-gated stop: once we're in movement phase (pieces_in_hand == 0
+        # and not must_capture), check if Gévay has coverage for THIS exact
+        # position. If yes, stop here and use the normalized first_key as
+        # the terminal value for every sample in the game (perspective-flipped
+        # per sample's actor in _assign_value_targets).
         if (
-            terminate_at_ply is not None
+            gevay_client is not None
+            and terminate_at_ply is not None
             and getattr(state, "total_halfmoves", 0) >= terminate_at_ply
+            and getattr(state, "pieces_in_hand", (1, 1)) == (0, 0)
+            and not getattr(state, "must_capture", False)
         ):
-            early_stop_at_ply = True
+            try:
+                gv = gevay_client.query(state)
+            except Exception:  # noqa: BLE001 — query failures must not crash self-play
+                gv = None
+            if gv is not None:
+                gevay_hit_value = float(gv["normalized"])
+                gevay_hit_perspective = int(state.current_player)
+                early_stop_gevay = True
+                break
+        # Hard cap: game has gone too long without a Gévay hit. Discard.
+        if (
+            gevay_max_total_plies is not None
+            and getattr(state, "total_halfmoves", 0) >= gevay_max_total_plies
+        ):
+            early_stop_cap_no_hit = True
             break
 
         # Temperature per regime:
@@ -743,32 +777,34 @@ def _play_game(
     # fuel. When the flag is set, drop their samples from the buffer entirely.
     timeout_discarded = discard_timeout_games and term_reason == "halfmove_cap"
 
-    # 18-ply opening regime: when we hit the ply cutoff (not a natural
-    # terminal), use V_Gévay(post-placement state) as the ground-truth
-    # value target. The query returns normalized first_key ∈ [-1, +1] from
-    # state.current_player's POV — the perspective we pass to
-    # _assign_value_targets so it flips signs across plies correctly.
-    gevay_terminal_value: float | None = None
-    gevay_perspective_player: int | None = None
-    if early_stop_at_ply and gevay_client is not None:
-        try:
-            gv = gevay_client.query(state)
-        except Exception:  # noqa: BLE001 — query failures must not crash self-play
-            gv = None
-        if gv is not None:
-            gevay_terminal_value = float(gv["normalized"])
-            gevay_perspective_player = int(state.current_player)
-            term_reason = "ply_cutoff_gevay"
-
-    samples = (
-        []
-        if timeout_discarded
-        else _assign_value_targets(
-            steps, outcome, term_reason, final_pieces_diff,
-            gevay_terminal_value=gevay_terminal_value,
-            gevay_perspective_player=gevay_perspective_player,
-        )
+    # Opening-only Gévay regime: only games that ENDED via a Gévay hit
+    # contribute samples. Everything else is dropped — natural terminals
+    # (somebody <3 or blocked) before Gévay coverage, hard ply cap
+    # without a hit, halfmove-cap drops. The user explicitly wants a
+    # pure-Gévay signal with no hybrid fallback.
+    gevay_regime_active = (
+        gevay_client is not None and terminate_at_ply is not None
     )
+    if gevay_regime_active:
+        if early_stop_gevay and gevay_hit_value is not None:
+            term_reason = "gevay_hit"
+            samples = _assign_value_targets(
+                steps, outcome, term_reason, final_pieces_diff,
+                gevay_terminal_value=gevay_hit_value,
+                gevay_perspective_player=gevay_hit_perspective,
+            )
+        else:
+            if early_stop_cap_no_hit:
+                term_reason = "gevay_cap_no_hit"
+            else:
+                term_reason = "gevay_natural_terminal_no_hit"
+            samples = []  # drop the game
+    else:
+        samples = (
+            []
+            if timeout_discarded
+            else _assign_value_targets(steps, outcome, term_reason, final_pieces_diff)
+        )
     outcome_int = -1 if (outcome is None or outcome == Outcome.DRAW) else int(outcome)
     return GameRecord(
         samples=samples,
@@ -948,6 +984,7 @@ def _worker_fn(
     variant: str = "no_flying",
     gevay_dir: str | None = None,
     phase1_dir: str | None = None,
+    gevay_max_total_plies: int | None = None,
 ) -> None:
     """Worker process: play self-play games until a None sentinel is received."""
     import random
@@ -1123,6 +1160,7 @@ def _worker_fn(
                 search_high_noise=search_high_noise,
                 terminate_at_ply=terminate_at_ply,
                 gevay_client=gevay_client,
+                gevay_max_total_plies=gevay_max_total_plies,
             )
             _maybe_log_trace(game, worker_id, game=game_name)
             results_queue.put(game)
@@ -1163,6 +1201,11 @@ def _worker_fn_remote(
     discard_timeout_games: bool = False,
     network_type: str = "resnet",
     num_planes: int = 7,
+    terminate_at_ply: int | None = None,
+    variant: str = "no_flying",
+    gevay_dir: str | None = None,
+    phase1_dir: str | None = None,
+    gevay_max_total_plies: int | None = None,
 ) -> None:
     """Worker process: delegates leaf evaluation to the inference server.
 
@@ -1242,6 +1285,39 @@ def _worker_fn_remote(
     games_played = 0
     rng = np.random.default_rng(worker_seed)
 
+    # Build game-specific function table mirroring _worker_fn's morris branch.
+    # Critical: when network_type == "graphnet", the SAMPLE encoder used by
+    # _play_game must be the 11-plane graph encoder — otherwise the buffer
+    # (sized to cfg.input_encoding.num_planes = 11) rejects samples with
+    # ValueError("could not broadcast input array from shape (7,24) into
+    # shape (11,24)"). Same wiring also propagates the flying variant for
+    # initial_state() so the played positions match Gévay's tablebase.
+    from morris_rl.env.rules import (
+        compute_aux_features as _morris_aux,
+        initial_state as _morris_initial_state,
+        Variant as _MorrisVariant,
+    )
+    _variant_enum = (
+        _MorrisVariant.FLYING if variant == "flying" else _MorrisVariant.NO_FLYING
+    )
+    _remote_game_fns: dict = {
+        "compute_aux_features": _morris_aux,
+        "initial_state": (lambda v=_variant_enum: _morris_initial_state(variant=v)),
+        "encode_state": encode_state,  # already swapped to graph encoder above
+    }
+
+    # Per-worker GévayClient (lazy spawn): one play_tb subprocess per worker.
+    gevay_client: Any = None
+    if gevay_dir and phase1_dir:
+        try:
+            from morris_rl.inference.gevay_client import GevayClient
+            from pathlib import Path as _Path
+            gevay_client = GevayClient(_Path(gevay_dir), _Path(phase1_dir))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(f"[worker {worker_id}] GevayClient init failed: {exc}. "
+                         "Falling back to hybrid value targets.")
+            gevay_client = None
+
     while not shutdown_event.is_set():
         try:
             game = _play_game(
@@ -1253,6 +1329,10 @@ def _worker_fn_remote(
                 playout_cap_config=playout_cap_config,
                 curriculum_config=curriculum_config,
                 discard_timeout_games=discard_timeout_games,
+                game_fns=_remote_game_fns,
+                terminate_at_ply=terminate_at_ply,
+                gevay_client=gevay_client,
+                gevay_max_total_plies=gevay_max_total_plies,
             )
             _maybe_log_trace(game, worker_id)
             results_queue.put(game)
@@ -1321,6 +1401,7 @@ class SelfPlayManager:
         variant: str = "no_flying",
         gevay_dir: str | None = None,
         phase1_dir: str | None = None,
+        gevay_max_total_plies: int | None = None,
     ) -> None:
         if inference_mode not in ("per_worker_cpu", "shared_gpu"):
             raise ValueError(f"unknown inference_mode {inference_mode!r}")
@@ -1354,6 +1435,7 @@ class SelfPlayManager:
         self._variant = variant
         self._gevay_dir = gevay_dir
         self._phase1_dir = phase1_dir
+        self._gevay_max_total_plies = gevay_max_total_plies
 
         self._ctx = mp.get_context("spawn")
         self._results_queue: mp.Queue = self._ctx.Queue()  # type: ignore[type-arg]
@@ -1436,6 +1518,11 @@ class SelfPlayManager:
                     self._discard_timeout_games,
                     self._network_cfg.get("type", "resnet"),
                     self._inference_server.num_planes,
+                    self._terminate_at_ply,
+                    self._variant,
+                    self._gevay_dir,
+                    self._phase1_dir,
+                    self._gevay_max_total_plies,
                 ),
                 daemon=True,
             )
@@ -1465,6 +1552,7 @@ class SelfPlayManager:
                     self._variant,
                     self._gevay_dir,
                     self._phase1_dir,
+                    self._gevay_max_total_plies,
                 ),
                 daemon=True,
             )

@@ -46,3 +46,9 @@ self_play.terminate_at_ply = 18 (stop fin placement)
 self_play.variant = flying
 gevay.enabled = true → chaque worker spawne son play_tb --serve --gevay-dir
 Si un sample ply-18 tombe sur un sous-espace que Gévay n'a pas (rare en placement-only, mais possible si une partie finit terminal-precoce <ply18 par captures), le worker fallback sur le hybrid outcome existant. Pas de crash.
+
+# visualisqtion statistiaues de etenison
+revoir le papier
+
+# santorini oithello finir crquage fanoroonan
+# entrainer lordi a finir la partie  aussi comme ca le reseau fait totut

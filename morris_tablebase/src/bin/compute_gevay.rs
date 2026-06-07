@@ -303,18 +303,31 @@ fn read_stats_cache(cache_path: &PathBuf, variant: Variant) -> std::io::Result<H
 /// returned `(first_key, dtw)` arrays for the first primary (4 B/slot ×
 /// n_states_canonical = 0.5 B × n_states) remain live, so:
 ///   peak_pair = max(1.0·n0, 0.5·n0 + 1.0·n1).
-const GEVAY_BYTES_PER_SLOT: f64 = 1.0;
-const GEVAY_RETURNED_BYTES_PER_SLOT: f64 = 0.5;
+// Empirically calibrated after the canonical-only refactor + streamed
+// init_pass (multi_value.rs):
+// - Wave arrays (first_key/dtw i16 + count u16 + 2 bitvecs): 5.25 B per
+//   canonical slot = 0.66 B per dense n_states slot.
+// - CanonicalIndexer.canonical_rank_b: ~4 B × n_canonical_entries ≈
+//   0.25 B per dense slot.
+// - BinaryHeap queue at peak: ~5-10% of canonical positions × 16 B ≈
+//   0.15 B per dense slot, peak transient.
+// - Phase 1 mmap'd page cache (per WU): a few GB resident under pressure
+//   but reclaimable; not counted toward the budget.
+// Total budgeted: ~1.3 B per dense n_states slot.
+const GEVAY_BYTES_PER_SLOT: f64 = 1.3;
 
 fn estimate_wu_ram_gb(wu: &morris_tablebase::work_unit::WorkUnit) -> f64 {
     let n0 = wu.primary[0].n_states() as f64;
     if wu.is_esc {
         GEVAY_BYTES_PER_SLOT * n0 / 1e9
     } else {
+        // Pair WU: now solved primary-by-primary with full RAM release
+        // between them (see process_primary closure in main). Peak is the
+        // max of the two solo solves — sum-of-both is no longer reachable
+        // because primary 1's first_key + dtw + count + bitvecs are all
+        // dropped before primary 2's solve_esc_work_unit returns.
         let n1 = wu.primary[1].n_states() as f64;
-        let peak_first = GEVAY_BYTES_PER_SLOT * n0;
-        let peak_second = GEVAY_RETURNED_BYTES_PER_SLOT * n0 + GEVAY_BYTES_PER_SLOT * n1;
-        peak_first.max(peak_second) / 1e9
+        GEVAY_BYTES_PER_SLOT * n0.max(n1) / 1e9
     }
 }
 
@@ -564,19 +577,14 @@ fn main() {
         println!("[{}/{}] {} — solving (est. {:.1} GB)...",
             i + 1, to_solve.len(), wu_label, need_gb);
 
-        let results: Vec<(Vec<i16>, Vec<i16>)> = if wu.is_esc {
-            let rank0 = *ranks.get(&wu.primary[0]).unwrap_or(&0);
-            let (fk, d) = solve_esc_work_unit(wu.primary[0], rank0, variant, &phase1_tb, &ranks);
-            vec![(fk, d)]
-        } else {
-            let rank0 = *ranks.get(&wu.primary[0]).unwrap_or(&0);
-            solve_pair_work_unit(wu, rank0, variant, &phase1_tb, &ranks)
-        };
-        println!("  wave done in {:.2}s", t_wu.elapsed().as_secs_f64());
-
-        for (k, (first_key, dtw)) in results.iter().enumerate() {
-            let sub = wu.primary[k];
-            let dist = gevay_distribution(sub, first_key);
+        // Closure: distribute → print → save → drop.
+        // Same body for ESC and each leg of a pair. Critical: the (first_key,
+        // dtw) Vecs are MOVED into this fn so they're dropped at return,
+        // freeing wave RAM before the next primary's solve starts. This
+        // bounds peak RAM at max(1.3·n0, 1.3·n1) instead of sum-of-both, so
+        // even the biggest pairs (7,8)/(8,7), (8,9)/(9,8) fit in 30 GB.
+        let process_primary = |sub: Subspace, first_key: Vec<i16>, dtw: Vec<i16>| {
+            let dist = gevay_distribution(sub, &first_key);
             let total = dist.win_class + dist.loss_class + dist.rank_zero_draws + dist.nonzero_draws;
             println!(
                 "  ({}, {}) wtm+btm: W={:>10} L={:>10} draws_0={:>10} draws_nz={:>10} (total {}, max|fk|={})",
@@ -585,7 +593,6 @@ fn main() {
                 dist.rank_zero_draws, dist.nonzero_draws,
                 total, dist.max_abs_first_key,
             );
-
             if let Some(dir) = &cli.save_to {
                 if !dir.exists() {
                     std::fs::create_dir_all(dir).expect("create save dir");
@@ -593,11 +600,35 @@ fn main() {
                 let path = dir.join(gevay_filename(sub, variant));
                 let t_save = std::time::Instant::now();
                 morris_tablebase::storage::save_gevay_canonical(
-                    sub, variant, first_key, dtw, &path,
+                    sub, variant, &first_key, &dtw, &path,
                 ).expect("save_gevay_canonical");
                 println!("    saved to {} ({:.1}s)",
                     path.display(), t_save.elapsed().as_secs_f64());
             }
+            // first_key + dtw drop here, freeing 4 B/slot × n_canonical.
+        };
+
+        if wu.is_esc {
+            let rank0 = *ranks.get(&wu.primary[0]).unwrap_or(&0);
+            let (fk, d) = solve_esc_work_unit(wu.primary[0], rank0, variant, &phase1_tb, &ranks);
+            println!("  wave done in {:.2}s", t_wu.elapsed().as_secs_f64());
+            process_primary(wu.primary[0], fk, d);
+        } else {
+            // Pair WU: solve, process, drop primary 1 BEFORE starting
+            // primary 2. Saves ~0.5 × n_states bytes of RAM at the
+            // primary-2 init peak vs solve_pair_work_unit (which holds
+            // both primaries' return values simultaneously).
+            let rank0 = *ranks.get(&wu.primary[0]).unwrap_or(&0);
+            let t_p0 = std::time::Instant::now();
+            let (fk0, d0) = solve_esc_work_unit(wu.primary[0], rank0, variant, &phase1_tb, &ranks);
+            println!("  primary 1 ({},{}) wave done in {:.2}s",
+                wu.primary[0].w_board, wu.primary[0].b_board, t_p0.elapsed().as_secs_f64());
+            process_primary(wu.primary[0], fk0, d0);
+            let t_p1 = std::time::Instant::now();
+            let (fk1, d1) = solve_esc_work_unit(wu.primary[1], -rank0, variant, &phase1_tb, &ranks);
+            println!("  primary 2 ({},{}) wave done in {:.2}s",
+                wu.primary[1].w_board, wu.primary[1].b_board, t_p1.elapsed().as_secs_f64());
+            process_primary(wu.primary[1], fk1, d1);
         }
         pb_wu.inc(1);
     }

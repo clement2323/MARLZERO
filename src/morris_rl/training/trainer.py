@@ -1024,6 +1024,16 @@ class Trainer:
             "game/term_double_pass_rate": term_window.count("double_pass") / n_recent,
             "game/term_board_full_rate": term_window.count("board_full") / n_recent,
             "game/term_piece_count_tiebreak_rate": term_window.count("piece_count_tiebreak") / n_recent,
+            # Gévay-gated regime: gevay_hit games are the only ones that
+            # contribute to the buffer; the other two are dropped before
+            # samples are emitted (per the user's pure-Gévay-no-hybrid spec).
+            # Watch gevay_hit_rate trend up as Gévay coverage saturates; the
+            # other two should stay low.
+            "game/term_gevay_hit_rate": term_window.count("gevay_hit") / n_recent,
+            "game/term_gevay_cap_no_hit_rate": term_window.count("gevay_cap_no_hit") / n_recent,
+            "game/term_gevay_natural_terminal_no_hit_rate": (
+                term_window.count("gevay_natural_terminal_no_hit") / n_recent
+            ),
         }
         # Decompose the piece_count_tiebreak rate by which level of
         # _piece_count_winner actually decided the game:

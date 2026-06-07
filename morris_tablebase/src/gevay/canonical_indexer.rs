@@ -43,30 +43,55 @@ pub struct CanonicalIndexer {
 
 impl CanonicalIndexer {
     pub fn build(sub: Subspace) -> Self {
+        use rayon::prelude::*;
         let w_count = sub.w_board as u32;
         let b_count = sub.b_board as u32;
         let n_rank_w = BINOM[24][w_count as usize];
         let n_rank_b = BINOM[(24 - w_count) as usize][b_count as usize];
 
-        let mut rank_w_offsets: Vec<u32> = Vec::with_capacity(n_rank_w as usize + 1);
-        let mut canonical_rank_b: Vec<Vec<u32>> =
-            (0..n_rank_w).map(|_| Vec::new()).collect();
+        // Per-rank_w buckets are independent (each tests its own n_rank_b
+        // candidates for canonicality), so we parallelise over rank_w with
+        // rayon. For (6,7): 134596 buckets × 31824 candidates = 4.28 billion
+        // ops single-threaded ≈ 5 minutes; with rayon over 30+ threads it
+        // drops to ~10 seconds, eliminating the silent stall the user
+        // observed before the init pass started.
+        let t_build = std::time::Instant::now();
+        // Print only for the bigger subspaces — the tiny ones build in <50ms
+        // and spamming a line per call inflates the WU log for no benefit.
+        let verbose = n_rank_w * n_rank_b > 10_000_000;
+        if verbose {
+            eprintln!("    indexer: building ({} rank_w × {} rank_b candidates)",
+                n_rank_w, n_rank_b);
+        }
+        let canonical_rank_b: Vec<Vec<u32>> = (0..n_rank_w)
+            .into_par_iter()
+            .map(|rank_w| {
+                let wbb = unrank_subset(rank_w, 24, w_count);
+                let mut bucket: Vec<u32> = Vec::new();
+                for rank_b in 0..n_rank_b {
+                    let compact_b = unrank_subset(rank_b, 24 - w_count, b_count);
+                    let bbb = expand_against(compact_b, wbb);
+                    let (cw, cb) = canonicalize(wbb, bbb);
+                    if (cw, cb) == (wbb, bbb) {
+                        bucket.push(rank_b);
+                    }
+                }
+                bucket
+            })
+            .collect();
 
+        // Sequential cumulative-offset pass — only n_rank_w iterations, fast.
+        let mut rank_w_offsets: Vec<u32> = Vec::with_capacity(n_rank_w as usize + 1);
         let mut cum: u32 = 0;
         for rank_w in 0..n_rank_w {
             rank_w_offsets.push(cum);
-            let wbb = unrank_subset(rank_w, 24, w_count);
-            for rank_b in 0..n_rank_b {
-                let compact_b = unrank_subset(rank_b, 24 - w_count, b_count);
-                let bbb = expand_against(compact_b, wbb);
-                let (cw, cb) = canonicalize(wbb, bbb);
-                if (cw, cb) == (wbb, bbb) {
-                    canonical_rank_b[rank_w as usize].push(rank_b);
-                    cum += 1;
-                }
-            }
+            cum += canonical_rank_b[rank_w as usize].len() as u32;
         }
         rank_w_offsets.push(cum);
+        if verbose {
+            eprintln!("    indexer: built in {:.1}s ({} canonical entries)",
+                t_build.elapsed().as_secs_f64(), cum);
+        }
 
         Self {
             subspace: sub,

@@ -355,6 +355,7 @@ def main(cfg: DictConfig) -> None:
     gevay_cfg = cfg.get("gevay", None)
     gevay_dir = None
     phase1_dir = None
+    gevay_max_total_plies = None
     if gevay_cfg is not None and bool(gevay_cfg.get("enabled", False)):
         gevay_dir = str(gevay_cfg.get("dir", ""))
         phase1_dir = str(gevay_cfg.get("phase1_dir", ""))
@@ -364,6 +365,10 @@ def main(cfg: DictConfig) -> None:
             )
             gevay_dir = None
             phase1_dir = None
+        # Hard ply cap: any game that hasn't seen a Gévay hit by this ply
+        # is dropped (no samples in buffer). Per the user's spec, the
+        # training signal is PURE Gévay — no hybrid fallback.
+        gevay_max_total_plies = int(gevay_cfg.get("max_total_plies", 60))
 
     manager = SelfPlayManager(
         network=network,
@@ -391,6 +396,7 @@ def main(cfg: DictConfig) -> None:
         variant=self_play_variant,
         gevay_dir=gevay_dir,
         phase1_dir=phase1_dir,
+        gevay_max_total_plies=gevay_max_total_plies,
     )
 
     logger.info(
