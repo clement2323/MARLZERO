@@ -144,11 +144,19 @@ impl PartialOrd for QueueKey {
 
 /// Queue entry. `sub_idx` distinguishes which primary subspace the state
 /// lives in (0 or 1 for non-ESC pairs).
+///
+/// Layout: key (4 B) + state_idx (u32, 4 B) + sub_idx (1 B) → 12 B with 3
+/// bytes trailing padding. `state_idx` is u32 because the largest canonical
+/// subspace we ever address is (8,8) ESC with `n_states_canonical = 2.37 G`,
+/// which fits in u32 (max 4.29 G) with margin. This shaves the struct from
+/// the 16 B natural layout it had with `state_idx: u64`, saving ~25% of
+/// the queue heap RAM — critical for the biggest WUs like (8,8)/(8,9)/(9,9)
+/// that approach the 30 GB machine ceiling at the init→wave transition.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueEntry {
     pub key: QueueKey,
+    pub state_idx: u32,
     pub sub_idx: u8,
-    pub state_idx: u64,
 }
 
 impl PartialEq for QueueEntry {
@@ -383,6 +391,23 @@ pub fn solve_esc_work_unit(
     // bottleneck. See [crate::gevay::canonical_indexer].
     let indexer = crate::gevay::canonical_indexer::CanonicalIndexer::build(sub);
     let n = indexer.n_states_canonical() as usize;
+    // Hard guard: QueueEntry packs `state_idx` as u32 to save 4 bytes per
+    // seed (×~600M seeds for the biggest WUs = ~2.4 GB RAM saved at peak).
+    // We never get close to u32::MAX with Morris (max canonical = (8,8) at
+    // 2.37 G < 4.29 G), but if anyone ever adds Lasker/Morabaraba subspaces
+    // or extends to a non-Morris game with > 4.29 G canonical, this assert
+    // fires immediately at WU start instead of overflowing silently mid-
+    // wave. To support those variants: widen state_idx back to u64 here AND
+    // in `QueueEntry`. There is a previous u32→u64 fix in this repo's
+    // history (commit b8c7… mentioned in the "u64 fix" plan) — that one was
+    // for the DENSE layout which goes up to 18.9 G. The CANONICAL layout we
+    // use now is ×8 smaller, hence u32 is fine. Do not remove this assert.
+    assert!(
+        n as u64 <= u32::MAX as u64,
+        "n_states_canonical = {} exceeds u32::MAX. Widen QueueEntry::state_idx \
+         back to u64 — see the comment above this assert in multi_value.rs.",
+        n,
+    );
     let mut first_key: Vec<i16> = vec![0; n];
     let mut dtw: Vec<i16> = vec![0; n];
     // count: parent-update remaining-children counter. Bounded by the
@@ -516,7 +541,15 @@ pub fn solve_esc_work_unit(
             chunks_done, t_init.elapsed().as_secs_f64(), queue_entries.len());
     }
 
-    let mut queue: std::collections::BinaryHeap<QueueEntry> = queue_entries.into_iter().collect();
+    // BinaryHeap::from(Vec) reuses the Vec's existing allocation and runs an
+    // O(n) in-place heapify (rebuild_tail). The previous `.into_iter().collect()`
+    // path was specialised in std for Vec sources, but writing the explicit
+    // `from` makes the in-place guarantee unambiguous — no transient double
+    // allocation between the queue_entries Vec and the heap. Critical for
+    // (8,8) where the queue_entries Vec is ~7 GB; a transient copy would add
+    // 7 GB to peak RAM and OOM the 30 GB machine.
+    let mut queue: std::collections::BinaryHeap<QueueEntry> =
+        std::collections::BinaryHeap::from(queue_entries);
 
     // Phase 1 — wave propagation through intra-WU parents.
     // Approximate first-arrival heuristic (mirrors the Phase 1 wave's
@@ -545,7 +578,7 @@ pub fn solve_esc_work_unit(
     let mut pops: u64 = 0;
     let mut last_println = std::time::Instant::now();
     while let Some(entry) = queue.pop() {
-        let p_idx = entry.state_idx;
+        let p_idx = entry.state_idx as u64;
         propagate_to_parents_gevay(
             sub, rank, variant, &indexer, p_idx,
             &mut first_key, &mut dtw, &mut count,
@@ -689,7 +722,7 @@ fn init_one_position_atomic(
         return Some(QueueEntry {
             key: QueueKey { neg_abs_value: -(rel.abs()), dtw: 0 },
             sub_idx: 0,
-            state_idx: idx as u64,
+            state_idx: idx as u32,
         });
     }
 
@@ -700,7 +733,7 @@ fn init_one_position_atomic(
         Some(QueueEntry {
             key: QueueKey { neg_abs_value: -(rel.abs()), dtw: d },
             sub_idx: 0,
-            state_idx: idx as u64,
+            state_idx: idx as u32,
         })
     } else if intra_children.is_empty() {
         if has_draw {
@@ -715,7 +748,7 @@ fn init_one_position_atomic(
             Some(QueueEntry {
                 key: QueueKey { neg_abs_value: -(rel.abs()), dtw: new_dtw },
                 sub_idx: 0,
-                state_idx: idx as u64,
+                state_idx: idx as u32,
             })
         } else {
             None
@@ -816,7 +849,7 @@ fn propagate_to_parents_gevay(
                         dtw: dtw[q_i],
                     },
                     sub_idx: 0,
-                    state_idx: q_idx,
+                    state_idx: q_idx as u32,
                 });
             } else if p_from_q < 0 {
                 // LOSS-direction intra-child: decrement count, stash max DTW.
@@ -843,7 +876,7 @@ fn propagate_to_parents_gevay(
                                 dtw: dtw[q_i],
                             },
                             sub_idx: 0,
-                            state_idx: q_idx,
+                            state_idx: q_idx as u32,
                         });
                     }
                 }
