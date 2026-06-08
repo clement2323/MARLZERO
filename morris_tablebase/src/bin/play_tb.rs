@@ -21,14 +21,22 @@ use morris_tablebase::board::{ADJACENCY, NUM_POSITIONS};
 use morris_tablebase::gevay::canonical_indexer::CanonicalIndexer;
 use morris_tablebase::gevay::multi_value::WIN_ABS;
 use morris_tablebase::rules::{is_mill_through, legal_capture_targets, popcount};
-use morris_tablebase::storage::{default_filename, gevay_filename, load_gevay_canonical};
+use morris_tablebase::storage::{default_filename, gevay_filename, load_gevay_canonical_mmap, MmapGevay};
 use morris_tablebase::subspace::{MappedTable, Subspace, Tablebase};
 use morris_tablebase::wave::{DRAW, LOSS, Variant, WIN};
 
 /// Loaded V_Gévay tables for the JSONL `--gevay-dir` query mode. Keyed by
-/// movement subspace; each value bundles the per-subspace CanonicalIndexer
-/// with the `first_key` / `dtw` arrays read from disk.
-type GevayStore = std::collections::HashMap<Subspace, (CanonicalIndexer, Vec<i16>, Vec<i16>)>;
+/// movement subspace; each value bundles a lazily-built CanonicalIndexer
+/// (wrapped in OnceCell — first query for a subspace pays the build cost,
+/// subsequent queries are O(1) hashmap lookups) with the mmap-backed
+/// `first_key` / `dtw` slices.
+///
+/// Why lazy + mmap: loading all 49 Gévay files into `Vec<i16>` would
+/// commit ~107 GB of RAM per process and OOM-kill any multi-worker
+/// training run. The mmap approach defers page residency to the kernel
+/// page cache (shared across processes) and the lazy indexer build
+/// avoids the ~5-50s cost for subspaces that never get queried.
+type GevayStore = std::collections::HashMap<Subspace, (std::sync::OnceLock<CanonicalIndexer>, MmapGevay)>;
 
 const POSITION_LABELS: [&str; 24] = [
     "a7", "d7", "g7", "g4", "g1", "d1", "a1", "a4",
@@ -399,11 +407,15 @@ fn serve_handle_gevay(gevay: &GevayStore, line: &str) -> Result<String, String> 
         return Err(format!("piece counts ({},{}) out of [3,9]", w, b));
     }
     let sub = Subspace::movement(w, b);
-    let (indexer, first_key, dtw) = gevay.get(&sub)
+    let (indexer_cell, mmap_gevay) = gevay.get(&sub)
         .ok_or_else(|| format!("gevay subspace ({},{}) not loaded", w, b))?;
+    // Lazy build on first query for this subspace. OnceLock::get_or_init
+    // is thread-safe and idempotent, so even if multiple worker threads
+    // race on the first query they all see the same indexer.
+    let indexer = indexer_cell.get_or_init(|| CanonicalIndexer::build(sub));
     let idx = indexer.index(state.wbb, state.bbb, state.stm) as usize;
-    let fk = first_key[idx];
-    let d = dtw[idx];
+    let fk = mmap_gevay.first_key()[idx];
+    let d = mmap_gevay.dtw()[idx];
     let normalized = (fk as f32) / (WIN_ABS as f32);
     Ok(format!(
         "{{\"first_key\":{},\"dtw\":{},\"normalized\":{:.6}}}",
@@ -589,10 +601,16 @@ fn main() {
                 let sub = Subspace::movement(w, b);
                 let path = dir.join(gevay_filename(sub, Variant::Flying));
                 if !path.exists() { continue; }
-                match load_gevay_canonical(&path) {
-                    Ok((fk, dtw_arr, _variant, sub_back)) => {
-                        let indexer = CanonicalIndexer::build(sub_back);
-                        gevay_store.insert(sub_back, (indexer, fk, dtw_arr));
+                match load_gevay_canonical_mmap(&path) {
+                    Ok(mmap_gevay) => {
+                        // CanonicalIndexer is built lazily on first query
+                        // for this subspace — avoids spending 5-50s × 49
+                        // subspaces (~10 min) at startup when most queries
+                        // only hit a handful of (w, b) tuples.
+                        gevay_store.insert(
+                            mmap_gevay.subspace,
+                            (std::sync::OnceLock::new(), mmap_gevay),
+                        );
                         g_loaded += 1;
                     }
                     Err(e) => {

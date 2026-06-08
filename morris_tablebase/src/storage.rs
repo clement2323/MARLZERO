@@ -605,8 +605,92 @@ pub fn save_gevay_canonical(
     Ok(())
 }
 
+/// Mmap-backed Gévay canonical table. The on-disk format is x86_64 LE
+/// `i16`, identical to in-memory layout, so we expose `first_key`/`dtw`
+/// as zero-copy `&[i16]` slices over the mapped pages.
+///
+/// Critical for `play_tb --gevay-dir` at serve time: loading all 49
+/// subspaces into `Vec<i16>` would commit ~107 GB of RAM per process and
+/// instantly OOM-kill any multi-worker setup. mmap defers the page
+/// residency to the kernel's page cache, which is also shared across
+/// processes that map the same file — so 8 self-play workers spawning 8
+/// `play_tb` subprocesses pay the working-set RAM cost ONCE, not 8×.
+pub struct MmapGevay {
+    _mmap: memmap2::Mmap,  // keeps the mapping alive
+    first_key_ptr: *const i16,
+    dtw_ptr: *const i16,
+    n: usize,
+    pub variant: Variant,
+    pub subspace: Subspace,
+}
+
+// SAFETY: the raw pointers point inside the mmap, which we own. No
+// interior mutability: queries are read-only.
+unsafe impl Send for MmapGevay {}
+unsafe impl Sync for MmapGevay {}
+
+impl MmapGevay {
+    #[inline]
+    pub fn first_key(&self) -> &[i16] {
+        unsafe { std::slice::from_raw_parts(self.first_key_ptr, self.n) }
+    }
+    #[inline]
+    pub fn dtw(&self) -> &[i16] {
+        unsafe { std::slice::from_raw_parts(self.dtw_ptr, self.n) }
+    }
+    #[inline]
+    pub fn len(&self) -> usize { self.n }
+}
+
+/// mmap-backed counterpart of [`load_gevay_canonical`]. Use this for
+/// long-lived processes (the `play_tb --serve` JSONL loop, inference
+/// servers) where loading 107 GB into RAM is not viable. The returned
+/// slices are valid as long as the `MmapGevay` is alive.
+pub fn load_gevay_canonical_mmap(path: &Path) -> io::Result<MmapGevay> {
+    let f = File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&f)? };
+    if mmap.len() < 32 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gevay file too small for header"));
+    }
+    let header_arr: &[u8; 32] = mmap[..32].try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "header slice cast failed"))?;
+    let h = parse_header(header_arr)?;
+    if h.payload_type != PAYLOAD_GEVAY_CANONICAL {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("expected payload_type={} (Gévay canonical), got {}",
+                PAYLOAD_GEVAY_CANONICAL, h.payload_type)));
+    }
+    let n = h.n_primary as usize;
+    let payload_bytes = (n as u64) * 2 * 2; // first_key + dtw, 2 bytes each
+    let required = 32u64 + payload_bytes;
+    if (mmap.len() as u64) < required {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("gevay file truncated: have {} bytes, need {}", mmap.len(), required)));
+    }
+    // SAFETY: i16 has alignment 2; offset 32 is 32-byte aligned (way more
+    // than enough). The pointer arithmetic stays inside the mapping (we
+    // just checked `mmap.len() >= 32 + 4n`).
+    let base = mmap.as_ptr();
+    let first_key_ptr = unsafe { base.add(32) as *const i16 };
+    let dtw_ptr = unsafe { base.add(32 + n * 2) as *const i16 };
+    let variant = h.variant;
+    let subspace = h.subspace;
+    Ok(MmapGevay {
+        _mmap: mmap,
+        first_key_ptr,
+        dtw_ptr,
+        n,
+        variant,
+        subspace,
+    })
+}
+
 /// Counterpart of [`save_gevay_canonical`]. Returns `(first_key, dtw, variant, subspace)`
 /// where the arrays are indexed by `CanonicalIndexer::build(subspace).canonical_index(..)`.
+///
+/// Prefer [`load_gevay_canonical_mmap`] for long-lived processes — this
+/// version eagerly copies the on-disk payload into `Vec<i16>`, which for
+/// the largest subspaces costs up to ~9 GB per file.
 pub fn load_gevay_canonical(path: &Path) -> io::Result<(Vec<i16>, Vec<i16>, Variant, Subspace)> {
     let f = File::open(path)?;
     let mut r = BufReader::new(f);
