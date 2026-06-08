@@ -43,6 +43,13 @@ self_play:
   # this ply hands aren't empty so Gévay never covers — polling earlier
   # is pure subprocess overhead.
   terminate_at_ply: 18
+  # Curriculum (random late-game starts) is OFF: random_late_game_state
+  # defaults to variant=NO_FLYING, so curriculum-spawned games get rejected
+  # by the GevayClient (variant mismatch) and the pure-Gévay movement guard
+  # drops them. Empirically produced a 24% drop rate. Re-enable only after
+  # patching the helper + game_fns to propagate variant=FLYING.
+  curriculum:
+    enabled: false
   # Activates the Flying variant (3-piece fly rule) in the rules engine
   # used by self-play. Has no observable effect during placement (fly only
   # kicks in at 3 pieces in movement phase, which we never reach during
@@ -67,3 +74,4 @@ gevay:
   # DROPPED — no samples added to the buffer. There is no hybrid value
   # fallback by design: the training signal must be pure Gévay.
   max_total_plies: 60
+
