@@ -619,6 +619,14 @@ def _play_game(
                 gevay_hit_perspective = int(state.current_player)
                 early_stop_gevay = True
                 break
+            # PURE-GÉVAY GUARD: we just entered movement phase (hands empty,
+            # not must_capture) and Gévay refused this position. Continuing
+            # would put us in genuine movement gameplay where the rules
+            # engine generates fly actions (variant=FLYING, 3-piece side)
+            # — those have indices ≥ ACTION_SPACE_SIZE (88) and crash the
+            # inference server mask. Drop the game per the no-hybrid contract.
+            early_stop_cap_no_hit = True
+            break
         # Hard cap: game has gone too long without a Gévay hit. Discard.
         if (
             gevay_max_total_plies is not None

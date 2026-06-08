@@ -30,6 +30,14 @@ mcts:
   num_simulations_train: 400
 
 self_play:
+  # PREREQUISITE: run `cargo run --release --bin build_indexer_cache --
+  # data/tablebase/gevay/` ONCE before launching training. That one-shot
+  # produces ~60 GB of CanonicalIndexer cache files in <gevay-dir>/.indexers/
+  # which the play_tb subprocesses mmap at startup. The OS page cache
+  # shares the resident pages across all 8 worker subprocesses, so RAM
+  # usage stays around ~5-15 GB total instead of the 40-60 GB you'd see
+  # if each worker rebuilt its own (8,8)/(8,9)/(9,9) indexers in private
+  # heap. Without the cache, drop num_workers to 2 (see git history).
   num_workers: 8
   # Minimum ply count before we START polling Gévay for coverage. Below
   # this ply hands aren't empty so Gévay never covers — polling earlier

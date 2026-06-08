@@ -15,7 +15,7 @@
 //!   c5 d5 e5 / c4 e4 / c3 d3 e3 (inner)
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use morris_tablebase::board::{ADJACENCY, NUM_POSITIONS};
 use morris_tablebase::gevay::canonical_indexer::CanonicalIndexer;
@@ -364,7 +364,7 @@ fn parse_start_spec(spec: &str, stm: u8, seed: u64) -> Result<State, String> {
 /// Response: `{"verdict":<u8>,"dtw":<u16>,"best_action":{"src":<u8>,"dst":<u8>,"cap":<u8>|null}|null,"top_moves":[{"src":<u8>,"dst":<u8>,"cap":<u8>|null,"verdict":<u8>,"dtw":<u16>}]}\n`
 ///
 /// On parse error: `{"error":"<msg>"}\n`. On EOF: exit cleanly.
-fn serve_loop(tb: &Tablebase, gevay: &GevayStore) {
+fn serve_loop(tb: &Tablebase, gevay: &GevayStore, indexer_cache_dir: Option<&Path>) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut line = String::new();
@@ -379,7 +379,7 @@ fn serve_loop(tb: &Tablebase, gevay: &GevayStore) {
         // or without internal whitespace) routes to the Gévay handler.
         // Full JSON parse stays in the per-handler functions.
         let resp = if trimmed.contains("\"gevay\"") && trimmed.contains("true") {
-            match serve_handle_gevay(gevay, trimmed) {
+            match serve_handle_gevay(gevay, indexer_cache_dir, trimmed) {
                 Ok(json) => json,
                 Err(msg) => format!("{{\"error\":\"{}\"}}", msg.replace('"', "'")),
             }
@@ -398,7 +398,11 @@ fn serve_loop(tb: &Tablebase, gevay: &GevayStore) {
 /// Response: `{"first_key":<i16>,"dtw":<i16>,"normalized":<f32>}` where
 /// `normalized = first_key / WIN_ABS` (∈ [-1, +1] approximately). Errors
 /// when the corresponding (w, b) gevay file wasn't loaded at startup.
-fn serve_handle_gevay(gevay: &GevayStore, line: &str) -> Result<String, String> {
+fn serve_handle_gevay(
+    gevay: &GevayStore,
+    indexer_cache_dir: Option<&Path>,
+    line: &str,
+) -> Result<String, String> {
     if line.is_empty() { return Err("empty request".to_string()); }
     let state = parse_serve_request(line)?;
     let w = popcount(state.wbb) as u8;
@@ -412,7 +416,13 @@ fn serve_handle_gevay(gevay: &GevayStore, line: &str) -> Result<String, String> 
     // Lazy build on first query for this subspace. OnceLock::get_or_init
     // is thread-safe and idempotent, so even if multiple worker threads
     // race on the first query they all see the same indexer.
-    let indexer = indexer_cell.get_or_init(|| CanonicalIndexer::build(sub));
+    // Lazy build OR mmap-load from the indexer cache directory if set.
+    // `open_or_build` falls back to in-memory build if the cache file is
+    // missing or stale, so even a fresh setup works; subsequent processes
+    // hit the cache file via mmap and share pages via the OS page cache.
+    let indexer = indexer_cell.get_or_init(|| {
+        CanonicalIndexer::open_or_build(sub, indexer_cache_dir)
+    });
     let idx = indexer.index(state.wbb, state.bbb, state.stm) as usize;
     let fk = mmap_gevay.first_key()[idx];
     let d = mmap_gevay.dtw()[idx];
@@ -537,6 +547,7 @@ fn main() {
     let mut seed: u64 = 42;
     let mut serve = false;
     let mut gevay_dir: Option<PathBuf> = None;
+    let mut indexer_cache_dir: Option<PathBuf> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -560,7 +571,22 @@ fn main() {
                 gevay_dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--indexer-cache-dir" if i + 1 < args.len() => {
+                indexer_cache_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             _ => { i += 1; }
+        }
+    }
+    // Default cache location: <gevay-dir>/.indexers/. Multiple play_tb
+    // processes (e.g. self-play workers spawning their own subprocess)
+    // mmap the same files there → resident RAM shared across processes
+    // via the OS page cache. Without this, each subprocess rebuilds its
+    // own CanonicalIndexer per subspace (~5 GB for (8,8)) and OOM-kills
+    // the box once a few of them race on (7,7)/(8,8)/(8,9)/(9,9).
+    if indexer_cache_dir.is_none() {
+        if let Some(g) = &gevay_dir {
+            indexer_cache_dir = Some(g.join(".indexers"));
         }
     }
 
@@ -628,7 +654,7 @@ fn main() {
 
     if serve {
         eprintln!("Loaded {} Phase 1 subspaces. Entering --serve loop.", loaded);
-        serve_loop(&tb, &gevay_store);
+        serve_loop(&tb, &gevay_store, indexer_cache_dir.as_deref());
         return;
     }
     println!("Loaded {} subspaces.\n", loaded);
